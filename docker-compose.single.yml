@@ -1,0 +1,17 @@
+# =============================================================================
+# Override para modo SINGLE-INSTANCE (benchmark comparativo 1 vs 5 réplicas)
+#
+# Uso:
+#   docker compose -f docker-compose.yml -f docker-compose.single.yml up -d
+#
+# Efecto: una sola réplica del document-service expuesta directamente en
+# http://localhost:8000 (sin pasar por el balanceador Traefik).
+# Los scripts de tests/stress/ apuntan aquí con BASE_URL=http://localhost:8000
+# =============================================================================
+services:
+  document-service:
+    container_name: pdf_document_service
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    deploy:
+      replicas: 1
