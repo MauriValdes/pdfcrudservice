@@ -1,0 +1,44 @@
+# =================================================================
+# 12-Factor App: la configuración vive en el entorno, NO en la imagen.
+# Excluimos .env para que las credenciales nunca se empaqueten ni
+# lleguen a un registro de imágenes (docker history / capas).
+# =================================================================
+.env
+.env.*
+!.env.example
+
+# =================================================================
+# Control de versiones
+# =================================================================
+.git
+.gitignore
+.github
+
+# =================================================================
+# Entornos locales y artefactos de Python
+# =================================================================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+# =================================================================
+# Archivos de infraestructura (la imagen no necesita orquestarse
+# a sí misma)
+# =================================================================
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# =================================================================
+# Documentación y tests (no forman parte de la ejecución en runtime)
+# =================================================================
+tests/
+docs/
