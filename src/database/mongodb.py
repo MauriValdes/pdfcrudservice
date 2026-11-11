@@ -29,8 +29,28 @@ class MongoDB:
             # Verificar conexión
             await self.client.admin.command('ping')
             logger.info(f"Conectado a MongoDB en la base de datos: {self.db.name}")
+
+            # Crear índice único sobre 'checksum' si no existe
+            await self._ensure_unique_index_on_checksum()
         except Exception as e:
             logger.error(f"Error al conectar con MongoDB: {e}")
+            raise
+
+    async def _ensure_unique_index_on_checksum(self):
+        """
+        Crea un índice único sobre el campo 'checksum' si no existe.
+        La operación es idempotente: si el índice ya existe con la misma configuración,
+        MongoDB no lanza error.
+        """
+        try:
+            await self.db[settings.mongo_collection].create_index(
+                [("checksum", 1)],
+                name="checksum_unique",
+                unique=True,
+            )
+            logger.info("Índice único 'checksum_unique' creado o ya existente.")
+        except Exception as e:
+            logger.error(f"Error al crear índice único en 'checksum': {e}")
             raise
 
     async def close(self):
