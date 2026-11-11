@@ -5,6 +5,10 @@ from src.config.config import settings
 from datetime import datetime
 
 
+class InvalidObjectIdError(ValueError):
+    """El identificador proporcionado no tiene formato de ObjectId válido de MongoDB."""
+
+
 class DocumentRepository:
     def __init__(self, db):
         self.db = db
@@ -65,11 +69,16 @@ class DocumentRepository:
 
     async def delete_by_id(self, document_id: str) -> int:
         """Elimina un documento por su ID de MongoDB y retorna la cantidad de eliminados."""
+        if not ObjectId.is_valid(document_id):
+            raise InvalidObjectIdError("Identificador de documento inválido")
         result = await self.collection.delete_one({"_id": ObjectId(document_id)})
         return result.deleted_count
 
     async def update_document(self, document_id: str, update_data: DocumentUpdate) -> DocumentResponse | None:
         """Actualiza un documento con los nuevos datos proporcionados."""
+        if not ObjectId.is_valid(document_id):
+            raise InvalidObjectIdError("Identificador de documento inválido")
+
         from datetime import datetime
 
         # Filtrar solo los campos que tienen valor (no None)

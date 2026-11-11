@@ -1,4 +1,9 @@
 import hashlib
+import httpx
+
+from pymongo.errors import DuplicateKeyError
+
+from src.config.config import settings
 from src.models.document import DocumentModel, DocumentStatus
 from src.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
 from src.repository.document_repository import DocumentRepository
@@ -8,6 +13,9 @@ from datetime import datetime, timezone
 class DocumentService:
     def __init__(self, repository: DocumentRepository):
         self.repository = repository
+        # Configuración de comunicación con MS2 (Extract Service)
+        self.extract_service_url = settings.extract_service_url
+        self.extract_service_timeout = settings.extract_service_timeout
 
     async def submit_pdf(self, file_bytes: bytes, filename: str) -> DocumentResponse:
         """Guarda los metadatos básicos del PDF en la base de datos.
@@ -42,9 +50,12 @@ class DocumentService:
         )
 
         # Guardar en MongoDB
-        result = await self.repository.collection.insert_one(
-            doc_orm.model_dump(by_alias=True, exclude={"id"})
-        )
+        try:
+            result = await self.repository.collection.insert_one(
+                doc_orm.model_dump(by_alias=True, exclude={"id"})
+            )
+        except DuplicateKeyError:
+            raise ValueError("El documento ya existe")
 
         # 4. Retornar el DTO de respuesta
         return DocumentResponse(
@@ -121,6 +132,135 @@ class DocumentService:
             return None
 
         return await self.repository.update_document(document_id, update_data)
+
+    # --- NUEVO: Comunicación HTTP con MS2 - Extracción de texto ---
+
+    async def call_extraction_service(
+        self, pdf_bytes: bytes, filename: str
+    ) -> dict:
+        """Realiza una petición HTTP al servicio MS2 para extraer texto de un PDF.
+
+        Envía el archivo en formato multipart/form-data con campo 'file'.
+        Valida la respuesta y retorna el diccionario parseado.
+
+        Raises:
+            httpx.TimeoutException: Si la conexión excede el timeout configurado.
+            httpx.ConnectError: Si el servicio MS2 no está disponible.
+            ValueError: Si la respuesta de MS2 es inválida (códigos de error,
+                        campos faltantes o tipos incorrectos).
+        """
+        url = self.extract_service_url.rstrip("/") + "/extract"
+        timeout = self.extract_service_timeout
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            files = {"file": (filename, pdf_bytes, "application/pdf")}
+            response = await client.post(url, files=files)
+
+        # Verificar código de estado HTTP
+        if response.status_code != 200:
+            if response.status_code >= 500:
+                # Errores de servidor MS2: mensaje siempre genérico, sin exponer
+                # el detalle interno que el servicio haya enviado en el cuerpo.
+                raise ValueError(
+                    f"MS2 retornó error HTTP {response.status_code}: "
+                    "servicio de extracción no disponible"
+                )
+            # Errores de cliente (4xx): conservamos el detalle útil de MS2
+            error_detail = "Unknown error from extraction service"
+            try:
+                error_json = response.json()
+                error_detail = error_json.get(
+                    "detail", error_detail
+                )
+            except Exception:
+                pass
+            raise ValueError(
+                f"MS2 retornó error HTTP {response.status_code}: {error_detail}"
+            )
+
+        # Parsear respuesta JSON
+        try:
+            extract_data = response.json()
+        except Exception as e:
+            raise ValueError(f"MS2 respondió con cuerpo no JSON: {str(e)}")
+
+        # Validar campos obligatorios y tipos
+        content = extract_data.get("content")
+        page_count = extract_data.get("page_count")
+
+        # content debe ser string (puede estar vacío - PDFs escaneados son válidos)
+        if not isinstance(content, str):
+            raise ValueError(
+                f"El campo 'content' debe ser string, recibido: {type(content).__name__}"
+            )
+
+        # page_count debe ser entero >= 0 (explicitamente rechazamos booleanos,
+        # ya que en Python isinstance(True, int) retorna True)
+        if (
+            not isinstance(page_count, int)
+            or isinstance(page_count, bool)
+            or page_count < 0
+        ):
+            raise ValueError(
+                f"El campo 'page_count' debe ser entero >= 0, recibido: {page_count}"
+            )
+
+        return {
+            "content": content,
+            "page_count": page_count,
+        }
+
+    # --- NUEVO: Orquestación de extracción de PDF ---
+
+    async def process_pdf_extraction(
+        self, document_id: str, pdf_bytes: bytes, filename: str
+    ) -> None:
+        """Orquesta el procesamiento de un PDF: llama a MS2 y actualiza el estado.
+
+        Flujo:
+        1. Llamar a MS2 /extract para obtener content y page_count.
+        2. Si tiene éxito: actualizar MongoDB a COMPLETED con los resultados.
+        3. Si falla: actualizar MongoDB a FAILED con el mensaje de error.
+        4. Cualquier error en la actualización de MongoDB se propaga (no se oculta).
+
+        Importante: Este método NO devuelve nada al cliente. El cliente debe
+        consultar el documento en MongoDB para obtener el estado final.
+        """
+        # 1. Llamar a MS2 para extraer texto
+        try:
+            extract_result = await self.call_extraction_service(pdf_bytes, filename)
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            # Error de comunicación con MS2
+            await self.repository.update_document(
+                document_id,
+                DocumentUpdate(status="failed", error_message=str(e)),
+            )
+            raise
+        except ValueError as e:
+            # Error de validación de la respuesta de MS2
+            await self.repository.update_document(
+                document_id,
+                DocumentUpdate(status="failed", error_message=str(e)),
+            )
+            raise
+
+        # 2. Actualizar MongoDB a COMPLETED con los resultados de la extracción
+        try:
+            await self.repository.update_document(
+                document_id,
+                DocumentUpdate(
+                    status="completed",
+                    content=extract_result["content"],
+                    page_count=extract_result["page_count"],
+                ),
+            )
+        except Exception as e:
+            # Si falla la actualización de MongoDB, volvemos a lanzar la excepción
+            # El documento puede quedar en estado PENDING o tener un estado parcial
+            # No intente recuperar automáticamente - eso corresponde a una etapa futura
+            raise
+
+    # --- FIN de la sección de comunicación HTTP con MS2 ---
 
     async def delete_document(self, document_id: str) -> bool:
         """Elimina un documento por su ID.
