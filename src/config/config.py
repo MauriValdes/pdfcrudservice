@@ -1,4 +1,4 @@
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,6 +11,20 @@ class Settings(BaseSettings):
     # 📡 Servicio de extracción (MS2)
     extract_service_url: str = Field(default="http://localhost:8002", alias="EXTRACT_SERVICE_URL")
     extract_service_timeout: int = Field(default=30, alias="EXTRACT_SERVICE_TIMEOUT")
+    # 📋 Nivel de logging (12-Factor: se configura por entorno)
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalize_log_level(cls, value: str) -> str:
+        """Normaliza el nivel de logging.
+
+        Aquí solo se lee y normaliza el valor: la interpretación del nivel y
+        el fallback ante un valor inválido son responsabilidad de
+        src.core.logging_config, de modo que un LOG_LEVEL incorrecto nunca
+        impida el arranque del servicio.
+        """
+        return value.strip().upper()
 
     model_config = SettingsConfigDict(
         env_file=".env", 

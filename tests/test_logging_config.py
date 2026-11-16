@@ -59,12 +59,28 @@ def isolate_logging_state():
     configure_logging() reemplaza los handlers del root logger y de los
     loggers de uvicorn; sin este aislamiento esos cambios se filtrarían al
     resto de la suite.
+
+    Además, cualquier test o módulo que importe src.main deja el root ya
+    configurado con los handlers del servicio (src.main llama a
+    configure_logging() al importarse). Como estos tests necesitan partir de
+    un estado sin logging centralizado, esos handlers se retiran antes de
+    capturar el estado a restaurar: así tampoco se vuelven a adjuntar al
+    finalizar y no quedan handlers propios del módulo después de los tests.
     """
+    _detach_module_handlers()
     state = capture_logging_state()
     try:
         yield
     finally:
         restore_logging_state(state)
+
+
+def _detach_module_handlers() -> None:
+    """Desvincula del root los handlers creados por el módulo de logging."""
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        if isinstance(handler, DynamicStreamHandler):
+            root.removeHandler(handler)
 
 
 def capture_logging_state() -> dict:
