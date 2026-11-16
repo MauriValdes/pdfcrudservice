@@ -37,6 +37,7 @@ from src.core.logging_config import (
     MaxLevelFilter,
     build_logging_config,
     configure_logging,
+    is_sensitive_key,
     redact_mapping,
     redact_uri,
     redact_value,
@@ -59,43 +60,131 @@ def isolate_logging_state():
     loggers de uvicorn; sin este aislamiento esos cambios se filtrarían al
     resto de la suite.
     """
-    root = logging.getLogger()
-    watched = ("uvicorn", "uvicorn.error", "uvicorn.access")
-
-    saved_root = (list(root.handlers), root.level, list(root.filters))
-    saved_loggers = {
-        name: (
-            list(logging.getLogger(name).handlers),
-            logging.getLogger(name).level,
-            logging.getLogger(name).propagate,
-            logging.getLogger(name).disabled,
-        )
-        for name in watched
-    }
-
+    state = capture_logging_state()
     try:
         yield
     finally:
-        for handler in root.handlers[:]:
-            if handler not in saved_root[0]:
-                root.removeHandler(handler)
-        for handler in saved_root[0]:
-            if handler not in root.handlers:
-                root.addHandler(handler)
-        root.setLevel(saved_root[1])
-        root.filters = saved_root[2]
+        restore_logging_state(state)
 
-        for name, (handlers, level, propagate, disabled) in saved_loggers.items():
-            logger = logging.getLogger(name)
-            for handler in logger.handlers[:]:
-                if handler not in handlers:
-                    logger.removeHandler(handler)
-            for handler in handlers:
-                if handler not in logger.handlers:
-                    logger.addHandler(handler)
-            logger.setLevel(level)
-            logger.propagate = propagate
-            logger.disabled = disabled
+
+def capture_logging_state() -> dict:
+    """Captura el estado global de logging que debe restaurarse."""
+    root = logging.getLogger()
+    watched = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+    streams = []
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        streams.append(
+            (
+                stream,
+                getattr(stream, "encoding", None),
+                getattr(stream, "errors", None),
+            )
+        )
+
+    return {
+        "root_handlers": list(root.handlers),
+        "root_level": root.level,
+        "root_filters": list(root.filters),
+        "loggers": {
+            name: (
+                list(logging.getLogger(name).handlers),
+                logging.getLogger(name).level,
+                logging.getLogger(name).propagate,
+                logging.getLogger(name).disabled,
+            )
+            for name in watched
+        },
+        "streams": streams,
+    }
+
+
+def _reopen_handler(handler) -> bool:
+    """Reabre un handler que dictConfig() cerró, si su stream sigue usable.
+
+    logging no expone una API pública para reabrir un handler, por lo que se
+    restauran los dos estados internos que close() modifica: la marca
+    "_closed" y el registro en la lista global de cleanup.
+
+    Solo se reabre cuando el stream del handler sigue abierto: en un
+    FileHandler, close() cierra además el archivo, y reabrirlo produciría
+    errores de escritura. En ese caso el handler se deja cerrado y se
+    desvincula del root.
+
+    Es necesario porque pytest crea sus handlers de captura una vez por
+    sesión y los reutiliza: si quedaran cerrados, pytest los volvería a
+    adjuntar al root en la fase siguiente, ya cerrados.
+    """
+    if not getattr(handler, "_closed", False):
+        return False
+
+    stream = getattr(handler, "stream", None)
+    if stream is None or getattr(stream, "closed", False):
+        return False
+
+    handler._closed = False
+    logging._addHandlerRef(handler)
+    return True
+
+
+def restore_logging_state(state: dict) -> None:
+    """Restaura el estado global de logging capturado previamente.
+
+    Los handlers que dictConfig() cerró se reabren cuando su stream sigue
+    siendo utilizable, y no se vuelven a adjuntar al root los que no se
+    pueden reabrir (un handler cerrado provocaría "--- Logging error ---" al
+    emitir sobre él). Tampoco se altera el stream vigente (que durante los
+    tests pertenece a la captura de pytest): solo se restaura la
+    codificación de los objetos de stream capturados.
+    """
+    root = logging.getLogger()
+
+    for handler in root.handlers[:]:
+        # Se detachment los handlers que no estaban antes y también los que
+        # dictConfig() ya cerró: un handler cerrado en el root provocaría
+        # "--- Logging error ---" al emitir sobre él.
+        if handler not in state["root_handlers"] or getattr(handler, "_closed", False):
+            root.removeHandler(handler)
+
+    for handler in state["root_handlers"]:
+        if handler in root.handlers:
+            continue
+        if getattr(handler, "_closed", False):
+            _reopen_handler(handler)
+        if not getattr(handler, "_closed", False):
+            root.addHandler(handler)
+
+    root.setLevel(state["root_level"])
+    root.filters = state["root_filters"]
+
+    for name, (handlers, level, propagate, disabled) in state["loggers"].items():
+        logger = logging.getLogger(name)
+        for handler in logger.handlers[:]:
+            if handler not in handlers or getattr(handler, "_closed", False):
+                logger.removeHandler(handler)
+        for handler in handlers:
+            if handler in logger.handlers:
+                continue
+            if getattr(handler, "_closed", False):
+                _reopen_handler(handler)
+            if not getattr(handler, "_closed", False):
+                logger.addHandler(handler)
+        logger.setLevel(level)
+        logger.propagate = propagate
+        logger.disabled = disabled
+
+    for stream, encoding, errors in state["streams"]:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            if encoding is not None:
+                reconfigure(encoding=encoding)
+            if errors is not None:
+                reconfigure(errors=errors)
+        except (AttributeError, ValueError, OSError):  # pragma: no cover
+            pass
 
 
 @pytest.fixture
@@ -171,6 +260,7 @@ def test_nivel_invalido_no_propaga_excepcion(clean_env):
         resolve_log_level()
     except Exception as exc:  # pragma: no cover - no debe ocurrir
         pytest.fail(f"resolve_log_level no debe lanzar: {exc}")
+    assert resolve_log_level() == logging.getLevelName(DEFAULT_LOG_LEVEL)
 
 
 def test_warning_por_nivel_invalido_sale_en_json_por_stderr(clean_env, capsys):
@@ -387,12 +477,26 @@ def test_nombre_del_logger_es_jerarquico(clean_env, capsys):
     assert record["logger"] == "src.services.document_service"
 
 
-def test_service_por_variable_de_entorno(clean_env, capsys):
+def test_el_nombre_del_servicio_explicito_gana_sobre_el_entorno(clean_env, capsys):
+    """El nombre pasado a configure_logging() es el que se registra."""
     clean_env.setenv("SERVICE_NAME", "ms3-desde-entorno")
     configure_logging(SERVICE_NAME)
     logging.getLogger("src.api.docs_api").info("mensaje")
     record = emitted(capsys.readouterr().out)[0]
+
     assert record["service"] == SERVICE_NAME
+    assert record["service"] != "ms3-desde-entorno"
+
+
+def test_el_formateador_usa_el_entorno_cuando_no_hay_nombre_explicito(clean_env):
+    """Sin nombre explícito, el formateador toma SERVICE_NAME del entorno."""
+    clean_env.setenv("SERVICE_NAME", "ms3-desde-entorno")
+    assert JsonFormatter().service_name == "ms3-desde-entorno"
+
+
+def test_el_formateador_usa_el_valor_por_defecto_sin_entorno(clean_env):
+    """Sin nombre explícito ni variable de entorno, se usa el valor por defecto."""
+    assert JsonFormatter().service_name == "unknown-service"
 
 
 def test_no_se_exponen_atributos_internos_de_logrecord(clean_env, capsys):
@@ -547,6 +651,77 @@ def test_redact_value_recursivo_en_listas_de_texto():
     assert result[1] == "sin credenciales"
 
 
+# --- Claves sensibles compuestas ---
+
+
+def test_las_claves_catalogadas_siguen_detectandose_como_sensibles():
+    """Cada clave del catálogo debe ser reconocida por la detección."""
+    for key in SENSITIVE_KEYS:
+        assert is_sensitive_key(key), f"{key} debería detectarse como sensible"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "db_password",
+        "api_key_v2",
+        "x-auth-token",
+        "DB_PASSWORD",
+        "Api_Key_V2",
+        "X-Auth-Token",
+        "refresh_token",
+        "client_secret",
+        "user_pwd",
+        "credentials",
+        "private_key",
+    ],
+)
+def test_claves_sensibles_compuestas_se_redactan(clean_env, capsys, key):
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.api.docs_api").info("contexto", extra={key: "CLAVEDEVALORES"})
+    record = emitted(capsys.readouterr().out)[0]
+
+    assert "CLAVEDEVALORES" not in json.dumps(record)
+    assert record[key] == REDACTED
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "document_id",
+        "page_count",
+        "status",
+        "file_name",
+        "content",
+        "checksum",
+        "created_at",
+        "size_bytes",
+        "error_message",
+        "monkey",
+    ],
+)
+def test_claves_no_sensibles_no_se_redactan(clean_env, capsys, key):
+    """La detección por token no debe redactar claves innocuous."""
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.api.docs_api").info("contexto", extra={key: "valor-visible"})
+    record = emitted(capsys.readouterr().out)[0]
+
+    assert record[key] == "valor-visible"
+
+
+def test_falso_positivo_conocido_de_la_deteccion_por_token(clean_env, capsys):
+    """'tokenizer' contiene el token 'token': falso positivo conocido y aceptado.
+
+    La detección es sencilla y basada en tokens de clave; se documenta este
+    caso para que el comportamiento no se considere un error oculto.
+    """
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.api.docs_api").info("contexto", extra={"tokenizer": "valor"})
+    record = emitted(capsys.readouterr().out)[0]
+
+    assert record["tokenizer"] == REDACTED
+
+
 def test_redact_mapping():
     result = redact_mapping({"password": "x", "document_id": "abc"})
     assert result["password"] == REDACTED
@@ -592,6 +767,138 @@ def test_credencial_en_el_traceback_queda_redactada(clean_env, capsys):
     assert "CLAVEDEVALORES" not in record["exception"]
     assert "mauri" not in record["exception"]
     assert "db:27017" in record["exception"]
+
+
+# --- I-2: valores no textuales (objetos con __str__ y bytes) ---
+
+
+def test_objeto_con_str_sensible_se_redacta(clean_env, capsys):
+    """Un objeto cuyo __str__ devuelve una URI con credenciales no debe filtrarla."""
+
+    class CredencialesMongo:
+        def __str__(self):
+            return "mongodb://usuario:CLAVEDEVALORES@db:27017/?authSource=admin"
+
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.database.mongodb").error(
+        "Error al conectar con MongoDB", extra={"conn": CredencialesMongo()}
+    )
+    record = emitted(capsys.readouterr().err)[0]
+
+    assert "CLAVEDEVALORES" not in json.dumps(record)
+    assert "usuario" not in json.dumps(record)
+    assert "db:27017" in record["conn"]
+
+
+def test_bytes_con_uri_sensible_se_redacta(clean_env, capsys):
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.database.mongodb").error(
+        "bytes", extra={"raw": b"mongodb://u:CLAVEDEVALORES@db:27017"}
+    )
+    record = emitted(capsys.readouterr().err)[0]
+
+    assert "CLAVEDEVALORES" not in json.dumps(record)
+    assert "db:27017" in record["raw"]
+
+
+def test_objeto_sensible_anidado_en_extra_se_redacta(clean_env, capsys):
+    class Credenciales:
+        def __str__(self):
+            return "mongodb://usuario:CLAVEDEVALORES@db:27017"
+
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.api.docs_api").info(
+        "contexto", extra={"ctx": {"conn": Credenciales(), "db": "pdf_database_dev"}}
+    )
+    record = emitted(capsys.readouterr().out)[0]
+
+    assert "CLAVEDEVALORES" not in json.dumps(record)
+    assert record["ctx"]["db"] == "pdf_database_dev"
+
+
+def test_valores_no_sensibles_se_conservan_sin_alterar(clean_env, capsys):
+    """La redacción no debe alterar los valores que no son sensibles."""
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.api.docs_api").info(
+        "contexto",
+        extra={"document_id": "665f1a", "size_bytes": 1234, "estado": "completado"},
+    )
+    record = emitted(capsys.readouterr().out)[0]
+
+    assert record["document_id"] == "665f1a"
+    assert record["size_bytes"] == 1234
+    assert record["estado"] == "completado"
+
+
+# --- I-3: argumentos de interpolación ---
+
+
+def test_diccionario_como_argumento_se_redacta(clean_env, capsys):
+    """Un dict pasado como argumento no debe quedar en claro."""
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.database.mongodb").error(
+        "contexto: %s", {"password": "hunter2", "user": "mauri"}
+    )
+    record = emitted(capsys.readouterr().err)[0]
+
+    assert "hunter2" not in record["message"]
+    # La estructura del contexto se conserva: la clave sigue visible.
+    assert "password" in record["message"]
+    assert "mauri" in record["message"]
+
+
+def test_diccionario_anidado_como_argumento_se_redacta(clean_env, capsys):
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.api.docs_api").error(
+        "contexto: %s", {"ctx": {"api_key": "CLAVEAPI", "ok": 1}}
+    )
+    record = emitted(capsys.readouterr().err)[0]
+
+    assert "CLAVEAPI" not in record["message"]
+    assert "ok" in record["message"]
+
+
+def test_argumento_con_uri_sensible_se_redacta(clean_env, capsys):
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.database.mongodb").error(
+        "conectando a %s con usuario %s",
+        "mongodb://u:CLAVEDEVALORES@db:27017",
+        "mauri",
+    )
+    record = emitted(capsys.readouterr().err)[0]
+
+    assert "CLAVEDEVALORES" not in record["message"]
+    assert "db:27017" in record["message"]
+    assert "mauri" in record["message"]
+
+
+def test_argumentos_multiples_se_conservan(clean_env, capsys):
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.services.document_service").info(
+        "Extracción OK: '%s' -> %d página(s)", "doc.pdf", 3
+    )
+    record = emitted(capsys.readouterr().out)[0]
+
+    assert "doc.pdf" in record["message"]
+    assert "3 página(s)" in record["message"]
+
+
+def test_formato_nombrado_con_diccionario_se_conserva(clean_env, capsys):
+    """logging admite %(nombre)s con un diccionario: debe seguir funcionando."""
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.api.docs_api").info("doc %(id)s", {"id": "665f1a"})
+    record = emitted(capsys.readouterr().out)[0]
+
+    assert record["message"] == "doc 665f1a"
+
+
+def test_mensaje_sin_argumentos_no_se_modifica(clean_env, capsys):
+    """Los mensajes sin argumentos no deben modificarse (incluido un % literal)."""
+    configure_logging(SERVICE_NAME)
+    logging.getLogger("src.api.docs_api").info("Conexión con MongoDB cerrada (100%)")
+    record = emitted(capsys.readouterr().out)[0]
+
+    assert record["message"] == "Conexión con MongoDB cerrada (100%)"
 
 
 def test_diccionario_anidado_en_extra_queda_redactado(clean_env, capsys):
@@ -836,17 +1143,88 @@ def test_max_level_filter_filtra_por_nivel_estricto():
     assert filt.filter(FakeRecord(logging.ERROR)) is False
 
 
-def test_json_formatter_usa_el_service_name_por_defecto(clean_env):
-    formatter = JsonFormatter()
-    assert formatter.service_name == "unknown-service"
+def test_configuracion_sin_nivel_usa_info(clean_env):
+    """Sin LOG_LEVEL ni argumento explícito, el nivel efectivo es INFO."""
+    configure_logging(SERVICE_NAME)
+    assert logging.getLogger().level == logging.INFO
 
 
-def test_lista_de_claves_sensibles_es_explicita():
-    assert "password" in SENSITIVE_KEYS
-    assert "token" in SENSITIVE_KEYS
-    assert "authorization" in SENSITIVE_KEYS
-    assert "mongo_url" in SENSITIVE_KEYS
+# --- Aislamiento del estado global de logging ---
 
 
-def test_default_log_level_es_info():
-    assert DEFAULT_LOG_LEVEL == "INFO"
+def test_la_restauracion_no_rea_agrega_handlers_cerrados(clean_env):
+    """dictConfig() cierra los handlers previos: no deben volver al root."""
+    state = capture_logging_state()
+    propio = logging.NullHandler()
+    logging.getLogger().addHandler(propio)
+
+    configure_logging(SERVICE_NAME)
+    assert getattr(propio, "_closed", False), "dictConfig debería cerrar el handler"
+
+    restore_logging_state(state)
+
+    root = logging.getLogger()
+    assert propio not in root.handlers
+    assert not [h for h in root.handlers if getattr(h, "_closed", False)]
+
+
+def test_la_restauracion_no_deja_handlers_del_modulo(clean_env):
+    """Tras restaurar, el root no debe conservar handlers del módulo."""
+    state = capture_logging_state()
+    configure_logging(SERVICE_NAME)
+    assert any(isinstance(h, DynamicStreamHandler) for h in logging.getLogger().handlers)
+
+    restore_logging_state(state)
+
+    root = logging.getLogger()
+    assert not [h for h in root.handlers if isinstance(h, DynamicStreamHandler)]
+
+
+def test_la_restauracion_devuelve_el_nivel_del_root(clean_env):
+    state = capture_logging_state()
+    nivel_original = logging.getLogger().level
+
+    configure_logging(SERVICE_NAME, level="DEBUG")
+    assert logging.getLogger().level == logging.DEBUG
+
+    restore_logging_state(state)
+    assert logging.getLogger().level == nivel_original
+
+
+def test_la_restauracion_revierte_la_codificacion_de_los_streams(clean_env):
+    """_force_utf8_streams() cambia el encoding: la restauración lo revierte."""
+
+    class FakeStream:
+        def __init__(self):
+            self.encoding = "cp1252"
+            self.errors = "strict"
+            self.reconfigurations = []
+
+        def reconfigure(self, **kwargs):
+            self.reconfigurations.append(kwargs)
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    fake = FakeStream()
+    state = capture_logging_state()
+    state["streams"] = [(fake, "cp1252", "strict")]
+
+    configure_logging(SERVICE_NAME)
+    restore_logging_state(state)
+
+    assert fake.reconfigurations, "debería haber reconfigurado el stream capturado"
+    assert fake.encoding == "cp1252"
+    assert fake.errors == "strict"
+
+
+def test_la_restauracion_no_altera_el_stream_vigente_de_pytest(clean_env):
+    """La restauración no debe tocar el stream que pytest tiene capturado."""
+    state = capture_logging_state()
+    stream_vigente = sys.stdout
+    encoding_vigente = stream_vigente.encoding
+
+    configure_logging(SERVICE_NAME)
+    restore_logging_state(state)
+
+    assert sys.stdout is stream_vigente
+    assert sys.stdout.encoding == encoding_vigente

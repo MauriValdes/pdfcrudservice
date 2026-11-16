@@ -18,15 +18,25 @@ Características:
   emite un warning en JSON por stderr.
 - No se registran credenciales: las URI con usuario/clave se redactan.
 
+Advertencia: configure_logging() reemplaza la configuración global de logging
+mediante logging.config.dictConfig(), lo que CIERRA cualquier handler
+registrado previamente en el proceso (incluidos los de integraciones de APM,
+OpenTelemetry o Sentry). Debe invocarse antes de registrar esos handlers.
+
 Alcance de la protección de datos sensibles
 --------------------------------------------
 La redacción implementada en este módulo es una BARRERA ADICIONAL de primer
 nivel, NO una garantía absoluta. Oculta:
 
 - Credenciales embebidas en una URI (mongodb://usuario:clave@host:27017).
-- Valores cuyas claves están en SENSITIVE_KEYS (password, token, ...).
+- Valores cuyas claves son sensibles, incluidas las variantes compuestas
+  habituales ("db_password", "api_key_v2", "x-auth-token"), tanto en primer
+  nivel como anidadas en diccionarios y listas.
 - Los mismos patrones dentro de diccionarios y listas anidados.
-- Los mensajes interpolados con %s, los tracebacks completos y el stack info.
+- Los mensajes interpolados con %s (incluidos los diccionarios usados como
+  argumento), los tracebacks completos y el stack info.
+- Los valores no textuales (bytes u objetos con __str__) cuya
+  representación textual exponga una URI con credenciales.
 
 NO puede ocultar, y por lo tanto no debe considerarse que lo haga:
 
@@ -105,6 +115,50 @@ _URI_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>[a-zA-Z][\w+.-]*://)(?P<credentials>[^/@\s]+)@"
 )
 
+# Normalización de claves para detectar variantes de nombres sensibles.
+# Se eliminan los separadores ("db_password" -> "dbpassword") y se pasan a
+# minúsculas, de modo que la comparación sea estable y predecible.
+_KEY_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+
+# Tokens sensibles buscados dentro de una clave normalizada. Cubre las
+# variantes habituales que no aparecen literalmente en SENSITIVE_KEYS
+# ("db_password", "api_key_v2", "x-auth-token", "refreshToken", ...).
+# Se listan de forma exhaustiva y simple: no se intenta detectar secretos
+# por heurística, solo por nombre de clave.
+SENSITIVE_KEY_TOKENS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credential",
+    "privatekey",
+)
+
+_SENSITIVE_KEYS_NORMALIZED = frozenset(
+    _KEY_NORMALIZE_RE.sub("", str(key).lower()) for key in SENSITIVE_KEYS
+)
+
+
+def is_sensitive_key(key: Any) -> bool:
+    """Indica si una clave debe tratarse como sensible.
+
+    Criterio simple y predecible, basado únicamente en el nombre de la clave:
+
+    1. La clave normalizada (minúsculas y sin separadores) coincide con
+       alguna de las claves catalogadas en SENSITIVE_KEYS.
+    2. La clave normalizada contiene alguno de los tokens de
+       SENSITIVE_KEY_TOKENS, lo que cubre variantes habituales como
+       "db_password", "api_key_v2" o "x-auth-token".
+    """
+    normalized = _KEY_NORMALIZE_RE.sub("", str(key).lower())
+    if normalized in _SENSITIVE_KEYS_NORMALIZED:
+        return True
+    return any(token in normalized for token in SENSITIVE_KEY_TOKENS)
+
 
 def redact_uri(uri: str | None) -> str:
     """Oculta las credenciales embebidas en una URI.
@@ -121,30 +175,40 @@ def redact_uri(uri: str | None) -> str:
     return _URI_CREDENTIALS_RE.sub(rf"\g<scheme>{REDACTED}:{REDACTED}@", str(uri))
 
 
-def redact_value(key: str, value: Any) -> Any:
+def redact_value(key: Any, value: Any) -> Any:
     """Redacta un valor de forma recursiva.
 
     Reglas aplicadas en orden:
 
-    1. Si la clave es sensible, todo el valor se reemplaza por "***".
+    1. Si la clave es sensible (ver is_sensitive_key), todo el valor se
+       reemplaza por "***".
     2. Si el valor es texto, se ocultan las credenciales de una URI.
     3. Si el valor es un diccionario, se aplica la misma regla a cada
        entrada, conservando la estructura del contexto.
     4. Si el valor es una lista, tupla o conjunto, se aplica la misma regla
        a cada elemento, conservando la estructura.
+    5. Cualquier otro valor (bytes u objetos con __str__) se convierte a
+       texto y se redacta: su representación textual podría exponer una
+       URI con credenciales.
 
     La estructura del contexto se conserva: solo se sustituyen los valores
     sensibles, nunca el contenedor que los contiene.
     """
-    if str(key).lower() in SENSITIVE_KEYS:
+    if is_sensitive_key(key):
         return REDACTED
     if isinstance(value, str):
         return redact_uri(value)
     if isinstance(value, Mapping):
-        return {str(k): redact_value(str(k), v) for k, v in value.items()}
+        return {str(k): redact_value(k, v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [redact_value(key, item) for item in value]
-    return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return redact_uri(bytes(value).decode("utf-8", errors="replace"))
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    # Objeto de cualquier otro tipo: se serializa a texto y se redacta,
+    # porque su __str__ puede exponer una URI con credenciales.
+    return redact_uri(str(value))
 
 
 def redact_mapping(mapping: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -163,6 +227,41 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
     return str(value)
+
+
+def _redact_record_args(args: Any) -> Any:
+    """Redacta los argumentos de interpolación de un LogRecord.
+
+    logging admite dos formas de argumentos: una tupla posicional
+    ("%s", valor) o un diccionario ("%(nombre)s", {"nombre": valor}).
+    En ambos casos se aplica la redacción recursiva antes de interpolar,
+    para que un diccionario sensible no termine representado como texto
+    sin revisar sus claves.
+    """
+    if not args:
+        return args
+    if isinstance(args, Mapping):
+        return redact_value("", args)
+    if isinstance(args, tuple):
+        return tuple(redact_value("", arg) for arg in args)
+    return args
+
+
+def _format_record_message(record: logging.LogRecord) -> str:
+    """Construye el mensaje de un registro con los argumentos ya redactados.
+
+    Replica el comportamiento de logging.LogRecord.getMessage() (str del
+    formato aplicado a los argumentos), pero interpola los argumentos ya
+    redactados. Los mensajes sin argumentos no se modifican.
+    """
+    msg = record.msg
+    args = record.args
+    if not args:
+        return redact_uri(str(msg))
+    try:
+        return redact_uri(str(msg) % _redact_record_args(args))
+    except Exception:  # pragma: no cover - defensivo
+        return redact_uri(str(msg))
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +311,9 @@ class JsonFormatter(logging.Formatter):
         )
 
     def format(self, record: logging.LogRecord) -> str:
-        try:
-            message = record.getMessage()
-        except Exception:  # pragma: no cover - defensivo
-            message = str(record.msg)
-
-        # La redacción se aplica DESPUÉS de getMessage() para cubrir también
-        # las credenciales que llegan como argumentos de %-formatting.
-        message = redact_uri(message)
+        # El mensaje se construye con los argumentos ya redactados, de modo
+        # que un diccionario sensible no quede expuesto en su forma textual.
+        message = _format_record_message(record)
 
         payload: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(
@@ -318,7 +412,7 @@ class RedactionFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         for key in list(record.__dict__):
-            if key.lower() in SENSITIVE_KEYS:
+            if is_sensitive_key(key):
                 record.__dict__[key] = REDACTED
         return True
 
@@ -470,6 +564,17 @@ def configure_logging(
         - Los registros previos a esta llamada conservan su configuración.
         - Es seguro llamarla más de una vez: dictConfig reemplaza los
           handlers del root en lugar de acumularlos.
+        - EFECTO GLOBAL: logging.config.dictConfig() no solo reemplaza los
+          handlers del root logger, sino que además CIERRA todos los
+          handlers registrados previamente en el proceso (los que
+          logging.shutdown() alcanza a través de logging._handlerList),
+          incluidos los pertenecientes a loggers de terceros y los que
+          hubiera agregado un APM, OpenTelemetry, Sentry u otra integración
+          similar. Por eso la inicialización del logging centralizado
+          debe realizarse ANTES de registrar cualquier handler de terceros:
+          configure_logging() no debe invocarse después de configurar
+          esas integraciones, o sus handlers quedarían cerrados y
+          dejarían de recibir eventos.
     """
     resolved_level, is_valid, raw = _resolve_log_level_info(level)
 
