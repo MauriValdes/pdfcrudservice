@@ -17,7 +17,9 @@ stdout/stderr y no existe ningún mensaje de texto plano.
 """
 
 import logging
+import asyncio
 from contextlib import asynccontextmanager
+from fastapi import HTTPException, status  # noqa: E402
 
 from src.config.config import settings
 from src.core.logging_config import configure_logging
@@ -33,24 +35,48 @@ from fastapi import FastAPI  # noqa: E402
 
 from src.api.docs_api import router as docs_router  # noqa: E402
 from src.core.exceptions import register_exception_handlers  # noqa: E402
-from src.database.mongodb import db_connection  # noqa: E402
+from src.database.mongodb import db_connection, retry_connect  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# Log de inicio de servicio: debe aparecer cuando el módulo se carga/recarga.
+# Este es necesario para que los tests que hacen importlib.reload(src.main)
+# verifiquen el arranque correcto.
+logger.info("Servicio MS3 (pdfcrudservice) iniciado")
+
+# 3) Definición del lifespan con supervisión de conexión MongoDB.
+#    La tarea de conexión y supervisión se inicia en background para no
+#    bloquear el arranque. Si MongoDB no está disponible, FastAPI inicia
+#    normalmente y las tareas intentarán recuperarse automáticamente.
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
+    # Iniciar tarea de conexión y supervisión de MongoDB en background.
+    # Esto permite que FastAPI inicie aunque MongoDB no esté disponible.
+    # La tarea intentará conectarse con backoff exponencial y, tras éxito,
+    # iniciará supervisión continua con ping periódico.
     logger.info("Iniciando conexión con MongoDB...")
-    await db_connection.connect()
+    connection_task = asyncio.create_task(retry_connect())
+    logger.info("Tarea de conexión MongoDB iniciada en background")
 
-    yield
+    try:
+        yield
+    finally:
+        # Cancelar la tarea de conexión/supervisión
+        connection_task.cancel()
+        # Detener tarea de supervisión (si existe)
+        await db_connection.stop_supervision()
+        # Esperar a que la tarea de conexión se detenga (puede lanzar CancelledError)
+        try:
+            await connection_task
+        except asyncio.CancelledError:
+            logger.info("Tarea de conexión MongoDB cancelada durante apagado")
+        # Cerrar conexión MongoDB gracefully
+        await db_connection.disconnect()
+        logger.info("Cerrando conexiones...")
 
-    logger.info("Cerrando conexiones...")
-    await db_connection.close()
-
-
-logger.info("Servicio MS3 (pdfcrudservice) iniciado")
 
 app = FastAPI(
     title="PDF Extract Text API",
@@ -64,6 +90,7 @@ register_exception_handlers(app)
 
 app.include_router(docs_router)
 
+
 @app.get("/")
 async def root():
     return {
@@ -74,4 +101,32 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    """Liveness check: verifica que el proceso FastAPI esté vivo.
+
+    Este endpoint es independiente de MongoDB: responde 200 aunque la BD
+    esté caída, ya que su propósito es que el orquestador (K8s, Docker)
+    sepa que el container sigue corriendo. No realiza operaciones de BD.
+    """
+    return {"status": "ok", "service": "ms3-crud", "timestamp": "live"}
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness check: verifica que el servicio esté listo para recibir peticiones.
+
+    Retorna 200 cuando MongoDB está disponible Y sus índices críticos
+    están inicializados. Retorna 503 cuando MongoDB no está disponible
+    o sus índices no están listos.
+
+    Este endpoint es usado por orquestadores para decidir enrutar tráfico.
+    """
+    # Usar el estado consolidado de indexes_ready que combina
+    # _connected y _indexes_created en mongodb.py
+    if db_connection.indexes_ready:
+        # Índices listos y conexión activa
+        return {"status": "ready", "database": "mongodb_connected"}
+    # Si no estamos listos por ninguna razón (no conectado, índices faltantes, etc.)
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"database": "mongodb_unavailable", "reason": "Índices no listos o MongoDB no disponible"}
+    )
