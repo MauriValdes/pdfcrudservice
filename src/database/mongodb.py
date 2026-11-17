@@ -3,7 +3,7 @@ import logging
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from src.config.config import settings
+from src.config.config import MONGO_TEST_DATABASE, settings
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,9 @@ class MongoDB:
     """
 
     def __init__(self):
+        self._mongo_url = None
+        self._database_name = None
+        self._testing = False
         self.client = None
         self.db = None
         self._connected = False
@@ -38,6 +41,15 @@ class MongoDB:
         self._supervision_shutdown = False
         # Tarea de supervisión en background (creada por start_supervision)
         self._supervision_task = None
+
+    @classmethod
+    def for_testing(cls):
+        """Create an isolated manager using only the validated test URI/database."""
+        manager = cls()
+        manager._mongo_url = settings.get_mongo_test_url()
+        manager._database_name = MONGO_TEST_DATABASE
+        manager._testing = True
+        return manager
 
     @property
     def connected(self) -> bool:
@@ -75,6 +87,11 @@ class MongoDB:
             Exception: si el ping falla o si no se pudo crear el índice
                 obligatorio 'checksum_unique'.
         """
+        if self._testing and database_name not in (None, MONGO_TEST_DATABASE):
+            raise ValueError(
+                f"La conexión de testing solo permite la base {MONGO_TEST_DATABASE}."
+            )
+
         # Crear cliente MongoDB (único, no acumular instancias)
         if self.client is not None:
             try:
@@ -88,20 +105,34 @@ class MongoDB:
             self.client = None
             self.db = None
 
-        self.client = AsyncIOMotorClient(settings.mongo_url)
+        mongo_url = self._mongo_url if self._testing else settings.mongo_url
+        selected_database = (
+            self._database_name
+            if self._testing
+            else database_name or settings.mongo_db_dev
+        )
+        try:
+            self.client = AsyncIOMotorClient(mongo_url)
+        except Exception:
+            if self._testing:
+                raise RuntimeError(
+                    "No se pudo inicializar el cliente MongoDB de testing; "
+                    "verifique MONGO_TEST_URL."
+                ) from None
+            raise
 
         # Selección dinámica de la base de datos
-        if database_name:
-            self.db = self.client[database_name]
-        else:
-            self.db = self.client[settings.mongo_db_dev]
+        self.db = self.client[selected_database]
 
         # Verificar conexión con ping; si falla, limpiar y propagar
         try:
             await self.client.admin.command('ping')
             logger.info("Ping a MongoDB exitoso")
         except Exception as e:
-            logger.warning(f"Ping a MongoDB falló: {e}. No se establece conexión.")
+            if self._testing:
+                logger.warning("Ping a MongoDB de testing falló; conexión no establecida.")
+            else:
+                logger.warning(f"Ping a MongoDB falló: {e}. No se establece conexión.")
             self._connected = False
             self._indexes_created = False
             try:
@@ -113,6 +144,10 @@ class MongoDB:
             self.client = None
             self.db = None
             logger.error("No se pudo establecer conexión con MongoDB - ping falló")
+            if self._testing:
+                raise RuntimeError(
+                    "Falló el ping a MongoDB de testing; revise conectividad y credenciales."
+                ) from None
             raise
 
         # Ping exitoso: recién ahora la conexión está establecida
@@ -126,7 +161,11 @@ class MongoDB:
         except Exception as e:
             logger.error(
                 f"Fallo la inicialización del índice obligatorio: "
-                f"la conexión no se considera completa: {e}"
+                + (
+                    "la conexión de testing no se considera completa."
+                    if self._testing
+                    else f"la conexión no se considera completa: {e}"
+                )
             )
             self._connected = False
             self._indexes_created = False
@@ -138,6 +177,10 @@ class MongoDB:
                 pass
             self.client = None
             self.db = None
+            if self._testing:
+                raise RuntimeError(
+                    "Falló la inicialización del índice en MongoDB de testing."
+                ) from None
             raise
 
         # Recuperación completa (ping + índices): recién aquí se reinicia el
@@ -173,7 +216,10 @@ class MongoDB:
             # Confirmar que los índices obligatorios están disponibles
             self._indexes_created = True
         except Exception as e:
-            logger.error(f"Error al crear índice único en 'checksum': {e}")
+            if self._testing:
+                logger.error("Error al crear índice único en MongoDB de testing.")
+            else:
+                logger.error(f"Error al crear índice único en 'checksum': {e}")
             # Controlar que el índice falló creación
             self._indexes_created = False
             raise
@@ -248,7 +294,12 @@ class MongoDB:
                 raise
             except Exception as e:
                 # El ping falló: MongoDB podría haber caído
-                logger.warning(f"Ping a MongoDB falló: {e}. Marcando conexión como caída.")
+                if self._testing:
+                    logger.warning("Ping a MongoDB de testing falló; conexión marcada como caída.")
+                else:
+                    logger.warning(
+                        f"Ping a MongoDB falló: {e}. Marcando conexión como caída."
+                    )
                 # Marcar conexión como caída e índices no disponibles
                 self._connected = False
                 self._indexes_created = False
