@@ -159,7 +159,7 @@ class MongoDB:
             Exception: si no hay base de datos seleccionada o si la creación
                 del índice falla.
         """
-        if not self.db:
+        if self.db is None:
             self._indexes_created = False
             logger.error("No hay base de datos seleccionada; no se puede crear el índice 'checksum_unique'.")
             raise RuntimeError("No hay base de datos seleccionada para crear el índice 'checksum_unique'.")
