@@ -10,6 +10,7 @@ Verifican que:
 - El arranque no genera errores y los registros mantienen el formato JSON.
 """
 
+import asyncio
 import importlib
 import json
 import logging
@@ -168,8 +169,20 @@ def test_el_lifespan_registra_el_inicio_y_el_cierre(monkeypatch, capsys):
     importlib.reload(src.main)
     capsys.readouterr()
 
-    monkeypatch.setattr(db_connection, "connect", AsyncMock())
-    monkeypatch.setattr(db_connection, "close", AsyncMock())
+    # Los mocks anteriores (connect/close) eran vestigiales: el lifespan
+    # real invoca la función de módulo retry_connect(), stop_supervision()
+    # y disconnect(). Se mockea exactamente lo que el lifespan usa, sin
+    # intentar ninguna conexión a MongoDB (antes el retry_connect real
+    # creaba un cliente Motor e intentaba un ping a localhost:27017).
+    async def retry_connect_suspendido():
+        # Permanece suspendida hasta que el apagado del lifespan la
+        # cancele: misma forma que la tarea real (tarea pendiente al
+        # apagar -> cancelada), sin conexión real.
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(src.main, "retry_connect", retry_connect_suspendido)
+    monkeypatch.setattr(db_connection, "stop_supervision", AsyncMock())
+    monkeypatch.setattr(db_connection, "disconnect", AsyncMock())
 
     with TestClient(src.main.app):
         pass
