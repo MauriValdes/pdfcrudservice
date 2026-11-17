@@ -3,9 +3,10 @@ import datetime
 import asyncio
 import httpx
 import hashlib
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from bson import ObjectId
 from fastapi.testclient import TestClient
+from pymongo.errors import AutoReconnect, DuplicateKeyError, ServerSelectionTimeoutError
 
 from src.main import app
 from src.api.docs_api import get_document_service
@@ -908,6 +909,246 @@ async def test_index_initialization_fails_gracefully(monkeypatch):
         mongodb = MongoDB()
         with pytest.raises(Exception):
             await mongodb.connect()
+
+
+# =============================================================================
+# Etapa 2 - Factor 4: indisponibilidad de MongoDB -> HTTP 503
+# =============================================================================
+
+def _patch_db_connection(monkeypatch, mock_db, connected: bool = True):
+    """Parchea el singleton db_connection con una BD mockeada y un estado dado."""
+    monkeypatch.setattr(db_connection, "db", mock_db)
+    monkeypatch.setattr(db_connection, "_connected", connected)
+
+
+def _mock_db_with_collection(mock_collection):
+    """Crea una BD mockeada cuya colección (settings.mongo_collection) es mock_collection."""
+    mock_db = MagicMock()
+    mock_db.__getitem__.return_value = mock_collection
+    return mock_db
+
+
+def _mock_collection_raising(operation: str, error: Exception):
+    """Crea una colección mockeada donde la operación indicada lanza `error`."""
+    mock_collection = MagicMock()
+    if operation == "find":
+        cursor = MagicMock()
+        cursor.to_list = AsyncMock(side_effect=error)
+        mock_collection.find.return_value = cursor
+    else:
+        setattr(mock_collection, operation, AsyncMock(side_effect=error))
+    return mock_collection
+
+
+def test_endpoints_return_503_when_db_is_none(client, monkeypatch):
+    """Si db_connection.db es None (conexión nunca establecida), los cinco
+    endpoints CRUD responden 503 y no 500 con TypeError."""
+    _patch_db_connection(monkeypatch, None, connected=False)
+    valid_id = str(ObjectId())
+    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
+
+    response = client.post("/documents/", files=files)
+    assert response.status_code == 503
+    assert "base de datos" in response.json()["detail"]
+
+    assert client.get("/documents").status_code == 503
+    assert client.get(f"/documents/{valid_id}").status_code == 503
+    assert client.patch(
+        f"/documents/{valid_id}", json={"status": "completed"}
+    ).status_code == 503
+    assert client.delete(f"/documents/{valid_id}").status_code == 503
+
+
+@pytest.mark.parametrize(
+    "db_error",
+    [
+        ServerSelectionTimeoutError("simulado"),
+        AutoReconnect("simulado"),
+    ],
+    ids=["server_selection_timeout", "auto_reconnect"],
+)
+def test_get_all_documents_returns_503_on_pymongo_connectivity_errors(
+    client, monkeypatch, db_error
+):
+    """ServerSelectionTimeoutError y AutoReconnect se traducen a 503 (no 500)."""
+    mock_db = _mock_db_with_collection(
+        _mock_collection_raising("find", db_error)
+    )
+    _patch_db_connection(monkeypatch, mock_db, connected=True)
+
+    response = client.get("/documents")
+    assert response.status_code == 503
+    assert "base de datos" in response.json()["detail"]
+
+
+def test_get_document_by_id_returns_503_on_connectivity_error(client, monkeypatch):
+    """GET /documents/{id} con find_one fallando por conectividad -> 503."""
+    mock_db = _mock_db_with_collection(
+        _mock_collection_raising("find_one", ServerSelectionTimeoutError("simulado"))
+    )
+    _patch_db_connection(monkeypatch, mock_db, connected=True)
+
+    response = client.get(f"/documents/{str(ObjectId())}")
+    assert response.status_code == 503
+    assert "base de datos" in response.json()["detail"]
+
+
+def test_upload_pdf_returns_503_when_mongodb_fails_mid_flow(client, monkeypatch):
+    """POST: el documento no es duplicado pero insert_one falla por caída de
+    MongoDB -> 503 controlado, no 500 inesperado."""
+    mock_collection = MagicMock()
+    mock_collection.find_one = AsyncMock(return_value=None)  # no duplicado
+    mock_collection.insert_one = AsyncMock(
+        side_effect=ServerSelectionTimeoutError("simulado")
+    )
+    _patch_db_connection(monkeypatch, _mock_db_with_collection(mock_collection), connected=True)
+
+    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
+    response = client.post("/documents/", files=files)
+    assert response.status_code == 503
+    assert "El documento ya existe" not in response.json()["detail"]
+
+
+def test_patch_returns_503_on_connectivity_error(client, monkeypatch):
+    """PATCH /documents/{id} con update_one fallando por conectividad -> 503."""
+    mock_db = _mock_db_with_collection(
+        _mock_collection_raising("update_one", AutoReconnect("simulado"))
+    )
+    _patch_db_connection(monkeypatch, mock_db, connected=True)
+
+    response = client.patch(
+        f"/documents/{str(ObjectId())}", json={"status": "completed"}
+    )
+    assert response.status_code == 503
+    assert "base de datos" in response.json()["detail"]
+
+
+def test_delete_returns_503_on_connectivity_error(client, monkeypatch):
+    """DELETE /documents/{id} con delete_one fallando por conectividad -> 503."""
+    mock_db = _mock_db_with_collection(
+        _mock_collection_raising("delete_one", ServerSelectionTimeoutError("simulado"))
+    )
+    _patch_db_connection(monkeypatch, mock_db, connected=True)
+
+    response = client.delete(f"/documents/{str(ObjectId())}")
+    assert response.status_code == 503
+    assert "base de datos" in response.json()["detail"]
+
+
+def test_fast_fail_skips_db_operations_when_not_connected(client, monkeypatch):
+    """Fast-fail: con connected False, 503 inmediato sin tocar la base de datos.
+
+    Esto evita esperas prolongadas (timeouts internos de Motor) ante una caída
+    ya detectada por el supervisor.
+    """
+    mock_db = MagicMock()
+    mock_collection = MagicMock()
+    mock_db.__getitem__.return_value = mock_collection
+    _patch_db_connection(monkeypatch, mock_db, connected=False)
+
+    response = client.get("/documents")
+    assert response.status_code == 503
+    # La dependencia no debe llegar a construir el repositorio ni operar la BD
+    mock_db.__getitem__.assert_not_called()
+    mock_collection.find.assert_not_called()
+
+
+def test_duplicate_document_still_returns_400_with_real_repository(
+    client, monkeypatch
+):
+    """DuplicateKeyError NO se traduce a 503: el servicio lo convierte y la
+    API conserva el 400 'El documento ya existe'."""
+    mock_collection = MagicMock()
+    mock_collection.find_one = AsyncMock(return_value=None)  # no existe aún
+    mock_collection.insert_one = AsyncMock(
+        side_effect=DuplicateKeyError("E11000 duplicate key", 11000)
+    )
+    _patch_db_connection(monkeypatch, _mock_db_with_collection(mock_collection), connected=True)
+
+    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
+    response = client.post("/documents/", files=files)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "El documento ya existe"
+
+
+def test_ms2_failure_with_mongodb_down_returns_503(client, monkeypatch):
+    """Si MS2 falla y además MongoDB está caído, prevalece el 503 (no 400/500):
+    no se puede ni persistir el estado FAILED ni recuperar el documento."""
+    mock_collection = MagicMock()
+    mock_collection.find_one = AsyncMock(return_value=None)  # no duplicado
+    mock_collection.insert_one = AsyncMock(
+        return_value=MagicMock(inserted_id=ObjectId())
+    )
+    mock_collection.update_one = AsyncMock(
+        side_effect=ServerSelectionTimeoutError("simulado")
+    )
+    _patch_db_connection(monkeypatch, _mock_db_with_collection(mock_collection), connected=True)
+
+    # MS2 inalcanzable (mock de red, sin dependencia de servicios reales)
+    with patch("src.services.document_service.httpx.AsyncClient") as mock_client_cls:
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("MS2 caído"))
+        mock_client_cls.return_value = mock_client
+
+        files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
+        response = client.post("/documents/", files=files)
+
+    assert response.status_code == 503
+    assert "base de datos" in response.json()["detail"]
+
+
+def test_upload_pdf_too_large_still_returns_413(client, mock_service):
+    """Regresión de validación: archivo demasiado grande mantiene 413
+    (con la BD operativa, vía servicio inyectado)."""
+    oversized = b"%PDF-1.4 " + b"x" * (settings.max_file_size_mb * 1024 * 1024 + 1)
+    response = client.post(
+        "/documents/", files={"file": ("big.pdf", oversized, "application/pdf")}
+    )
+    assert response.status_code == 413
+
+
+def test_ms2_errors_are_not_confused_with_mongodb_unavailability(
+    client, mock_service
+):
+    """Regresión: un error de conexión con MS2 NO se traduce a 503; conserva
+    el comportamiento actual (201 + documento FAILED)."""
+    now = datetime.datetime.now()
+    mock_service.submit_pdf.return_value = DocumentResponse(
+        id="test-id",
+        filename="test.pdf",
+        checksum="checksum123",
+        size_bytes=1024,
+        status="pending",
+        content=None,
+        page_count=None,
+        error_message=None,
+        created_at=now,
+        updated_at=now,
+    )
+    mock_service.process_pdf_extraction = AsyncMock(
+        side_effect=httpx.ConnectError("Connection error to extract service")
+    )
+    mock_service.get_document_by_id.return_value = DocumentResponse(
+        id="test-id",
+        filename="test.pdf",
+        checksum="checksum123",
+        size_bytes=1024,
+        status="failed",
+        content=None,
+        page_count=0,
+        error_message="Connection error to extract service",
+        created_at=now,
+        updated_at=now,
+    )
+
+    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
+    response = client.post("/documents/", files=files)
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["error_message"] == "Connection error to extract service"
 
 
 # =============================================================================

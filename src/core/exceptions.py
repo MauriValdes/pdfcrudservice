@@ -57,6 +57,18 @@ class ExtractionError(AppError):
     detail = "No se pudo extraer el texto del PDF (archivo inválido o corrupto)"
 
 
+class DatabaseUnavailableError(AppError):
+    """MongoDB no está disponible: no conectado o caído durante la operación.
+
+    Se traduce a HTTP 503 para que el cliente reintente más tarde, sin
+    confundir la indisponibilidad del backing service con un error interno
+    del servicio (500).
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    detail = "Servicio temporalmente no disponible: base de datos no accesible"
+
+
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     """Traduce cualquier AppError (y subclases) a una respuesta JSON uniforme."""
     logger.warning(

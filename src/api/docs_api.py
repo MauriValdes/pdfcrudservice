@@ -8,6 +8,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
 from src.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
 from src.models.document import DocumentStatus
 from src.config.config import settings
+from src.core.exceptions import AppError, DatabaseUnavailableError
 from src.database.mongodb import db_connection
 from src.repository.document_repository import DocumentRepository, InvalidObjectIdError
 from src.services.document_service import DocumentService
@@ -19,6 +20,14 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 # Inyección de Dependencias
 def get_document_service() -> DocumentService:
+    # Fast-fail ante indisponibilidad de MongoDB:
+    # - db is None: la conexión nunca llegó a establecerse (evita el TypeError
+    #   de indexar None y el 500 inesperado).
+    # - connected False: el supervisor ya detectó una caída y la reconexión
+    #   está en curso; responder 503 inmediato en lugar de esperar los
+    #   timeouts internos de Motor (~30s).
+    if db_connection.db is None or not db_connection.connected:
+        raise DatabaseUnavailableError()
     repository = DocumentRepository(db_connection.db)
     return DocumentService(
         repository=repository,
@@ -99,6 +108,10 @@ async def upload_pdf(
 
     except HTTPException:
         raise
+    except AppError:
+        # Indisponibilidad de MongoDB y demás errores de dominio:
+        # el manejador central preserva el código HTTP (ej. 503).
+        raise
     except ValueError as e:
         # Errores de negocio o de validación de respuesta MS2.
         # Incluye el documento duplicado: el servicio convierte
@@ -108,6 +121,9 @@ async def upload_pdf(
             failed_doc = await service.get_document_by_id(document_id) if document_id else None
             if failed_doc and failed_doc.status == "failed":
                 return failed_doc
+        except AppError:
+            # MongoDB no disponible durante la recuperación del estado: 503
+            raise
         except Exception:
             pass
         # Si no hay documento FAILED, lanzamos el error HTTP
@@ -122,6 +138,9 @@ async def upload_pdf(
             failed_doc = await service.get_document_by_id(document_id) if document_id else None
             if failed_doc and failed_doc.status == "failed":
                 return failed_doc
+        except AppError:
+            # MongoDB no disponible durante la recuperación del estado: 503
+            raise
         except Exception:
             pass
         raise HTTPException(
@@ -143,6 +162,9 @@ async def get_all_documents(
     try:
         documents = await service.get_all_documents()
         return documents
+    except AppError:
+        # Indisponibilidad de MongoDB (503): el manejador central la traduce.
+        raise
     except Exception as e:
         logger.error(f"Error al obtener documentos: {e}", exc_info=True)
         raise HTTPException(
@@ -180,6 +202,9 @@ async def get_document_by_id(
             )
         return doc
     except HTTPException:
+        raise
+    except AppError:
+        # Indisponibilidad de MongoDB (503): el manejador central la traduce.
         raise
     except Exception as e:
         logger.error(f"Error al obtener documento {document_id}: {e}", exc_info=True)
@@ -219,6 +244,9 @@ async def update_document(
         )
     except HTTPException:
         raise
+    except AppError:
+        # Indisponibilidad de MongoDB (503): el manejador central la traduce.
+        raise
     except Exception as e:
         logger.error(f"Error al actualizar documento {document_id}: {e}", exc_info=True)
         raise HTTPException(
@@ -255,6 +283,9 @@ async def delete_document_by_id(
             detail=str(e)
         )
     except HTTPException:
+        raise
+    except AppError:
+        # Indisponibilidad de MongoDB (503): el manejador central la traduce.
         raise
     except Exception as e:
         logger.error(f"Error al eliminar documento {document_id}: {e}", exc_info=True)
