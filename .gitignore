@@ -127,7 +127,10 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+# --- Variables de entorno y secretos ---
 .env
+.env.*
+!.env.example
 bin/
 include/
 lib64

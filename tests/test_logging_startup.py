@@ -74,6 +74,7 @@ def recaptured(captured) -> list[dict]:
 
 def test_settings_expone_el_nivel_de_logging_por_defecto(monkeypatch):
     monkeypatch.delenv("LOG_LEVEL", raising=False)
+    assert Settings.model_config.get("env_file") is None
     assert Settings().log_level == "INFO"
 
 

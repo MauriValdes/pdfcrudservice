@@ -3,6 +3,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # Local default without authentication; Docker Compose injects the
+    # authenticated URI explicitly for its MongoDB container.
     mongo_url: str = Field(default="mongodb://localhost:27017", alias="MONGO_URL")
     # 🗄️ Base de datos de desarrollo (usada por defecto al conectar)
     mongo_db_dev: str = "pdf_database_dev"
@@ -27,8 +29,6 @@ class Settings(BaseSettings):
         return value.strip().upper()
 
     model_config = SettingsConfigDict(
-        env_file=".env", 
-        env_file_encoding='utf-8',
         extra='ignore' 
     )
 settings = Settings()

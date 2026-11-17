@@ -63,11 +63,16 @@ services:
         condition: service_healthy
     environment:
       # --- MongoDB ---
-      - MONGO_URL=mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@db:27017/?authSource=admin
-      - MONGO_DB_DEV=${MONGO_DB_DEV:-pdf_database_dev}
-      - MONGO_DB_TEST=${MONGO_DB_TEST:-pdf_database_test}
-      - MONGO_COLLECTION=${MONGO_COLLECTION:-processed_pdfs}
-      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-5}
+      MONGO_URL: "${MONGO_URL_DOCKER:-mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@db:27017/?authSource=admin}"
+      MONGO_DB_DEV: ${MONGO_DB_DEV:-pdf_database_dev}
+      MONGO_DB_TEST: ${MONGO_DB_TEST:-pdf_database_test}
+      MONGO_COLLECTION: ${MONGO_COLLECTION:-processed_pdfs}
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-5}
+      EXTRACT_SERVICE_URL: ${EXTRACT_SERVICE_URL_SINGLE_DOCKER:-http://host.docker.internal:8000}
+      EXTRACT_SERVICE_TIMEOUT: ${EXTRACT_SERVICE_TIMEOUT:-30}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     labels:
       # Etiquetas de Traefik para enrutar el puerto 80 hacia este servicio
       - traefik.enable=true

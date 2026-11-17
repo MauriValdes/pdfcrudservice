@@ -124,37 +124,69 @@ uv sync
 ### 3. Configurar variables de entorno
 
 ```bash
-cp .env.example .env
+cp ../pdfinfraestructure/.env.example ../pdfinfraestructure/.env
 ```
 
-Editar `.env` con los parámetros de conexión a MongoDB.
+Editar el archivo central con las credenciales y URLs locales. La aplicación
+lee variables del entorno y no carga `.env` por sí misma.
+
+Para ejecución local, `MONGO_URL` debe apuntar al MongoDB publicado en
+`localhost`, y `EXTRACT_SERVICE_URL` al MS2 accesible desde el host. Los Compose
+individual e integrado sustituyen esas direcciones por las internas adecuadas:
+el Compose individual usa `MONGO_URL_DOCKER` (o construye la URI autenticada
+desde las variables de MongoDB) y `EXTRACT_SERVICE_URL_SINGLE_DOCKER`; el
+integrado inyecta la URI MongoDB hacia `db` y `EXTRACT_SERVICE_URL_DOCKER` hacia
+Traefik interno. La plantilla central es la referencia para esos valores.
 
 ### 4. Iniciar MongoDB
 
+Desde `pdfcrudservice/`:
+
 ```bash
-docker compose up -d db
+docker compose --env-file ../pdfinfraestructure/.env -f docker-compose.yml up -d db
+```
+
+Desde la raíz del workspace:
+
+```bash
+docker compose --env-file ./pdfinfraestructure/.env --project-directory ./pdfcrudservice -f ./pdfcrudservice/docker-compose.yml up -d db
 ```
 
 ### 5. Ejecutar la aplicación
 
 ```bash
-uv run uvicorn src.main:app --reload
+uv run --env-file ../pdfinfraestructure/.env uvicorn src.main:app --reload --port 8001
 ```
 
 La aplicación estará disponible en:
 
-- API: http://localhost:8000
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+- API: http://localhost:8001
+- Swagger UI: http://localhost:8001/docs
+- ReDoc: http://localhost:8001/redoc
 
 ---
 
 ## Ejecución con Docker Compose
 
-Para iniciar la infraestructura con cinco réplicas del servicio:
+El archivo central de variables está en `pdfinfraestructure/.env`. Compose no lo
+descubre automáticamente desde `pdfcrudservice/`, por eso se indica con
+`--env-file` en todos los comandos.
+
+En modo de instancia única, `APP_PORT` solo configura el puerto publicado de
+MS3 en el host; el listener del contenedor permanece en `8000`. No controla el
+puerto del Compose integrado.
+
+Para iniciar la infraestructura con cinco réplicas del servicio, desde
+`pdfcrudservice/`:
 
 ```bash
-docker compose up -d --build
+docker compose --env-file ../pdfinfraestructure/.env -f docker-compose.yml up -d --build
+```
+
+El mismo comando desde la raíz del workspace:
+
+```bash
+docker compose --env-file ./pdfinfraestructure/.env --project-directory ./pdfcrudservice -f ./pdfcrudservice/docker-compose.yml up -d --build
 ```
 
 El acceso externo se realiza mediante Traefik:
@@ -164,15 +196,22 @@ El acceso externo se realiza mediante Traefik:
 
 ### Modo de instancia única
 
-Para realizar pruebas comparativas con una sola réplica:
+Para realizar pruebas comparativas con una sola réplica, desde
+`pdfcrudservice/`:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.single.yml up -d --build
+docker compose --env-file ../pdfinfraestructure/.env -f docker-compose.yml -f docker-compose.single.yml up -d --build
+```
+
+O desde la raíz del workspace:
+
+```bash
+docker compose --env-file ./pdfinfraestructure/.env --project-directory ./pdfcrudservice -f ./pdfcrudservice/docker-compose.yml -f ./pdfcrudservice/docker-compose.single.yml up -d --build
 ```
 
 La API estará disponible directamente en:
 
-http://localhost:8000
+http://localhost:8001
 
 ---
 
