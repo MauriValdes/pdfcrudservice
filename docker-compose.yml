@@ -7,7 +7,7 @@ services:
     container_name: pdf_mongo_db
     restart: always
     ports:
-      - "${MONGO_PORT:-27017}:27017"
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
     environment:
       - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
       - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
@@ -29,14 +29,13 @@ services:
     restart: always
     ports:
       - "80:80"
-      - "${TRAEFIK_DASHBOARD_PORT:-8081}:8080"
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --entrypoints.web.address=:80
       - --entrypoints.web.transport.respondingTimeouts.readTimeout=60s
       - --entrypoints.web.transport.respondingTimeouts.writeTimeout=60s
-      - --api.insecure=true
+      - --api=false
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
