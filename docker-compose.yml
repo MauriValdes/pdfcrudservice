@@ -61,10 +61,10 @@ services:
       db:
         condition: service_healthy
     environment:
-      # --- MongoDB ---
-      MONGO_URL: "${MONGO_URL_DOCKER:-mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@db:27017/?authSource=admin}"
+      # --- MongoDB (usuarios independientes de aplicación y testing) ---
+      MONGO_URL: "${MONGO_URL_DOCKER:?Defina MONGO_URL_DOCKER en el archivo .env}"
+      MONGO_TEST_URL: "${MONGO_TEST_URL_DOCKER:?Defina MONGO_TEST_URL_DOCKER en el archivo .env}"
       MONGO_DB_DEV: ${MONGO_DB_DEV:-pdf_database_dev}
-      MONGO_DB_TEST: ${MONGO_DB_TEST:-pdf_database_test}
       MONGO_COLLECTION: ${MONGO_COLLECTION:-processed_pdfs}
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-5}
       EXTRACT_SERVICE_URL: ${EXTRACT_SERVICE_URL_SINGLE_DOCKER:-http://host.docker.internal:8000}

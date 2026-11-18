@@ -130,13 +130,34 @@ cp ../pdfinfraestructure/.env.example ../pdfinfraestructure/.env
 Editar el archivo central con las credenciales y URLs locales. La aplicación
 lee variables del entorno y no carga `.env` por sí misma.
 
-Para ejecución local, `MONGO_URL` debe apuntar al MongoDB publicado en
-`localhost`, y `EXTRACT_SERVICE_URL` al MS2 accesible desde el host. Los Compose
-individual e integrado sustituyen esas direcciones por las internas adecuadas:
-el Compose individual usa `MONGO_URL_DOCKER` (o construye la URI autenticada
-desde las variables de MongoDB) y `EXTRACT_SERVICE_URL_SINGLE_DOCKER`; el
-integrado inyecta la URI MongoDB hacia `db` y `EXTRACT_SERVICE_URL_DOCKER` hacia
-Traefik interno. La plantilla central es la referencia para esos valores.
+MS3 utiliza dos usuarios independientes: `pdf_ms3_app` tiene `readWrite`
+exclusivamente sobre `pdf_database_dev`; `pdf_ms3_test` tiene `readWrite`
+exclusivamente sobre `pdf_database_test`. Las pruebas de integración deben
+usarse con `MONGO_TEST_URL`, nunca con la URI de aplicación.
+
+La plantilla `../pdfinfraestructure/.env.example` contiene las URI por modo.
+Localmente, MS3 usa `MONGO_URL` y las pruebas usan `MONGO_TEST_URL`, con
+`localhost:27018`. En Docker Compose, MS3 usa `MONGO_URL_DOCKER` y el proceso
+de pruebas usa `MONGO_TEST_URL_DOCKER`, con el nombre interno `db:27017`.
+Cada URI selecciona su propia base y autentica contra ella mediante
+`authSource`: `pdf_database_dev` para la aplicación y `pdf_database_test`
+para testing.
+
+Ejemplos de formato (usar las URI de la plantilla central):
+
+```text
+MONGO_URL=mongodb://pdf_ms3_app:<PASSWORD_URL_ENCODED>@localhost:27018/pdf_database_dev?authSource=pdf_database_dev
+MONGO_TEST_URL=mongodb://pdf_ms3_test:<PASSWORD_URL_ENCODED>@localhost:27018/pdf_database_test?authSource=pdf_database_test
+MONGO_URL_DOCKER=mongodb://pdf_ms3_app:<PASSWORD_URL_ENCODED>@db:27017/pdf_database_dev?authSource=pdf_database_dev
+MONGO_TEST_URL_DOCKER=mongodb://pdf_ms3_test:<PASSWORD_URL_ENCODED>@db:27017/pdf_database_test?authSource=pdf_database_test
+```
+
+Las contraseñas con caracteres especiales deben codificarse para URL
+(percent-encoding) antes de incluirlas en una URI. `MONGO_INITDB_ROOT_USERNAME`
+y `MONGO_INITDB_ROOT_PASSWORD` quedan reservadas para inicialización y
+administración de MongoDB; MS3 y sus pruebas no deben utilizarlas.
+`EXTRACT_SERVICE_URL` apunta al MS2 accesible desde el host; Compose configura
+la dirección interna correspondiente.
 
 ### 4. Iniciar MongoDB
 
