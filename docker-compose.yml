@@ -70,6 +70,12 @@ services:
       EXTRACT_SERVICE_URL: ${EXTRACT_SERVICE_URL_SINGLE_DOCKER:-http://host.docker.internal:8000}
       EXTRACT_SERVICE_TIMEOUT: ${EXTRACT_SERVICE_TIMEOUT:-30}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     extra_hosts:
       - "host.docker.internal:host-gateway"
     labels:
