@@ -13,7 +13,7 @@ from src.api.docs_api import get_document_service
 from src.schemas.document import DocumentResponse
 from src.database.mongodb import db_connection
 from src.config.config import settings
-from src.repository.document_repository import InvalidObjectIdError
+from src.repository.document_repository import DocumentRepository, InvalidObjectIdError
 
 
 @pytest.fixture
@@ -1164,51 +1164,50 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
     como duplicada (HTTP 400). Se simula únicamente MS2 (servicio de
     extracción); la persistencia en MongoDB es real.
 
-    Si MongoDB no está disponible (o no se puede autenticar/crear el índice),
-    la prueba se omite de forma controlada en lugar de fallar.
+    Los errores de conexión, configuración, autenticación o permisos hacen
+    fallar explícitamente la prueba.
     """
     import hashlib
-    import time as _time
+    import uuid
 
+    import fitz
     from httpx import ASGITransport, AsyncClient
     from unittest.mock import AsyncMock, patch
 
     from src.main import app
-    from src.database.mongodb import db_connection
+    from src.api.docs_api import get_document_service
+    from src.database.mongodb import MongoDB
     from src.services.document_service import DocumentService
     from src.config.config import settings
 
-    # Base de datos temporal e isolada (nunca pdf_database_dev)
-    test_db_name = f"pdf_concurrency_test_{int(_time.time() * 1000)}"
+    # for_testing valida MONGO_TEST_URL explícitamente; cualquier error de
+    # conexión, autenticación o inicialización se propaga como fallo.
+    testing_db = MongoDB.for_testing()
+    repository = None
+    checksum = None
+    previous_override_marker = object()
+    previous_override = app.dependency_overrides.get(
+        get_document_service, previous_override_marker
+    )
+    override_installed = False
 
-    # Intentar conectar a MongoDB real. Si no es posible (por ejemplo, el
-    # servidor requiere autenticación que no está configurada), omitir.
     try:
-        await db_connection.connect(database_name=test_db_name)
-    except Exception as exc:
-        pytest.skip(
-            f"No se pudo conectar a MongoDB real para la prueba de concurrencia: {exc}"
-        )
+        await testing_db.connect()
 
-    try:
-        # Asegurar el índice único en la base de datos temporal
-        try:
-            await db_connection.db[settings.mongo_collection].create_index(
-                [("checksum", 1)],
-                name="checksum_unique",
-                unique=True,
-            )
-        except Exception as exc:
-            pytest.skip(
-                f"No se pudo crear el índice único en MongoDB real: {exc}"
-            )
+        repository = DocumentRepository(testing_db.db)
+        testing_service = DocumentService(repository=repository)
+        app.dependency_overrides[get_document_service] = lambda: testing_service
+        override_installed = True
 
-        pdf_bytes = b"%PDF-1.4 real concurrency test"
+        # Generar un PDF válido distinto por ejecución sin alterar su estructura.
+        pdf = fitz.open()
+        page = pdf.new_page()
+        page.insert_text((72, 72), f"Concurrency test {uuid.uuid4()}")
+        pdf_bytes = pdf.tobytes()
+        pdf.close()
         filename = "test_concurrent_real.pdf"
         checksum = hashlib.sha256(pdf_bytes).hexdigest()
 
-        # Simular únicamente MS2: devolver una extracción válida sin invocar al
-        # servicio real. Aplica a todas las instancias de DocumentService.
         extraction_result = {"content": "texto extraído de prueba", "page_count": 3}
 
         with patch.object(
@@ -1238,16 +1237,14 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
         assert 201 in status_codes, f"Esperaba una respuesta 201, obtuvo {status_codes}"
         assert 400 in status_codes, f"Esperaba una respuesta 400, obtuvo {status_codes}"
 
-        # MongoDB debe contener exactamente un documento para ese checksum
-        existing_docs = await db_connection.db[settings.mongo_collection].find(
+        existing_docs = await repository.collection.find(
             {"checksum": checksum}
         ).to_list(length=None)
         assert len(existing_docs) == 1, (
             f"Se esperaba exactamente 1 documento, se encontró {len(existing_docs)}"
         )
 
-        # Verificar que el índice checksum_unique es realmente único
-        indexes = await db_connection.db[settings.mongo_collection].list_indexes().to_list(
+        indexes = await testing_db.db[settings.mongo_collection].list_indexes().to_list(
             length=None
         )
         unique_indexes = [
@@ -1257,9 +1254,32 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
         ]
         assert len(unique_indexes) == 1, "El índice checksum_unique no es único"
     finally:
-        # Limpiar exclusivamente la base de datos temporal, incluso ante excepciones
+        if override_installed:
+            if previous_override is previous_override_marker:
+                app.dependency_overrides.pop(get_document_service, None)
+            else:
+                app.dependency_overrides[get_document_service] = previous_override
+
+        import sys
+
+        test_error = sys.exc_info()[1]
+        cleanup_error = None
+
         try:
-            await db_connection.client.drop_database(test_db_name)
-        except Exception:
-            pass
-        await db_connection.close()
+            if repository is not None and checksum is not None:
+                await repository.delete_by_checksum(checksum)
+        except Exception as exc:
+            cleanup_error = exc
+        finally:
+            try:
+                await testing_db.disconnect()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+
+        if cleanup_error is not None:
+            if test_error is None:
+                raise cleanup_error
+            test_error.add_note(
+                "La limpieza de MongoDB también falló; se conserva el error original."
+            )

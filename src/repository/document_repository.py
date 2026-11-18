@@ -151,6 +151,14 @@ class DocumentRepository:
             raise DatabaseUnavailableError() from e
         return result.deleted_count
 
+    async def delete_by_checksum(self, checksum: str) -> int:
+        """Elimina exclusivamente el documento con el checksum exacto indicado."""
+        try:
+            result = await self.collection.delete_one({"checksum": checksum})
+        except _UNAVAILABLE_ERRORS as e:
+            raise DatabaseUnavailableError() from e
+        return result.deleted_count
+
     async def update_document(self, document_id: str, update_data: DocumentUpdate) -> DocumentResponse | None:
         """Actualiza un documento con los nuevos datos proporcionados."""
         if not ObjectId.is_valid(document_id):
