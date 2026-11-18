@@ -463,6 +463,33 @@ async def test_process_extraction_connect_error_marks_failed_and_reraises():
     )
 
 
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        (httpx.ReadError, "MS2 read failed"),
+        (httpx.WriteError, "MS2 write failed"),
+        (httpx.RemoteProtocolError, "MS2 protocol failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_process_extraction_transport_errors_mark_failed_and_reraise(
+    error_type, message
+):
+    """Los demás errores de transporte también persisten FAILED y se propagan."""
+    service, repository = build_service()
+    transport_error = error_type(message)
+    service.call_extraction_service = AsyncMock(side_effect=transport_error)
+
+    with pytest.raises(error_type) as exc_info:
+        await service.process_pdf_extraction("doc-1", b"%PDF-1.4", "doc.pdf")
+
+    assert exc_info.value is transport_error
+    repository.update_document.assert_awaited_once_with(
+        "doc-1",
+        DocumentUpdate(status="failed", error_message=message),
+    )
+
+
 @pytest.mark.asyncio
 async def test_process_extraction_invalid_response_marks_failed():
     """Respuesta inválida de MS2 (ValueError de validación): FAILED."""
@@ -519,3 +546,20 @@ async def test_process_extraction_persist_failed_failure_propagates_original_err
     assert "MS2 retornó error HTTP 503" in str(exc_info.value.__context__)
     # Se intentó registrar el estado FAILED antes de propagar
     repository.update_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_process_extraction_transport_error_persist_failed_propagates():
+    """El error Mongo al registrar FAILED se propaga, sin ocultar el de transporte."""
+    service, repository = build_service(persist_error=Exception("Mongo down"))
+    transport_error = httpx.RemoteProtocolError("MS2 protocol failed")
+    service.call_extraction_service = AsyncMock(side_effect=transport_error)
+
+    with pytest.raises(Exception, match="Mongo down") as exc_info:
+        await service.process_pdf_extraction("doc-1", b"%PDF-1.4", "doc.pdf")
+
+    assert exc_info.value.__context__ is transport_error
+    repository.update_document.assert_awaited_once_with(
+        "doc-1",
+        DocumentUpdate(status="failed", error_message="MS2 protocol failed"),
+    )
