@@ -1109,11 +1109,19 @@ def test_upload_pdf_too_large_still_returns_413(client, mock_service):
     assert response.status_code == 413
 
 
-def test_ms2_errors_are_not_confused_with_mongodb_unavailability(
-    client, mock_service
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        (httpx.ConnectError, "Connection error to extract service"),
+        (httpx.ReadError, "Read error from extract service"),
+        (httpx.WriteError, "Write error to extract service"),
+        (httpx.RemoteProtocolError, "Protocol error from extract service"),
+    ],
+)
+def test_ms2_transport_errors_are_not_confused_with_mongodb_unavailability(
+    client, mock_service, error_type, message
 ):
-    """Regresión: un error de conexión con MS2 NO se traduce a 503; conserva
-    el comportamiento actual (201 + documento FAILED)."""
+    """Los errores de transporte conservan la respuesta 201 + documento FAILED."""
     now = datetime.datetime.now()
     mock_service.submit_pdf.return_value = DocumentResponse(
         id="test-id",
@@ -1128,7 +1136,7 @@ def test_ms2_errors_are_not_confused_with_mongodb_unavailability(
         updated_at=now,
     )
     mock_service.process_pdf_extraction = AsyncMock(
-        side_effect=httpx.ConnectError("Connection error to extract service")
+        side_effect=error_type(message)
     )
     mock_service.get_document_by_id.return_value = DocumentResponse(
         id="test-id",
@@ -1138,7 +1146,7 @@ def test_ms2_errors_are_not_confused_with_mongodb_unavailability(
         status="failed",
         content=None,
         page_count=0,
-        error_message="Connection error to extract service",
+        error_message=message,
         created_at=now,
         updated_at=now,
     )
@@ -1148,7 +1156,7 @@ def test_ms2_errors_are_not_confused_with_mongodb_unavailability(
     assert response.status_code == 201
     body = response.json()
     assert body["status"] == "failed"
-    assert body["error_message"] == "Connection error to extract service"
+    assert body["error_message"] == message
 
 
 # =============================================================================

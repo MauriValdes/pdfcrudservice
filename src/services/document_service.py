@@ -144,8 +144,7 @@ class DocumentService:
         Valida la respuesta y retorna el diccionario parseado.
 
         Raises:
-            httpx.TimeoutException: Si la conexión excede el timeout configurado.
-            httpx.ConnectError: Si el servicio MS2 no está disponible.
+            httpx.TransportError: Si falla la comunicación de transporte con MS2.
             ValueError: Si la respuesta de MS2 es inválida (códigos de error,
                         campos faltantes o tipos incorrectos).
         """
@@ -229,8 +228,9 @@ class DocumentService:
         # 1. Llamar a MS2 para extraer texto
         try:
             extract_result = await self.call_extraction_service(pdf_bytes, filename)
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
-            # Error de comunicación con MS2
+        except httpx.TransportError as e:
+            # Cualquier fallo de transporte (timeout, conexión, lectura,
+            # escritura o protocolo) deja el documento en un estado terminal.
             await self.repository.update_document(
                 document_id,
                 DocumentUpdate(status="failed", error_message=str(e)),
