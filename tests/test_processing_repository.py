@@ -1,4 +1,4 @@
-"""Pruebas unitarias RED del reclamo atómico de trabajos pendientes."""
+"""Pruebas unitarias RED del reclamo y renovación de leases de procesamiento."""
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -103,6 +103,20 @@ def _claimed_document(
     if processing_cycle_id is not ...:
         document["processing_cycle_id"] = processing_cycle_id
     return document
+
+
+def _renewal_call_parts(repository):
+    call = repository.collection.update_one.call_args
+    assert call is not None
+    query = call.args[0]
+    update = call.args[1]
+    return query, update, call.kwargs
+
+
+def _pipeline_set(update):
+    assert isinstance(update, list)
+    assert len(update) == 1
+    return update[0]["$set"]
 
 
 @pytest.mark.asyncio
@@ -326,4 +340,200 @@ async def test_claim_uses_one_atomic_operation_without_pre_read(
     repo.collection.update_one.assert_not_called()
     repo.collection.update_many.assert_not_called()
     repo.collection.replace_one.assert_not_called()
+    repo.collection.aggregate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_renewal_atomically_filters_current_processing_owner_and_live_lease(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    document_id = str(ObjectId())
+    repo.collection.update_one.return_value = MagicMock(matched_count=1)
+
+    result = await repo.renew_processing_lease(
+        document_id,
+        "worker-a",
+        "fencing-token-a",
+    )
+
+    assert result is True
+    query, _, kwargs = _renewal_call_parts(repo)
+    assert query == {
+        "_id": ObjectId(document_id),
+        "status": DocumentStatus.PROCESSING.value,
+        "worker_id": "worker-a",
+        "fencing_token": "fencing-token-a",
+        "lease_until": {"$gte": NOW},
+    }
+    assert isinstance(query["_id"], ObjectId)
+    assert query["lease_until"] == {"$gte": NOW}
+    assert kwargs == {"upsert": False}
+
+
+@pytest.mark.asyncio
+async def test_renewal_pipeline_maximizes_only_the_three_lease_timestamps(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value = MagicMock(matched_count=1)
+
+    await repo.renew_processing_lease(
+        str(ObjectId()),
+        "worker-a",
+        "fencing-token-a",
+    )
+
+    _, update, _ = _renewal_call_parts(repo)
+    fields = _pipeline_set(update)
+    assert set(fields) == {"heartbeat_at", "lease_until", "updated_at"}
+    expected_values = {
+        "heartbeat_at": NOW,
+        "lease_until": NOW + timedelta(seconds=60),
+        "updated_at": NOW,
+    }
+    for field, expected_value in expected_values.items():
+        assert fields[field]["$max"][0] == f"${field}"
+        value = fields[field]["$max"][1]
+        if isinstance(value, dict) and "$literal" in value:
+            value = value["$literal"]
+        assert value == expected_value
+
+
+@pytest.mark.asyncio
+async def test_renewal_returns_false_when_mongo_matches_zero_documents(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value = MagicMock(matched_count=0)
+
+    result = await repo.renew_processing_lease(
+        str(ObjectId()),
+        "worker-a",
+        "fencing-token-a",
+    )
+
+    assert result is False
+    repo.collection.update_one.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_renewal_rejects_invalid_document_id_without_mongodb_operations(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+
+    with pytest.raises(ValueError):
+        await repo.renew_processing_lease(
+            "identificador-invalido",
+            "worker-a",
+            "fencing-token-a",
+        )
+
+    repo.collection.update_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find.assert_not_called()
+    repo.collection.update_many.assert_not_awaited()
+    repo.collection.replace_one.assert_not_awaited()
+    repo.collection.aggregate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "rejection_reason",
+    [
+        "wrong-status",
+        "wrong-worker-id",
+        "wrong-fencing-token",
+        "expired-lease",
+        "document-does-not-exist",
+    ],
+)
+@pytest.mark.asyncio
+async def test_renewal_reports_false_for_every_conditional_rejection(
+    repo_with_mocks, fixed_clock, rejection_reason
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value = MagicMock(matched_count=0)
+
+    result = await repo.renew_processing_lease(
+        str(ObjectId()),
+        "worker-a",
+        "fencing-token-a",
+    )
+
+    assert result is False, rejection_reason
+    repo.collection.update_one.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "connection_error",
+    [
+        ServerSelectionTimeoutError("unavailable"),
+        AutoReconnect("unavailable"),
+        ConnectionFailure("unavailable"),
+        NetworkTimeout("unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_renewal_translates_mongo_connectivity_errors(
+    repo_with_mocks, fixed_clock, connection_error
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.side_effect = connection_error
+
+    with pytest.raises(DatabaseUnavailableError):
+        await repo.renew_processing_lease(
+            str(ObjectId()),
+            "worker-a",
+            "fencing-token-a",
+        )
+
+
+@pytest.mark.asyncio
+async def test_renewal_propagates_unexpected_errors(repo_with_mocks, fixed_clock):
+    repo = repo_with_mocks
+    repo.collection.update_one.side_effect = RuntimeError("unexpected update failure")
+
+    with pytest.raises(RuntimeError, match="unexpected update failure"):
+        await repo.renew_processing_lease(
+            str(ObjectId()),
+            "worker-a",
+            "fencing-token-a",
+        )
+
+
+@pytest.mark.asyncio
+async def test_renewal_does_not_read_or_mutate_processing_or_upload_ownership_fields(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value = MagicMock(matched_count=1)
+
+    await repo.renew_processing_lease(
+        str(ObjectId()),
+        "worker-a",
+        "fencing-token-a",
+    )
+
+    query, update, _ = _renewal_call_parts(repo)
+    update_fields = _pipeline_set(update)
+    assert not {
+        "processing_cycle_id",
+        "attempt_count",
+        "worker_id",
+        "fencing_token",
+    }.intersection(update_fields)
+    assert not any(field.startswith("upload_") for field in update_fields)
+    query_and_update = repr((query, update))
+    assert "upload_owner_id" not in query_and_update
+    assert "upload_lease_until" not in query_and_update
+    assert "upload_fencing_token" not in query_and_update
+
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one_and_update.assert_not_awaited()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find.assert_not_called()
+    repo.collection.update_many.assert_not_awaited()
+    repo.collection.replace_one.assert_not_awaited()
     repo.collection.aggregate.assert_not_called()

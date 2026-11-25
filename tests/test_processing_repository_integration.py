@@ -199,6 +199,32 @@ async def _create_pending_pdf(db, resources, *, created_at=None, fields=None):
     }
 
 
+async def _claim_processing_document(
+    db,
+    resources,
+    monkeypatch,
+    *,
+    worker_id="heartbeat-worker",
+    attempt_count=4,
+    now=FIXED_NOW,
+):
+    """Crea un fixture registrado y lo reclama para preparar el heartbeat."""
+    now = _freeze_claim_clock(monkeypatch, now)
+    cycle_id = str(uuid.uuid4())
+    document = await _create_pending_pdf(
+        db,
+        resources,
+        fields={
+            "attempt_count": attempt_count,
+            "processing_cycle_id": cycle_id,
+        },
+    )
+    claimed = await ProcessingRepository(db).claim_pending(worker_id)
+    assert claimed is not None
+    assert claimed.id == str(document["document_id"])
+    return document, claimed, now, cycle_id
+
+
 async def _insert_raw_pending(db, resources, *, file_id=MISSING, fields=None):
     """Inserta un documento de testing para filtros con valores no válidos."""
     token = uuid.uuid4().hex
@@ -616,3 +642,278 @@ async def test_processing_collection_inherits_durable_write_concern(testing_cont
     collection = ProcessingRepository(db).collection
 
     assert collection.write_concern.document == {"w": 1, "j": True}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_renew_processing_lease_persists_all_three_timestamps(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch
+    )
+    collection = db[settings.mongo_collection]
+    await collection.update_one(
+        {"_id": document["document_id"], "checksum": document["checksum"]},
+        {
+            "$set": {
+                "lease_until": now + timedelta(seconds=10),
+                "heartbeat_at": now - timedelta(seconds=5),
+                "updated_at": now - timedelta(seconds=5),
+            }
+        },
+    )
+
+    renewed = await ProcessingRepository(db).renew_processing_lease(
+        claimed.id,
+        claimed.worker_id,
+        claimed.fencing_token,
+    )
+
+    persisted = await collection.find_one({"_id": document["document_id"]})
+    assert renewed is True
+    assert _normalize_datetime(persisted["heartbeat_at"]) == now
+    assert _normalize_datetime(persisted["lease_until"]) == now + timedelta(
+        seconds=60
+    )
+    assert _normalize_datetime(persisted["updated_at"]) == now
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_renew_processing_lease_preserves_cycle_attempts_and_upload_fields(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, cycle_id = await _claim_processing_document(
+        db,
+        resources,
+        monkeypatch,
+        attempt_count=9,
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    renewed = await ProcessingRepository(db).renew_processing_lease(
+        claimed.id,
+        claimed.worker_id,
+        claimed.fencing_token,
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert renewed is True
+    assert after["processing_cycle_id"] == cycle_id == before["processing_cycle_id"]
+    assert after["attempt_count"] == 9 == before["attempt_count"]
+    for field in (
+        "upload_owner_id",
+        "upload_lease_until",
+        "upload_fencing_token",
+    ):
+        assert after[field] == before[field]
+    assert _normalize_datetime(after["lease_until"]) >= now + timedelta(seconds=60)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_renew_processing_lease_rejects_expired_lease(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch
+    )
+    collection = db[settings.mongo_collection]
+    await collection.update_one(
+        {"_id": document["document_id"]},
+        {"$set": {"lease_until": now - timedelta(milliseconds=1)}},
+    )
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    renewed = await ProcessingRepository(db).renew_processing_lease(
+        claimed.id,
+        claimed.worker_id,
+        claimed.fencing_token,
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert renewed is False
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_renew_processing_lease_accepts_exact_expiration_boundary(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch
+    )
+    collection = db[settings.mongo_collection]
+    await collection.update_one(
+        {"_id": document["document_id"]},
+        {"$set": {"lease_until": now}},
+    )
+
+    renewed = await ProcessingRepository(db).renew_processing_lease(
+        claimed.id,
+        claimed.worker_id,
+        claimed.fencing_token,
+    )
+
+    persisted = await collection.find_one({"_id": document["document_id"]})
+    assert renewed is True
+    assert _normalize_datetime(persisted["lease_until"]) == now + timedelta(
+        seconds=60
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_renew_processing_lease_rejects_different_worker_id(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, _, _ = await _claim_processing_document(
+        db, resources, monkeypatch
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    renewed = await ProcessingRepository(db).renew_processing_lease(
+        claimed.id,
+        "another-worker",
+        claimed.fencing_token,
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert renewed is False
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_renew_processing_lease_rejects_different_fencing_token(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, _, _ = await _claim_processing_document(
+        db, resources, monkeypatch
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    renewed = await ProcessingRepository(db).renew_processing_lease(
+        claimed.id,
+        claimed.worker_id,
+        str(uuid.uuid4()),
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert renewed is False
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_renew_processing_lease_returns_false_for_missing_document(
+    testing_context, monkeypatch
+):
+    db, _ = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+
+    renewed = await ProcessingRepository(db).renew_processing_lease(
+        str(ObjectId()),
+        "heartbeat-worker",
+        str(uuid.uuid4()),
+    )
+
+    assert renewed is False
+    assert now == FIXED_NOW
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_heartbeats_do_not_move_lease_or_timestamps_backwards(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch
+    )
+    later_now = now + timedelta(seconds=5)
+    clock_values = [now, later_now]
+
+    class ConcurrentHeartbeatClock:
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is timezone.utc
+            return clock_values.pop(0)
+
+    monkeypatch.setattr(processing_repository, "datetime", ConcurrentHeartbeatClock)
+    repository = ProcessingRepository(db)
+
+    first, second = await asyncio.gather(
+        repository.renew_processing_lease(
+            claimed.id,
+            claimed.worker_id,
+            claimed.fencing_token,
+        ),
+        repository.renew_processing_lease(
+            claimed.id,
+            claimed.worker_id,
+            claimed.fencing_token,
+        ),
+    )
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert first is True
+    assert second is True
+    assert clock_values == []
+    assert _normalize_datetime(persisted["heartbeat_at"]) == later_now
+    assert _normalize_datetime(persisted["updated_at"]) == later_now
+    assert _normalize_datetime(persisted["lease_until"]) == later_now + timedelta(
+        seconds=60
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_old_processing_owner_cannot_renew_after_new_owner_acquires_document(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, old_claim, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch
+    )
+    collection = db[settings.mongo_collection]
+    new_worker_id = "new-heartbeat-owner"
+    new_fencing_token = str(uuid.uuid4())
+    new_lease_until = now + timedelta(seconds=90)
+    await collection.update_one(
+        {"_id": document["document_id"]},
+        {
+            "$set": {
+                "worker_id": new_worker_id,
+                "fencing_token": new_fencing_token,
+                "lease_until": new_lease_until,
+            }
+        },
+    )
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    renewed = await ProcessingRepository(db).renew_processing_lease(
+        old_claim.id,
+        old_claim.worker_id,
+        old_claim.fencing_token,
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert renewed is False
+    assert after == before
+    assert after["worker_id"] == new_worker_id
+    assert after["fencing_token"] == new_fencing_token
+    assert _normalize_datetime(after["lease_until"]) == new_lease_until

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from bson import ObjectId
 from pymongo import ASCENDING, ReturnDocument
 from pymongo.errors import (
     AutoReconnect,
@@ -91,3 +92,52 @@ class ProcessingRepository:
         if document_id is not None:
             document_data["id"] = str(document_id)
         return DocumentModel.model_validate(document_data)
+
+    async def renew_processing_lease(
+        self,
+        document_id: str,
+        worker_id: str,
+        fencing_token: str,
+    ) -> bool:
+        if not ObjectId.is_valid(document_id):
+            raise ValueError("Identificador de documento inválido")
+
+        now = datetime.now(timezone.utc)
+        object_id = ObjectId(document_id)
+        renewed_lease_until = now + timedelta(seconds=60)
+        query = {
+            "_id": object_id,
+            "status": "processing",
+            "worker_id": worker_id,
+            "fencing_token": fencing_token,
+            "lease_until": {"$gte": now},
+        }
+        update = [
+            {
+                "$set": {
+                    "heartbeat_at": {
+                        "$max": ["$heartbeat_at", {"$literal": now}]
+                    },
+                    "lease_until": {
+                        "$max": [
+                            "$lease_until",
+                            {"$literal": renewed_lease_until},
+                        ]
+                    },
+                    "updated_at": {
+                        "$max": ["$updated_at", {"$literal": now}]
+                    },
+                }
+            }
+        ]
+
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        return result.matched_count == 1
