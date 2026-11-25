@@ -207,6 +207,63 @@ class DocumentRepository:
             existing_data["id"] = str(document_id)
         return DocumentModel.model_validate(existing_data), acquired
 
+    async def renew_upload_lease(
+        self,
+        document_id: str,
+        upload_owner_id: str,
+        upload_fencing_token: str,
+        upload_lease_until: datetime,
+    ) -> bool:
+        """Renueva el lease si el llamante conserva la propiedad vigente.
+
+        Retorna ``False`` si no se cumplieron las condiciones de renovación;
+        en ese caso, el llamante debe dejar de actuar como propietario.
+        """
+        if not ObjectId.is_valid(document_id):
+            raise ValueError("Identificador de documento inválido")
+
+        now = datetime.now(timezone.utc)
+        lease_offset = (
+            upload_lease_until.utcoffset()
+            if upload_lease_until.tzinfo is not None
+            else None
+        )
+        if (
+            lease_offset != timezone.utc.utcoffset(now)
+            or upload_lease_until <= now
+        ):
+            raise ValueError(
+                "upload_lease_until debe ser una fecha UTC consciente y futura."
+            )
+
+        query = {
+            "_id": ObjectId(document_id),
+            "status": DocumentStatus.UPLOADING.value,
+            "upload_owner_id": upload_owner_id,
+            "upload_fencing_token": upload_fencing_token,
+            "upload_lease_until": {
+                "$gte": now,
+                "$lt": upload_lease_until,
+            },
+        }
+        update = {
+            "$set": {
+                "upload_lease_until": upload_lease_until,
+                "updated_at": now,
+            }
+        }
+
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as e:
+            raise DatabaseUnavailableError() from e
+
+        return result.matched_count == 1
+
     async def find_by_id(self, document_id: str) -> dict | None:
         """Busca un documento por su ObjectId. Devuelve None si el ID es inválido o no existe."""
         if not ObjectId.is_valid(document_id):
