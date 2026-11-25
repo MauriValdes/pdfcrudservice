@@ -112,7 +112,11 @@ class MongoDB:
             else database_name or settings.mongo_db_dev
         )
         try:
-            self.client = AsyncIOMotorClient(mongo_url)
+            self.client = AsyncIOMotorClient(
+                mongo_url,
+                w=1,
+                journal=True,
+            )
         except Exception:
             if self._testing:
                 raise RuntimeError(

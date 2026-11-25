@@ -208,6 +208,24 @@ def _make_mongo_mocks():
     return state, factory, mock_client
 
 
+async def test_cada_conexion_recrea_cliente_con_write_concern(
+    clean_db_connection, monkeypatch
+):
+    """Cada connect(), incluida una reconexión, recrea el cliente con
+    w=1 y journal=True."""
+    state, factory, _ = _make_mongo_mocks()
+    monkeypatch.setattr(mongodb, "AsyncIOMotorClient", factory)
+    state["mongo_disponible"] = True
+
+    await db_connection.connect()
+    await db_connection.connect()
+
+    assert factory.call_count == 2
+    for call in factory.call_args_list:
+        _, kwargs = call
+        assert kwargs == {"w": 1, "journal": True}
+
+
 # ---------------------------------------------------------------------------
 # 1. Secuencia del backoff
 # ---------------------------------------------------------------------------

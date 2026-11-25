@@ -3,10 +3,14 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.uri_parser import parse_uri
 
 from src.config.config import MONGO_TEST_DATABASE, Settings, settings
 from src.database.mongodb import MongoDB, db_connection
+
+
+EXPECTED_WRITE_CONCERN = {"w": 1, "j": True}
 
 
 def _settings(monkeypatch, test_url=None, production_url="mongodb://prod:27017/pdf_database_dev"):
@@ -173,7 +177,7 @@ async def test_testing_manager_uses_independent_client_and_fixed_database(monkey
         manager = MongoDB.for_testing()
         await manager.connect()
 
-    factory.assert_called_once_with(test_uri)
+    factory.assert_called_once_with(test_uri, w=1, journal=True)
     client.__getitem__.assert_called_once_with(MONGO_TEST_DATABASE)
     assert manager.db.name == MONGO_TEST_DATABASE
     assert manager is not db_connection
@@ -200,9 +204,28 @@ async def test_production_manager_keeps_default_uri_and_database(monkeypatch):
         manager = MongoDB()
         await manager.connect()
 
-    factory.assert_called_once_with(production_uri)
+    factory.assert_called_once_with(production_uri, w=1, journal=True)
     client.__getitem__.assert_called_once_with("pdf_database_dev")
     assert manager._testing is False
+
+
+def test_write_concern_is_inherited_by_client_database_and_collection():
+    """w=1 y journal=True se aplican al cliente y se heredan hasta la colección."""
+    client = AsyncIOMotorClient(
+        "mongodb://localhost:27017",
+        w=1,
+        journal=True,
+        connect=False,
+    )
+    try:
+        database = client["pdf_database_test"]
+        collection = database[settings.mongo_collection]
+
+        assert client.write_concern.document == EXPECTED_WRITE_CONCERN
+        assert database.write_concern.document == EXPECTED_WRITE_CONCERN
+        assert collection.write_concern.document == EXPECTED_WRITE_CONCERN
+    finally:
+        client.close()
 
 
 def test_constructor_does_not_accept_testing_uri_overrides():
