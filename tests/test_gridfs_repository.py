@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from bson import ObjectId
 
@@ -19,14 +19,23 @@ def repo_with_mocks():
     """Crea GridFSRepository con bucket y grid_in mock inyectados.
 
     Retorna: (repo, bucket, grid_in)
+
+    Los mocks reflejan la API real de Motor 3.7.1:
+    - open_upload_stream_with_id retorna GridIn síncronamente (sin await),
+      por lo que usa Mock y assert_called_once_with().
+    - grid_in.write/close/abort son métodos awaitable (usar AsyncMock).
+    - open_download_stream es una coroutine (requiere await).
+    - delete es un método async en AsyncIOMotorGridFSBucket.
     """
     repo = GridFSRepository(object())  # db dummy
 
     bucket = AsyncMock()
     grid_in = AsyncMock()
 
-    # open_upload_stream_with_id retorna grid_in
-    bucket.open_upload_stream_with_id = AsyncMock(return_value=grid_in)
+    # open_upload_stream_with_id retorna grid_in síncronamente.
+    # Usamos Mock (no AsyncMock) porque el código cliente NO usa await
+    # en esta llamada (adaptador corregido).
+    bucket.open_upload_stream_with_id = Mock(return_value=grid_in)
 
     # open_download_stream retorna None por defecto (los tests lo sobreescriben)
     bucket.open_download_stream = AsyncMock(return_value=None)
@@ -55,6 +64,11 @@ async def test_save_success(repo_with_mocks):
 
     result = await repo.save(file_id, "test.pdf", data)
 
+    # open_upload_stream_with_id usa Mock (no await), por assert_called_once_with
+    bucket.open_upload_stream_with_id.assert_called_once_with(
+        file_id, "test.pdf", metadata=None
+    )
+    # write, close, abort son awaitable, por assert_awaited_once_with
     grid_in.write.assert_awaited_once_with(data)
     grid_in.close.assert_awaited_once()
     grid_in.abort.assert_not_awaited()
@@ -153,11 +167,9 @@ async def test_save_abort_failure_preserves_original(repo_with_mocks, caplog):
     with pytest.raises(RuntimeError, match="write failed"):
         await repo.save(file_id, "test.pdf", data)
 
-    # El error de abort se registra en caplog pero no oculta el original
-    # (caplog captura el message si está configurado)
-
 
 # ---- Tests stat() ----
+
 
 
 @pytest.mark.asyncio
@@ -201,6 +213,7 @@ async def test_stat_nonexistent_file(repo_with_mocks):
 # ---- Tests read() ----
 
 
+
 @pytest.mark.asyncio
 async def test_read_success(repo_with_mocks):
     """7. read(): lectura exitosa."""
@@ -229,6 +242,7 @@ async def test_read_nonexistent_file(repo_with_mocks):
 
 
 # ---- Tests delete() ----
+
 
 
 @pytest.mark.asyncio

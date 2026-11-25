@@ -50,7 +50,7 @@ class GridFSRepository:
         la carga y se propaga la excepción original.
         """
         bucket = self._bucket()
-        grid_in = await bucket.open_upload_stream_with_id(
+        grid_in = bucket.open_upload_stream_with_id(
             file_id,
             filename,
             metadata=metadata,

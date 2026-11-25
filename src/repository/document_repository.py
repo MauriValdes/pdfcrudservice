@@ -1,5 +1,6 @@
 from bson import ObjectId
 from datetime import datetime
+from typing import Mapping, Optional, Any
 import inspect
 
 from pymongo.errors import (
@@ -13,6 +14,7 @@ from src.core.exceptions import DatabaseUnavailableError
 from src.models.document import DocumentModel
 from src.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
 from src.config.config import settings
+from src.repository.gridfs_repository import GridFSRepository
 
 # Errores de conectividad de PyMongo/Motor que indican indisponibilidad de
 # MongoDB (servidor inalcanzable, conexión perdida o red interrumpida).
@@ -204,3 +206,17 @@ class DocumentRepository:
             created_at=updated_doc.get("created_at", datetime.now()),
             updated_at=updated_doc.get("updated_at", datetime.now()),
         )
+
+    def _gridfs_repository(self) -> GridFSRepository:
+        """Crea y retorna un GridFSRepository reutilizando la base MongoDB existente.
+
+        Este método está pensado para ser usado por el servicio o endpoints
+        que necesiten almacenar PDFs originales en GridFS sin crear un nuevo
+        cliente MongoDB ni configurar Write Concern nuevamente.
+
+        El bucket GridFS se crea de forma perezosa sobre ``self.db``, que es
+        la misma base que usa ``DocumentRepository``, por lo que ambas
+        operaciones (documentos y GridFS) comparten configuración de conexión
+        y Write Concern (w=1, journal=True).
+        """
+        return GridFSRepository(self.db)

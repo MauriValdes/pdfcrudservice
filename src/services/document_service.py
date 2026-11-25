@@ -2,6 +2,7 @@ import hashlib
 import httpx
 
 from pymongo.errors import DuplicateKeyError
+from typing import Mapping, Optional
 
 from src.config.config import settings
 from src.models.document import DocumentModel, DocumentStatus
@@ -272,3 +273,48 @@ class DocumentService:
         if not deleted:
             raise ValueError("El documento no existe")
         return True
+
+    async def save_original_pdf(
+        self,
+        file_id: ObjectId,
+        filename: str,
+        data: bytes,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ObjectId:
+        """Guarda un PDF original en GridFS usando un identificador preasignado.
+
+        Este método forma parte del flujo de persistencia v1.6 para GridFS:
+        - ``file_id`` debe ser un ``ObjectId`` nuevo y único por cada intento de carga.
+        - La escritura se confirma con ``await grid_in.close()``.
+        - Ante errores o cancelaciones durante ``write()`` o ``close()``, se intenta
+          ``abort()`` como limpieza best-effort y se propaga la excepción original.
+        - El ``file_id`` únicamente se considera guardado después de completar exitosamente
+          el cierre ``close()``; en caso contrario, no se devuelve y la carga se considera
+          fallida sin archivo asociado en ``fs.files``.
+
+        Esta operación reutiliza la conexión MongoDB ya inyectada en el repositorio
+        (``self.repository.db``), por lo que comparte el Write Concern configurado
+        (``w=1, journal=True``) y no crea un nuevo cliente.
+
+        Args:
+            file_id: Identificador preasignado (debe ser ``ObjectId()`` nuevo por intento).
+            filename: Nombre lógico del archivo PDF.
+            data: Contenido del PDF en bytes.
+            metadata: Metadatos opcionales que se persistirán en el documento de ``fs.files``.
+
+        Returns:
+            ``file_id`` únicamente si el cierre ``close()`` finaliza exitosamente.
+
+        Raises:
+            ``gridfs.errors.NoFile`` u otros errores de GridFS si la operación falla
+            de manera que impida el guardado.
+            ``BaseException`` (incluye ``asyncio.CancelledError``) si la escritura o el
+            cierre se interrumpen.
+        """
+        gridfs_repo = self.repository._gridfs_repository()
+        return await gridfs_repo.save(
+            file_id=file_id,
+            filename=filename,
+            data=data,
+            metadata=metadata,
+        )
