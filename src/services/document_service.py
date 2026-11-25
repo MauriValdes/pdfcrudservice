@@ -8,7 +8,8 @@ from src.config.config import settings
 from src.models.document import DocumentModel, DocumentStatus
 from src.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
 from src.repository.document_repository import DocumentRepository
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 
 ReservationClassification = Literal[
@@ -37,6 +38,28 @@ class DocumentService:
         if document.status == DocumentStatus.UPLOADING:
             return document, "existing_uploading"
         return document, "existing"
+
+    async def acquire_upload_ownership(
+        self,
+        document: DocumentModel,
+        lease_duration_seconds: int,
+    ) -> tuple[DocumentModel | None, bool]:
+        """Intenta adquirir la propiedad temporal de una reserva de carga."""
+        if lease_duration_seconds <= 0:
+            raise ValueError("lease_duration_seconds debe ser mayor que cero.")
+
+        upload_owner_id = str(uuid4())
+        upload_fencing_token = str(uuid4())
+        upload_lease_until = datetime.now(timezone.utc) + timedelta(
+            seconds=lease_duration_seconds
+        )
+
+        return await self.repository.acquire_upload_ownership(
+            document.checksum,
+            upload_owner_id,
+            upload_fencing_token,
+            upload_lease_until,
+        )
 
     async def submit_pdf(self, file_bytes: bytes, filename: str) -> DocumentResponse:
         """Guarda los metadatos básicos del PDF en la base de datos.
