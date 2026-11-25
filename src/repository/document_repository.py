@@ -1,17 +1,18 @@
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Mapping, Optional, Any
 import inspect
 
 from pymongo.errors import (
     AutoReconnect,
     ConnectionFailure,
+    DuplicateKeyError,
     NetworkTimeout,
     ServerSelectionTimeoutError,
 )
 
 from src.core.exceptions import DatabaseUnavailableError
-from src.models.document import DocumentModel
+from src.models.document import DocumentModel, DocumentStatus
 from src.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
 from src.config.config import settings
 from src.repository.gridfs_repository import GridFSRepository
@@ -84,6 +85,57 @@ class DocumentRepository:
         except _UNAVAILABLE_ERRORS as e:
             raise DatabaseUnavailableError() from e
         return document
+
+    async def reserve_document(
+        self, document_data: DocumentCreate
+    ) -> tuple[DocumentModel, bool]:
+        """Reserva atómicamente un checksum creando un documento uploading.
+
+        Retorna el documento reservado y ``True`` si la inserción tuvo éxito.
+        Si el checksum ya existe, retorna el documento existente y ``False``
+        sin modificarlo.
+        """
+        now = datetime.now(timezone.utc)
+        document = DocumentModel(
+            filename=document_data.filename,
+            checksum=document_data.checksum,
+            size_bytes=document_data.size_bytes,
+            status=DocumentStatus.UPLOADING,
+            created_at=now,
+            updated_at=now,
+            file_id=None,
+            upload_owner_id=None,
+            upload_lease_until=None,
+            upload_fencing_token=None,
+        )
+        document_data_for_insert = document.model_dump(
+            by_alias=True,
+            exclude={"id"},
+        )
+
+        try:
+            result = await self.collection.insert_one(document_data_for_insert)
+        except DuplicateKeyError as duplicate_error:
+            try:
+                existing_document = await self.collection.find_one(
+                    {"checksum": document_data.checksum}
+                )
+            except _UNAVAILABLE_ERRORS as e:
+                raise DatabaseUnavailableError() from e
+
+            if existing_document is None:
+                raise duplicate_error
+
+            existing_data = dict(existing_document)
+            existing_id = existing_data.pop("_id", None)
+            if existing_id is not None:
+                existing_data["id"] = str(existing_id)
+            return DocumentModel.model_validate(existing_data), False
+        except _UNAVAILABLE_ERRORS as e:
+            raise DatabaseUnavailableError() from e
+
+        document.id = str(result.inserted_id)
+        return document, True
 
     async def find_by_id(self, document_id: str) -> dict | None:
         """Busca un documento por su ObjectId. Devuelve None si el ID es inválido o no existe."""
