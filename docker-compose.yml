@@ -69,6 +69,8 @@ services:
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-5}
       EXTRACT_SERVICE_URL: ${EXTRACT_SERVICE_URL_SINGLE_DOCKER:-http://host.docker.internal:8000}
       EXTRACT_SERVICE_TIMEOUT: ${EXTRACT_SERVICE_TIMEOUT:-30}
+      UPLOAD_LEASE_SECONDS:
+      UPLOAD_LEASE_RENEW_INTERVAL_SECONDS:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]

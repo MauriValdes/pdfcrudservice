@@ -210,6 +210,25 @@ El mismo comando desde la raíz del workspace:
 docker compose --env-file ./pdfinfraestructure/.env --project-directory ./pdfcrudservice -f ./pdfcrudservice/docker-compose.yml up -d --build
 ```
 
+### Lease de carga de PDF
+
+MS3 permite configurar la propiedad temporal de carga mediante estas variables
+opcionales en el archivo central `../pdfinfraestructure/.env`:
+
+| Variable | Propósito | Unidad | Default de `Settings` |
+|---|---|---|---:|
+| `UPLOAD_LEASE_SECONDS` | Duración del lease de carga | segundos | `120` |
+| `UPLOAD_LEASE_RENEW_INTERVAL_SECONDS` | Intervalo de renovación del lease de carga | segundos | `30` |
+
+Ambos valores deben ser enteros positivos y el intervalo de renovación debe ser
+menor que la duración del lease. Si se omiten, Docker Compose no los inyecta y
+MS3 utiliza los defaults de `Settings`. Si se definen explícitamente con valores
+inválidos, se conservan y la validación de `Settings` impide el inicio de MS3.
+
+Para configurarlos, agregar sus valores al `.env` central y ejecutar Compose
+con `--env-file ../pdfinfraestructure/.env`, como en los comandos anteriores.
+No se debe crear un archivo `.env` dentro de `pdfcrudservice`.
+
 El acceso externo se realiza mediante Traefik:
 
 - API: http://localhost
