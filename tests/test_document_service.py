@@ -5,9 +5,11 @@ Pruebas en aislamiento con AsyncMock simulando la capa de persistencia.
 from datetime import datetime
 import base64
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 from src.services.document_service import DocumentService
+from src.core.exceptions import DatabaseUnavailableError
+from src.models.document import DocumentModel, DocumentStatus
 from src.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
 
 
@@ -23,6 +25,99 @@ def build_service(existing_doc=None):
         repository=repository,
     )
     return service, repository
+
+
+def build_reservation_data():
+    """Construye los datos de entrada para reservar un documento."""
+    return DocumentCreate(
+        filename="manual.pdf",
+        checksum="abc123",
+        size_bytes=1024,
+    )
+
+
+def build_reservation_document(status):
+    """Construye un documento persistido con el estado indicado."""
+    return DocumentModel(
+        id="507f1f77bcf86cd799439011",
+        filename="manual.pdf",
+        checksum="abc123",
+        size_bytes=1024,
+        status=status,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reserve_or_classify_returns_new_uploading_reservation():
+    document_data = build_reservation_data()
+    document = build_reservation_document(DocumentStatus.UPLOADING)
+    repository = AsyncMock()
+    repository.reserve_document.return_value = (document, True)
+    service = DocumentService(repository=repository)
+
+    result = await service.reserve_or_classify(document_data)
+
+    assert result == (document, "created")
+    assert result[0] is document
+    repository.reserve_document.assert_awaited_once_with(document_data)
+    assert repository.method_calls == [call.reserve_document(document_data)]
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        DocumentStatus.PENDING,
+        DocumentStatus.PROCESSING,
+        DocumentStatus.COMPLETED,
+        DocumentStatus.FAILED,
+    ],
+)
+@pytest.mark.asyncio
+async def test_reserve_or_classify_returns_existing_document(status):
+    document_data = build_reservation_data()
+    document = build_reservation_document(status)
+    repository = AsyncMock()
+    repository.reserve_document.return_value = (document, False)
+    service = DocumentService(repository=repository)
+
+    result = await service.reserve_or_classify(document_data)
+
+    assert result == (document, "existing")
+    assert result[0] is document
+    repository.reserve_document.assert_awaited_once_with(document_data)
+    assert repository.method_calls == [call.reserve_document(document_data)]
+
+
+@pytest.mark.asyncio
+async def test_reserve_or_classify_returns_existing_uploading_reservation():
+    document_data = build_reservation_data()
+    document = build_reservation_document(DocumentStatus.UPLOADING)
+    repository = AsyncMock()
+    repository.reserve_document.return_value = (document, False)
+    service = DocumentService(repository=repository)
+
+    result = await service.reserve_or_classify(document_data)
+
+    assert result == (document, "existing_uploading")
+    assert result[0] is document
+    repository.reserve_document.assert_awaited_once_with(document_data)
+    assert repository.method_calls == [call.reserve_document(document_data)]
+
+
+@pytest.mark.asyncio
+async def test_reserve_or_classify_propagates_database_unavailable():
+    document_data = build_reservation_data()
+    error = DatabaseUnavailableError()
+    repository = AsyncMock()
+    repository.reserve_document.side_effect = error
+    service = DocumentService(repository=repository)
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await service.reserve_or_classify(document_data)
+
+    assert raised.value is error
+    repository.reserve_document.assert_awaited_once_with(document_data)
+    assert repository.method_calls == [call.reserve_document(document_data)]
 
 
 @pytest.mark.asyncio

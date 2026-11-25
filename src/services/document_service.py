@@ -2,7 +2,7 @@ import hashlib
 import httpx
 
 from pymongo.errors import DuplicateKeyError
-from typing import Mapping, Optional
+from typing import Literal, Mapping, Optional
 
 from src.config.config import settings
 from src.models.document import DocumentModel, DocumentStatus
@@ -11,12 +11,32 @@ from src.repository.document_repository import DocumentRepository
 from datetime import datetime, timezone
 
 
+ReservationClassification = Literal[
+    "created",
+    "existing",
+    "existing_uploading",
+]
+
+
 class DocumentService:
     def __init__(self, repository: DocumentRepository):
         self.repository = repository
         # Configuración de comunicación con MS2 (Extract Service)
         self.extract_service_url = settings.extract_service_url
         self.extract_service_timeout = settings.extract_service_timeout
+
+    async def reserve_or_classify(
+        self,
+        document_data: DocumentCreate,
+    ) -> tuple[DocumentModel, ReservationClassification]:
+        """Reserva el checksum y clasifica el documento devuelto."""
+        document, created = await self.repository.reserve_document(document_data)
+
+        if created:
+            return document, "created"
+        if document.status == DocumentStatus.UPLOADING:
+            return document, "existing_uploading"
+        return document, "existing"
 
     async def submit_pdf(self, file_bytes: bytes, filename: str) -> DocumentResponse:
         """Guarda los metadatos básicos del PDF en la base de datos.
