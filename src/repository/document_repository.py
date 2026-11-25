@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from typing import Mapping, Optional, Any
 import inspect
 
+from pymongo import ReturnDocument
 from pymongo.errors import (
     AutoReconnect,
     ConnectionFailure,
@@ -136,6 +137,75 @@ class DocumentRepository:
 
         document.id = str(result.inserted_id)
         return document, True
+
+    async def acquire_upload_ownership(
+        self,
+        checksum: str,
+        upload_owner_id: str,
+        upload_fencing_token: str,
+        upload_lease_until: datetime,
+    ) -> tuple[DocumentModel | None, bool]:
+        """Intenta adquirir atómicamente la propiedad de una carga uploading."""
+        now = datetime.now(timezone.utc)
+        lease_offset = (
+            upload_lease_until.utcoffset()
+            if upload_lease_until.tzinfo is not None
+            else None
+        )
+        if (
+            lease_offset != timezone.utc.utcoffset(now)
+            or upload_lease_until <= now
+        ):
+            raise ValueError(
+                "upload_lease_until debe ser una fecha UTC consciente y futura."
+            )
+
+        query = {
+            "checksum": checksum,
+            "status": DocumentStatus.UPLOADING.value,
+            "file_id": None,
+            "$or": [
+                {"upload_owner_id": {"$exists": False}},
+                {"upload_owner_id": None},
+                {"upload_lease_until": {"$lt": now}},
+            ],
+        }
+        update = {
+            "$set": {
+                "upload_owner_id": upload_owner_id,
+                "upload_lease_until": upload_lease_until,
+                "upload_fencing_token": upload_fencing_token,
+                "updated_at": now,
+            }
+        }
+
+        try:
+            document_data = await self.collection.find_one_and_update(
+                query,
+                update,
+                return_document=ReturnDocument.AFTER,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as e:
+            raise DatabaseUnavailableError() from e
+
+        acquired = document_data is not None
+        if document_data is None:
+            try:
+                document_data = await self.collection.find_one(
+                    {"checksum": checksum}
+                )
+            except _UNAVAILABLE_ERRORS as e:
+                raise DatabaseUnavailableError() from e
+
+        if document_data is None:
+            return None, False
+
+        existing_data = dict(document_data)
+        document_id = existing_data.pop("_id", None)
+        if document_id is not None:
+            existing_data["id"] = str(document_id)
+        return DocumentModel.model_validate(existing_data), acquired
 
     async def find_by_id(self, document_id: str) -> dict | None:
         """Busca un documento por su ObjectId. Devuelve None si el ID es inválido o no existe."""
