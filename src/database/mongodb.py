@@ -4,6 +4,7 @@ import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from src.config.config import MONGO_TEST_DATABASE, settings
+from src.database.indexes import ensure_required_indexes
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +61,8 @@ class MongoDB:
     def indexes_ready(self) -> bool:
         """Indica si los índices obligatorios están inicializados sobre la conexión actual.
 
-        Returns True solo si hay una conexión activa Y los índices obligatorios
-        ('checksum_unique') se crearon exitosamente. Un bucle de supervisión
-        continuo intenta re-crear los índices si fallaron inicialmente.
+        Returns True solo si hay una conexión activa y los índices obligatorios
+        (checksum, trabajos pendientes y leases vencidos) se inicializaron.
 
         Esta propiedad es síncrona para evitar coroutines sin await en contexto
         de tests y endpoints síncronos.
@@ -70,6 +70,21 @@ class MongoDB:
         if not self._connected or self.db is None:
             return False
         return self._indexes_created
+
+    async def _cleanup_connection(self):
+        """Cierra el cliente actual y deja la conexión en estado no disponible."""
+        self._connected = False
+        self._indexes_created = False
+        client = self.client
+        self.client = None
+        self.db = None
+        if client is not None:
+            try:
+                close_result = client.close()
+                if asyncio.iscoroutine(close_result):
+                    await close_result
+            except Exception:
+                logger.warning("Error al cerrar cliente MongoDB durante la limpieza")
 
     async def connect(self, database_name: str = None):
         """Intenta conectar a MongoDB y dejar los índices obligatorios listos.
@@ -84,26 +99,23 @@ class MongoDB:
                 la configuración por defecto.
 
         Raises:
-            Exception: si el ping falla o si no se pudo crear el índice
-                obligatorio 'checksum_unique'.
+            Exception: si el ping o la inicialización de cualquiera de los
+                índices requeridos falla.
         """
         if self._testing and database_name not in (None, MONGO_TEST_DATABASE):
             raise ValueError(
                 f"La conexión de testing solo permite la base {MONGO_TEST_DATABASE}."
             )
 
+        # Una conexión nueva debe volver a demostrar la disponibilidad del
+        # conjunto completo de índices antes de publicar readiness.
+        self._connected = False
+        self._indexes_created = False
+
         # Crear cliente MongoDB (único, no acumular instancias)
         if self.client is not None:
-            try:
-                close_result = self.client.close()
-                # Soporte para mocks asíncronos cuyo close() devuelve coroutine
-                if asyncio.iscoroutine(close_result):
-                    await close_result
-                logger.info("Cliente MongoDB anterior cerrado antes de reconectar")
-            except Exception:
-                logger.warning("Error al cerrar cliente MongoDB anterior")
-            self.client = None
-            self.db = None
+            await self._cleanup_connection()
+            logger.info("Referencias del cliente anterior limpiadas antes de reconectar")
 
         mongo_url = self._mongo_url if self._testing else settings.mongo_url
         selected_database = (
@@ -132,21 +144,15 @@ class MongoDB:
         try:
             await self.client.admin.command('ping')
             logger.info("Ping a MongoDB exitoso")
+        except asyncio.CancelledError:
+            await self._cleanup_connection()
+            raise
         except Exception as e:
             if self._testing:
                 logger.warning("Ping a MongoDB de testing falló; conexión no establecida.")
             else:
                 logger.warning(f"Ping a MongoDB falló: {e}. No se establece conexión.")
-            self._connected = False
-            self._indexes_created = False
-            try:
-                close_result = self.client.close()  # close() es síncrono, no usar await
-                if asyncio.iscoroutine(close_result):
-                    await close_result
-            except Exception:
-                pass
-            self.client = None
-            self.db = None
+            await self._cleanup_connection()
             logger.error("No se pudo establecer conexión con MongoDB - ping falló")
             if self._testing:
                 raise RuntimeError(
@@ -158,75 +164,35 @@ class MongoDB:
         self._connected = True
         logger.info(f"Conectado a MongoDB en la base de datos: {self.db.name}")
 
-        # Verificar o crear índice único sobre 'checksum' de forma idempotente.
-        # La conexión NO está completa hasta que el índice exista.
+        # Garantizar el conjunto completo de índices requeridos. La conexión
+        # no se considera lista hasta que termine exitosamente la operación.
         try:
-            await self._ensure_unique_index_on_checksum()
+            collection = self.db[settings.mongo_collection]
+            await ensure_required_indexes(collection)
+            self._indexes_created = True
+            logger.info("Índices requeridos creados o ya existentes.")
+        except asyncio.CancelledError:
+            await self._cleanup_connection()
+            raise
         except Exception as e:
             logger.error(
-                f"Fallo la inicialización del índice obligatorio: "
+                f"Fallo la inicialización de índices: "
                 + (
                     "la conexión de testing no se considera completa."
                     if self._testing
                     else f"la conexión no se considera completa: {e}"
                 )
             )
-            self._connected = False
-            self._indexes_created = False
-            try:
-                close_result = self.client.close()  # close() es síncrono, no usar await
-                if asyncio.iscoroutine(close_result):
-                    await close_result
-            except Exception:
-                pass
-            self.client = None
-            self.db = None
+            await self._cleanup_connection()
             if self._testing:
                 raise RuntimeError(
-                    "Falló la inicialización del índice en MongoDB de testing."
+                    "Falló la inicialización de índices en MongoDB de testing."
                 ) from None
             raise
 
         # Recuperación completa (ping + índices): recién aquí se reinicia el
         # contador de reintentos que gestiona retry_connect.
         self._retry_attempt = 0
-
-    async def _ensure_unique_index_on_checksum(self):
-        """Crea un índice único sobre el campo 'checksum' si no existe.
-
-        La operación es idempotente: si el índice ya existe con la misma configuración,
-        MongoDB no lanza error. Si el índice se crea exitosamente, actualiza el
-        estado interno para reflejar que los índices obligatorios están disponibles.
-
-        Si falla la creación, marca _indexes_created = False, registra el error
-        y PROPAGA la excepción para que el caller (connect / retry_connect)
-        sepa que la recuperación no está completa.
-
-        Raises:
-            Exception: si no hay base de datos seleccionada o si la creación
-                del índice falla.
-        """
-        if self.db is None:
-            self._indexes_created = False
-            logger.error("No hay base de datos seleccionada; no se puede crear el índice 'checksum_unique'.")
-            raise RuntimeError("No hay base de datos seleccionada para crear el índice 'checksum_unique'.")
-        try:
-            await self.db[settings.mongo_collection].create_index(
-                [("checksum", 1)],
-                name="checksum_unique",
-                unique=True,
-            )
-            logger.info("Índice único 'checksum_unique' creado o ya existente.")
-            # Confirmar que los índices obligatorios están disponibles
-            self._indexes_created = True
-        except Exception as e:
-            if self._testing:
-                logger.error("Error al crear índice único en MongoDB de testing.")
-            else:
-                logger.error(f"Error al crear índice único en 'checksum': {e}")
-            # Controlar que el índice falló creación
-            self._indexes_created = False
-            raise
 
     async def disconnect(self):
         """Cierra la conexión con MongoDB de forma gracefull."""

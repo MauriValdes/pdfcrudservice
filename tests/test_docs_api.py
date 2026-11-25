@@ -3,7 +3,7 @@ import datetime
 import asyncio
 import httpx
 import hashlib
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from bson import ObjectId
 from fastapi.testclient import TestClient
 from pymongo.errors import AutoReconnect, DuplicateKeyError, ServerSelectionTimeoutError
@@ -828,14 +828,11 @@ def test_upload_pdf_validation_errors_still_return_400(client, mock_service):
 # =============================================================================
 
 async def test_index_unique_is_created_automatically(monkeypatch):
-    """Verifica que el índice único se crea automáticamente al conectar.
+    """Verifica la inicialización completa y conserva checksum_unique.
 
-    Ejecuta el método real MongoDB.connect(), que a su vez invoca al método
-    real _ensure_unique_index_on_checksum(). Sólo se simula el cliente de
-    MongoDB y su colección; nunca se reemplaza el método bajo prueba.
+    Ejecuta MongoDB.connect() con el cliente y la colección simulados.
     """
     from src.database.mongodb import MongoDB
-    from src.config.config import settings
 
     mock_collection = AsyncMock()
     mock_collection.create_index = AsyncMock(return_value="checksum_unique")
@@ -851,20 +848,34 @@ async def test_index_unique_is_created_automatically(monkeypatch):
         mongodb = MongoDB()
         await mongodb.connect()
 
-    mock_collection.create_index.assert_called_once()
-    args, kwargs = mock_collection.create_index.call_args
-    assert args[0] == [("checksum", 1)]
-    assert kwargs["name"] == "checksum_unique"
-    assert kwargs["unique"] is True
+    assert mock_collection.create_index.await_args_list == [
+        call(
+            [("checksum", 1)],
+            name="checksum_unique",
+            unique=True,
+        ),
+        call(
+            [
+                ("status", 1),
+                ("next_retry_at", 1),
+                ("created_at", 1),
+            ],
+            name="pending_jobs_idx",
+        ),
+        call(
+            [("status", 1), ("lease_until", 1)],
+            name="expired_leases_idx",
+        ),
+    ]
+    assert mongodb.indexes_ready is True
 
 
 async def test_index_initialization_is_idempotent(monkeypatch):
-    """Verifica que inicializar el índice dos veces no lanza error.
+    """Verifica que conexiones repetidas solicitan las mismas definiciones.
 
     Ejecuta MongoDB.connect() dos veces con la implementación real.
     """
     from src.database.mongodb import MongoDB
-    from src.config.config import settings
 
     mock_collection = AsyncMock()
     mock_collection.create_index = AsyncMock(return_value="checksum_unique")
@@ -881,17 +892,19 @@ async def test_index_initialization_is_idempotent(monkeypatch):
         await mongodb.connect()
         await mongodb.connect()  # Segunda inicialización: debe ser idempotente
 
-    assert mock_collection.create_index.call_count == 2
+    calls = mock_collection.create_index.await_args_list
+    assert len(calls) == 6
+    assert calls[:3] == calls[3:]
+    assert mongodb.indexes_ready is True
 
 
 async def test_index_initialization_fails_gracefully(monkeypatch):
-    """Verifica que un error al crear el índice se propaga correctamente.
+    """Verifica que un error de inicialización se propaga y no da readiness.
 
     Ejecuta MongoDB.connect() con la implementación real; la colección
     simula que create_index falla y el error debe propagarse.
     """
     from src.database.mongodb import MongoDB
-    from src.config.config import settings
 
     mock_collection = AsyncMock()
     mock_collection.create_index = AsyncMock(
@@ -910,6 +923,10 @@ async def test_index_initialization_fails_gracefully(monkeypatch):
         with pytest.raises(Exception):
             await mongodb.connect()
 
+    assert mongodb.indexes_ready is False
+    assert mongodb.connected is False
+    assert mongodb.client is None
+    assert mongodb.db is None
 
 # =============================================================================
 # Etapa 2 - Factor 4: indisponibilidad de MongoDB -> HTTP 503

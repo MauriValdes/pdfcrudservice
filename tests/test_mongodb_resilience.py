@@ -54,13 +54,14 @@ P4 - apagado graceful:
 import asyncio
 import contextlib
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from pymongo.errors import ServerSelectionTimeoutError
 
 import src.database.mongodb as mongodb
 import src.main as src_main
+from src.config.config import settings
 from src.database.mongodb import _apply_backoff, db_connection, retry_connect
 from fastapi.testclient import TestClient
 from src.main import app
@@ -224,6 +225,204 @@ async def test_cada_conexion_recrea_cliente_con_write_concern(
     for call in factory.call_args_list:
         _, kwargs = call
         assert kwargs == {"w": 1, "journal": True}
+
+
+async def test_connect_espera_inicializacion_completa_antes_de_indexes_ready(
+    clean_db_connection, monkeypatch
+):
+    """La readiness solo puede reflejar el fin de toda la inicialización."""
+    state, factory, _ = _make_mongo_mocks()
+    state["mongo_disponible"] = True
+    monkeypatch.setattr(mongodb, "AsyncIOMotorClient", factory)
+
+    async def inicializacion_completa(collection):
+        assert collection is db_connection.db[settings.mongo_collection]
+        assert db_connection.connected is True
+        assert db_connection.indexes_ready is False
+
+    initializer = AsyncMock(side_effect=inicializacion_completa)
+    monkeypatch.setattr(
+        mongodb, "ensure_required_indexes", initializer, raising=False
+    )
+
+    await db_connection.connect()
+
+    initializer.assert_awaited_once_with(
+        db_connection.db[settings.mongo_collection]
+    )
+    assert db_connection.indexes_ready is True
+
+
+@pytest.mark.parametrize("failing_call", [1, 2, 3])
+async def test_fallo_de_cualquier_indice_limpia_conexion_y_no_marca_ready(
+    failing_call, clean_db_connection, monkeypatch
+):
+    state, factory, mock_client = _make_mongo_mocks()
+    state["mongo_disponible"] = True
+    monkeypatch.setattr(mongodb, "AsyncIOMotorClient", factory)
+    collection = mock_client.__getitem__.return_value.__getitem__.return_value
+    collection.create_index.side_effect = (
+        [None] * (failing_call - 1)
+        + [RuntimeError(f"fallo índice {failing_call}")]
+    )
+
+    with pytest.raises(RuntimeError, match=f"fallo índice {failing_call}"):
+        await db_connection.connect()
+
+    assert collection.create_index.await_count == failing_call
+    assert db_connection.connected is False
+    assert db_connection.indexes_ready is False
+    assert db_connection.client is None
+    assert db_connection.db is None
+    mock_client.close.assert_called_once()
+
+
+async def test_cancelacion_durante_ping_cierra_y_limpia_conexion(
+    clean_db_connection, monkeypatch
+):
+    state, factory, mock_client = _make_mongo_mocks()
+    monkeypatch.setattr(mongodb, "AsyncIOMotorClient", factory)
+    ping_started = asyncio.Event()
+    ping_gate = asyncio.Event()
+
+    async def blocked_ping(*args, **kwargs):
+        ping_started.set()
+        await ping_gate.wait()
+        return {"ok": 1}
+
+    mock_client.admin.command = AsyncMock(side_effect=blocked_ping)
+    task = asyncio.create_task(db_connection.connect())
+    try:
+        await asyncio.wait_for(ping_started.wait(), timeout=2)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        mock_client.close.assert_called_once()
+        assert db_connection.connected is False
+        assert db_connection.indexes_ready is False
+        assert db_connection.client is None
+        assert db_connection.db is None
+    finally:
+        ping_gate.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cancelacion_durante_creacion_de_indice_cierra_y_limpia_conexion(
+    clean_db_connection, monkeypatch
+):
+    state, factory, mock_client = _make_mongo_mocks()
+    state["mongo_disponible"] = True
+    monkeypatch.setattr(mongodb, "AsyncIOMotorClient", factory)
+    collection = mock_client.__getitem__.return_value.__getitem__.return_value
+    pending_index_started = asyncio.Event()
+    pending_index_gate = asyncio.Event()
+
+    async def controlled_create_index(*args, **kwargs):
+        if kwargs["name"] == "pending_jobs_idx":
+            pending_index_started.set()
+            await pending_index_gate.wait()
+        return kwargs["name"]
+
+    collection.create_index.side_effect = controlled_create_index
+    task = asyncio.create_task(db_connection.connect())
+    try:
+        await asyncio.wait_for(pending_index_started.wait(), timeout=2)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert collection.create_index.await_count == 2
+        mock_client.close.assert_called_once()
+        assert db_connection.connected is False
+        assert db_connection.indexes_ready is False
+        assert db_connection.client is None
+        assert db_connection.db is None
+    finally:
+        pending_index_gate.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cada_reconexion_vuelve_a_garantizar_todos_los_indices(
+    clean_db_connection, monkeypatch
+):
+    state, factory, _ = _make_mongo_mocks()
+    state["mongo_disponible"] = True
+    monkeypatch.setattr(mongodb, "AsyncIOMotorClient", factory)
+
+    async def inicializacion_completa(_collection):
+        assert db_connection.indexes_ready is False
+
+    initializer = AsyncMock(side_effect=inicializacion_completa)
+    monkeypatch.setattr(
+        mongodb, "ensure_required_indexes", initializer, raising=False
+    )
+
+    await db_connection.connect()
+    collection_primera_conexion = db_connection.db[settings.mongo_collection]
+    await db_connection.connect()
+    collection_segunda_conexion = db_connection.db[settings.mongo_collection]
+
+    assert initializer.await_args_list == [
+        call(collection_primera_conexion),
+        call(collection_segunda_conexion),
+    ]
+    assert db_connection.indexes_ready is True
+
+
+async def test_retry_connect_recupera_fallo_transitorio_de_indices_y_readiness(
+    clean_db_connection, fake_clock, monkeypatch
+):
+    state, factory, mock_client = _make_mongo_mocks()
+    state["mongo_disponible"] = True
+    monkeypatch.setattr(mongodb, "AsyncIOMotorClient", factory)
+    initializer = AsyncMock(
+        side_effect=[RuntimeError("fallo transitorio"), None]
+    )
+    monkeypatch.setattr(
+        mongodb, "ensure_required_indexes", initializer, raising=False
+    )
+    fake_clock.stop_after = 1
+
+    task = asyncio.create_task(retry_connect())
+    try:
+        await asyncio.wait_for(fake_clock.reached_stop.wait(), timeout=2)
+        # Con la integración productiva, la primera espera es el backoff.
+        # En RED, el flujo actual alcanza la espera del supervisor; la
+        # aserción falla enseguida porque no se llamó al inicializador.
+        assert initializer.await_count == 1
+        assert fake_clock.delays == [1]
+        assert factory.call_count == 1
+        assert db_connection.connected is False
+        assert db_connection.indexes_ready is False
+        assert db_connection.client is None
+        assert db_connection.db is None
+        assert TestClient(app).get("/ready").status_code == 503
+
+        # Release the simulated backoff; the second real connect() should
+        # call the initializer again and complete before supervision proceeds.
+        fake_clock.gate.set()
+        await fake_clock.wait_until(
+            lambda: initializer.await_count == 2 and db_connection.indexes_ready,
+            timeout_s=2,
+        )
+
+        assert initializer.await_count == 2
+        assert factory.call_count == 2
+        assert db_connection.connected is True
+        assert db_connection.indexes_ready is True
+        assert TestClient(app).get("/ready").status_code == 200
+    finally:
+        fake_clock.gate.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +651,7 @@ async def test_pings_periodicos_respetan_intervalo(
     assert db_connection._indexes_created is True
     # El supervisor no crea clientes ni reinicializa índices
     assert factory.call_count == 1
-    assert db_connection.db.__getitem__.return_value.create_index.call_count == 1
+    assert db_connection.db.__getitem__.return_value.create_index.call_count == 3
     # La tarea sigue activa mientras está congelada en el gate
     assert task.done() is False
     assert task.cancelled() is False
@@ -641,7 +840,7 @@ async def test_ciclo_completo_de_recuperacion(
     collection = db_connection.db.__getitem__.return_value
     index_calls_iniciales = collection.create_index.call_count
     factory_calls_iniciales = factory.call_count
-    assert index_calls_iniciales == 1
+    assert index_calls_iniciales == 3
     assert factory_calls_iniciales == 1
 
     # 2) Caída de MongoDB: el supervisor la detecta y termina por sí mismo
@@ -668,8 +867,8 @@ async def test_ciclo_completo_de_recuperacion(
     assert factory.call_count == factory_calls_iniciales + 1, (
         "retry_connect debe crear una NUEVA conexión tras la caída"
     )
-    assert collection.create_index.call_count == index_calls_iniciales + 1, (
-        "el índice obligatorio debe recrearse en la reconexión"
+    assert collection.create_index.call_count == index_calls_iniciales + 3, (
+        "los índices obligatorios deben recrearse en la reconexión"
     )
     assert db_connection._indexes_created is True
     assert db_connection.indexes_ready is True
@@ -983,8 +1182,8 @@ async def test_cancelacion_durante_reconexion_dentro_de_connect(
 ):
     """Conexión exitosa -> caída -> la reconexión queda bloqueada dentro de
     connect() (ping suspendido en un Event) -> cancelar ahí: CancelledError
-    atraviesa connect() SIN limpiar recursos, la supervisión queda limpia y
-    client/db se conservan para disconnect()."""
+    atraviesa connect(), se limpian los recursos de la nueva conexión y la
+    supervisión queda limpia."""
     state, factory, mock_client = _make_mongo_mocks()
     monkeypatch.setattr(mongodb, "AsyncIOMotorClient", factory)
     state["mongo_disponible"] = True
@@ -1027,7 +1226,7 @@ async def test_cancelacion_durante_reconexion_dentro_de_connect(
         and not db_connection._supervision_task.done()
     )
     collection = db_connection.db.__getitem__.return_value
-    assert collection.create_index.call_count == 1
+    assert collection.create_index.call_count == 3
 
     # 2) Caída: el supervisor termina por sí mismo
     state["mongo_disponible"] = False
@@ -1040,27 +1239,24 @@ async def test_cancelacion_durante_reconexion_dentro_de_connect(
     await ping_bloqueado.wait()  # mismo loop: await directo seguro
     assert task.done() is False
     assert factory.call_count == 2, "el intento de reconexión creó un cliente"
-    assert collection.create_index.call_count == 1, (
-        "la reconexión quedó a mitad de camino: sin índice recreado"
+    assert collection.create_index.call_count == 3, (
+        "la reconexión quedó bloqueada antes del ping y los índices"
     )
 
-    # 4) Cancelación dentro de connect(): el ping está en el Event.
-    # Línea base de cierres: connect() ya cerró al "cliente anterior" al
-    # entrar a reconectar (lógica propia de connect(), no de la cancelación)
+    # 4) Cancelación dentro de connect(): el ping está en el Event. El cierre
+    # previo corresponde al cliente de la conexión caída; la cancelación debe
+    # cerrar también el cliente de la reconexión interrumpida.
     cerrados_antes_de_cancelar = mock_client.close.call_count
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
 
     assert task.cancelled(), "CancelledError debió propagarse desde connect()"
-    # La supervisión quedó limpia y los recursos conservados: ni connect()
-    # (except Exception no captura CancelledError) ni retry_connect
-    # descartan client/db al cancelarse; el cierre es de disconnect().
     assert db_connection._supervision_task is None
-    assert db_connection.client is mock_client
-    assert db_connection.db is not None
+    assert db_connection.client is None
+    assert db_connection.db is None
     assert db_connection._connected is False
     assert db_connection._indexes_created is False
-    assert mock_client.close.call_count == cerrados_antes_de_cancelar, (
-        "la cancelación no debe cerrar el cliente: es trabajo de disconnect()"
+    assert mock_client.close.call_count == cerrados_antes_de_cancelar + 1, (
+        "la cancelación debe cerrar el cliente de la reconexión interrumpida"
     )
