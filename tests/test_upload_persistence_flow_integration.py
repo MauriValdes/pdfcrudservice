@@ -3,6 +3,7 @@
 import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -195,3 +196,116 @@ async def test_upload_persistence_flow_with_real_mongodb_and_gridfs(
             await gridfs_repository.delete(file_id)
         finally:
             await collection.delete_one({"checksum": checksum})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_service_stores_authorized_upload_durably_without_finalizing(
+    _isolated_testing_db,
+):
+    """Reserva, adquiere y almacena con el servicio sin asociar ni finalizar."""
+    testing_db = _isolated_testing_db
+    db = testing_db.db
+    collection = db[settings.mongo_collection]
+    repository = DocumentRepository(db)
+    service = DocumentService(repository=repository)
+    gridfs_repository = GridFSRepository(db)
+
+    unique_token = str(uuid.uuid4())
+    pdf_bytes = _build_minimal_pdf(f"durable-upload-{unique_token}")
+    checksum = hashlib.sha256(pdf_bytes).hexdigest()
+    filename = f"durable-upload-{unique_token}.pdf"
+    document_id = None
+    file_id = None
+
+    service.call_extraction_service = AsyncMock()
+    service.process_pdf_extraction = AsyncMock()
+
+    try:
+        document, classification = await service.reserve_or_classify(
+            DocumentCreate(
+                filename=filename,
+                checksum=checksum,
+                size_bytes=len(pdf_bytes),
+            )
+        )
+        if classification == "created":
+            document_id = document.id
+
+        assert classification == "created"
+        assert document_id is not None
+        assert document.status == DocumentStatus.UPLOADING
+        assert document.file_id is None
+
+        owned_document, acquired = await service.acquire_upload_ownership(
+            document,
+            settings.upload_lease_seconds,
+        )
+
+        assert acquired is True
+        assert owned_document is not None
+        assert owned_document.id == document_id
+        assert owned_document.upload_owner_id
+        assert owned_document.upload_fencing_token
+        assert owned_document.upload_lease_until is not None
+        lease_until = _normalize_mongo_datetime(
+            owned_document.upload_lease_until
+        )
+        assert lease_until > datetime.now(timezone.utc)
+
+        # El ID se crea para este intento, después de confirmar la adquisición.
+        file_id = ObjectId()
+        assert isinstance(file_id, ObjectId)
+        metadata = {
+            "document_id": owned_document.id,
+            "checksum": owned_document.checksum,
+            "upload_owner_id": owned_document.upload_owner_id,
+            "upload_fencing_token": owned_document.upload_fencing_token,
+        }
+        assert metadata == {
+            "document_id": document_id,
+            "checksum": checksum,
+            "upload_owner_id": owned_document.upload_owner_id,
+            "upload_fencing_token": owned_document.upload_fencing_token,
+        }
+
+        stored_file_id = await service.save_original_pdf(
+            file_id=file_id,
+            filename=filename,
+            data=pdf_bytes,
+            metadata=metadata,
+        )
+
+        assert stored_file_id == file_id
+        file_info = await gridfs_repository.stat(file_id)
+        assert file_info is not None
+        assert file_info.length == len(pdf_bytes)
+        assert file_info.metadata == metadata
+
+        recovered_pdf = await gridfs_repository.read(file_id)
+        assert recovered_pdf == pdf_bytes
+        assert hashlib.sha256(recovered_pdf).hexdigest() == checksum
+
+        persisted_document = await collection.find_one(
+            {"_id": ObjectId(document_id)}
+        )
+        assert persisted_document is not None
+        assert persisted_document["status"] == DocumentStatus.UPLOADING.value
+        assert persisted_document["file_id"] is None
+        assert persisted_document["checksum"] == checksum
+
+        service.call_extraction_service.assert_not_awaited()
+        service.process_pdf_extraction.assert_not_awaited()
+    finally:
+        try:
+            if file_id is not None:
+                await db["fs.files"].delete_one({"_id": file_id})
+        finally:
+            try:
+                if file_id is not None:
+                    await db["fs.chunks"].delete_many({"files_id": file_id})
+            finally:
+                if document_id is not None:
+                    await collection.delete_one(
+                        {"_id": ObjectId(document_id)}
+                    )
