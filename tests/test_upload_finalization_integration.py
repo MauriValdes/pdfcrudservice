@@ -308,3 +308,107 @@ async def test_concurrent_upload_finalization_associates_only_one_file(
         )
     finally:
         await collection.delete_many({"checksum": checksum})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_previous_upload_owner_cannot_renew_or_finalize_after_reacquisition(
+    _isolated_testing_db,
+):
+    """Una readquisición invalida al propietario anterior para renovar y finalizar."""
+    testing_db = _isolated_testing_db
+    checksum = _unique_checksum()
+    collection = testing_db.db[settings.mongo_collection]
+
+    try:
+        repository = DocumentRepository(testing_db.db)
+        reservation, owner_a, token_a, _ = await _create_owned_reservation(
+            repository,
+            checksum,
+            "finalize-upload-reacquired-owner.pdf",
+        )
+        document_filter = {
+            "_id": ObjectId(reservation.id),
+            "checksum": checksum,
+        }
+
+        expired_lease = datetime.now(timezone.utc) - timedelta(minutes=1)
+        expiration_result = await collection.update_one(
+            document_filter,
+            {"$set": {"upload_lease_until": expired_lease}},
+        )
+        assert expiration_result.matched_count == 1
+
+        owner_b = str(uuid.uuid4())
+        token_b = str(uuid.uuid4())
+        lease_b = datetime.now(timezone.utc) + timedelta(minutes=15)
+        reacquired_document, reacquired = (
+            await repository.acquire_upload_ownership(
+                checksum,
+                owner_b,
+                token_b,
+                lease_b,
+            )
+        )
+
+        assert reacquired is True
+        assert reacquired_document is not None
+        assert reacquired_document.id == reservation.id
+
+        persisted_for_b = await collection.find_one(document_filter)
+        assert persisted_for_b is not None
+        assert persisted_for_b["_id"] == ObjectId(reservation.id)
+        assert persisted_for_b["upload_owner_id"] == owner_b
+        assert persisted_for_b["upload_fencing_token"] == token_b
+        assert _normalize_mongo_datetime(
+            persisted_for_b["upload_lease_until"]
+        ) == _normalize_mongo_datetime(lease_b)
+        persisted_before_stale_attempts = dict(persisted_for_b)
+
+        stale_renewal = await repository.renew_upload_lease(
+            reservation.id,
+            owner_a,
+            token_a,
+            lease_b + timedelta(minutes=15),
+        )
+        assert stale_renewal is False
+
+        file_id_a = ObjectId()
+        file_id_b = ObjectId()
+        assert file_id_a != file_id_b
+        stale_finalization = await repository.finalize_upload(
+            reservation.id,
+            owner_a,
+            token_a,
+            file_id_a,
+        )
+        assert stale_finalization is False
+
+        persisted_after_stale_attempts = await collection.find_one(
+            document_filter
+        )
+        assert persisted_after_stale_attempts == persisted_before_stale_attempts
+
+        finalized_by_b = await repository.finalize_upload(
+            reservation.id,
+            owner_b,
+            token_b,
+            file_id_b,
+        )
+        assert finalized_by_b is True
+
+        persisted_final = await collection.find_one(document_filter)
+        assert persisted_final is not None
+        assert persisted_final["_id"] == ObjectId(reservation.id)
+        assert persisted_final["status"] == DocumentStatus.PENDING.value
+        assert isinstance(persisted_final["file_id"], ObjectId)
+        assert persisted_final["file_id"] == file_id_b
+        assert persisted_final["file_id"] != file_id_a
+        assert persisted_final["upload_owner_id"] == owner_b
+        assert persisted_final["upload_fencing_token"] == token_b
+        assert _normalize_mongo_datetime(
+            persisted_final["upload_lease_until"]
+        ) == _normalize_mongo_datetime(lease_b)
+        assert await collection.count_documents({"checksum": checksum}) == 1
+    finally:
+        await collection.delete_many({"checksum": checksum})
