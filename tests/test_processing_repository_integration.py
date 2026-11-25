@@ -1,0 +1,618 @@
+"""Pruebas de integración de reclamos contra MongoDB real de testing."""
+
+import asyncio
+import hashlib
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from bson import ObjectId
+
+from src.config.config import MONGO_TEST_DATABASE, settings
+from src.database.mongodb import MongoDB
+from src.models.document import DocumentModel, DocumentStatus
+from src.repository import processing_repository
+from src.repository.document_repository import DocumentRepository
+from src.repository.gridfs_repository import GridFSRepository
+from src.repository.processing_repository import ProcessingRepository
+from src.schemas.document import DocumentCreate
+
+
+MISSING = object()
+FIXED_NOW = datetime(2026, 11, 25, 12, 0, 0, 123000, tzinfo=timezone.utc)
+
+
+@pytest_asyncio.fixture
+async def testing_context():
+    """Conecta exclusivamente a pdf_database_test y limpia solo sus fixtures."""
+    manager = MongoDB.for_testing()
+    resources: list[tuple[ObjectId, str, ObjectId | None]] = []
+    validated_test_db = None
+    try:
+        await manager.connect()
+        if (
+            manager._testing is not True
+            or manager.db is None
+            or manager.db.name != MONGO_TEST_DATABASE
+        ):
+            raise RuntimeError(
+                "El fixture solo puede operar sobre pdf_database_test."
+            )
+        validated_test_db = manager.db
+        yield validated_test_db, resources
+    finally:
+        try:
+            if validated_test_db is not None:
+                if (
+                    manager._testing is not True
+                    or manager.db is not validated_test_db
+                    or manager.db.name != MONGO_TEST_DATABASE
+                ):
+                    raise RuntimeError(
+                        "Se bloqueó la limpieza fuera de pdf_database_test."
+                    )
+                collection = validated_test_db[settings.mongo_collection]
+                gridfs = GridFSRepository(validated_test_db)
+                for document_id, checksum, file_id in reversed(resources):
+                    try:
+                        if file_id is not None:
+                            await gridfs.delete(file_id)
+                    finally:
+                        await collection.delete_one(
+                            {"_id": document_id, "checksum": checksum}
+                        )
+        finally:
+            await manager.disconnect()
+
+
+def _freeze_claim_clock(monkeypatch, now=FIXED_NOW):
+    """Fija el reloj del repositorio sin alterar las fechas del driver Mongo."""
+    class FrozenDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is timezone.utc
+            return now
+
+    monkeypatch.setattr(processing_repository, "datetime", FrozenDateTime)
+    return now
+
+
+def _build_minimal_pdf(unique_content: str) -> bytes:
+    """Construye un PDF mínimo con contenido único para almacenar en GridFS."""
+    stream = f"BT /F1 12 Tf 72 720 Td ({unique_content}) Tj ET\n".encode(
+        "ascii"
+    )
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        (
+            f"<< /Length {len(stream)} >>\n".encode("ascii")
+            + b"stream\n"
+            + stream
+            + b"endstream"
+        ),
+    ]
+
+    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{number} 0 obj\n".encode("ascii"))
+        pdf.extend(body)
+        pdf.extend(b"\nendobj\n")
+
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        (
+            f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return bytes(pdf)
+
+
+def _normalize_datetime(value: datetime) -> datetime:
+    """Normaliza datetimes BSON a UTC y precisión de milisegundos."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.replace(microsecond=(value.microsecond // 1000) * 1000)
+
+
+async def _create_pending_pdf(db, resources, *, created_at=None, fields=None):
+    """Crea uploading, persiste un PDF GridFS y finaliza la reserva a pending."""
+    token = uuid.uuid4().hex
+    pdf_bytes = _build_minimal_pdf(f"processing-claim-{token}")
+    checksum = hashlib.sha256(pdf_bytes).hexdigest()
+    filename = f"processing-claim-{token}.pdf"
+    repository = DocumentRepository(db)
+    gridfs = GridFSRepository(db)
+    collection = db[settings.mongo_collection]
+    file_id = ObjectId()
+
+    reservation, created = await repository.reserve_document(
+        DocumentCreate(
+            filename=filename,
+            checksum=checksum,
+            size_bytes=len(pdf_bytes),
+        )
+    )
+    assert created is True
+    document_id = ObjectId(reservation.id)
+    resources.append((document_id, checksum, file_id))
+
+    owner_id = str(uuid.uuid4())
+    upload_token = str(uuid.uuid4())
+    upload_lease_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+    _, acquired = await repository.acquire_upload_ownership(
+        checksum,
+        owner_id,
+        upload_token,
+        upload_lease_until,
+    )
+    assert acquired is True
+
+    await gridfs.save(
+        file_id,
+        filename,
+        pdf_bytes,
+        metadata={"checksum": checksum},
+    )
+    finalized = await repository.finalize_upload(
+        reservation.id,
+        owner_id,
+        upload_token,
+        file_id,
+    )
+    assert finalized is True
+
+    updates: dict[str, Any] = dict(fields or {})
+    if created_at is not None:
+        updates["created_at"] = created_at
+    if updates:
+        result = await collection.update_one(
+            {"_id": document_id, "checksum": checksum},
+            {"$set": updates},
+        )
+        assert result.matched_count == 1
+
+    return {
+        "document_id": document_id,
+        "checksum": checksum,
+        "file_id": file_id,
+        "pdf_bytes": pdf_bytes,
+        "upload_owner_id": owner_id,
+        "upload_fencing_token": upload_token,
+        "upload_lease_until": upload_lease_until,
+    }
+
+
+async def _insert_raw_pending(db, resources, *, file_id=MISSING, fields=None):
+    """Inserta un documento de testing para filtros con valores no válidos."""
+    token = uuid.uuid4().hex
+    checksum = hashlib.sha256(token.encode("ascii")).hexdigest()
+    document_id = ObjectId()
+    document = {
+        "_id": document_id,
+        "filename": f"raw-claim-{token}.pdf",
+        "checksum": checksum,
+        "size_bytes": 1,
+        "status": DocumentStatus.PENDING.value,
+        "created_at": FIXED_NOW,
+        "updated_at": FIXED_NOW,
+        "attempt_count": 0,
+    }
+    if file_id is not MISSING:
+        document["file_id"] = file_id
+    document.update(fields or {})
+    await db[settings.mongo_collection].insert_one(document)
+    resources.append((document_id, checksum, None))
+    return document_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_persists_successful_claim_and_returns_document_model(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    document = await _create_pending_pdf(
+        db,
+        resources,
+        fields={"attempt_count": 6},
+    )
+    repository = ProcessingRepository(db)
+    worker_id = "integration-worker-success"
+    collection = db[settings.mongo_collection]
+
+    claimed = await repository.claim_pending(worker_id)
+
+    assert isinstance(claimed, DocumentModel)
+    assert claimed.id == str(document["document_id"])
+    assert claimed.status == DocumentStatus.PROCESSING
+    assert claimed.worker_id == worker_id
+    assert _normalize_datetime(claimed.lease_until) == now + timedelta(seconds=60)
+    assert _normalize_datetime(claimed.heartbeat_at) == now
+    assert _normalize_datetime(claimed.updated_at) == now
+    uuid.UUID(claimed.fencing_token)
+    uuid.UUID(claimed.processing_cycle_id)
+    assert claimed.fencing_token != claimed.processing_cycle_id
+    assert claimed.attempt_count == 6
+    assert claimed.file_id == document["file_id"]
+
+    persisted = await collection.find_one({"_id": document["document_id"]})
+    assert persisted is not None
+    assert persisted["status"] == DocumentStatus.PROCESSING.value
+    assert persisted["worker_id"] == worker_id
+    assert _normalize_datetime(persisted["lease_until"]) == now + timedelta(
+        seconds=60
+    )
+    assert _normalize_datetime(persisted["heartbeat_at"]) == now
+    assert _normalize_datetime(persisted["updated_at"]) == now
+    assert persisted["fencing_token"] == claimed.fencing_token
+    assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert persisted["attempt_count"] == 6
+    assert persisted["file_id"] == document["file_id"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_returns_none_when_there_are_no_eligible_candidates(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    await _insert_raw_pending(
+        db,
+        resources,
+        file_id=None,
+    )
+
+    result = await ProcessingRepository(db).claim_pending("worker-no-candidate")
+
+    assert result is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expired_lease"),
+    [
+        (DocumentStatus.UPLOADING.value, False),
+        (DocumentStatus.PROCESSING.value, True),
+        (DocumentStatus.COMPLETED.value, False),
+        (DocumentStatus.FAILED.value, False),
+    ],
+    ids=["uploading", "processing-expired-lease", "completed", "failed"],
+)
+async def test_claim_excludes_documents_outside_pending_state(
+    testing_context, monkeypatch, status, expired_lease
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    fields = {"status": status}
+    if expired_lease:
+        fields["lease_until"] = now - timedelta(seconds=1)
+    document = await _create_pending_pdf(db, resources, fields=fields)
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    result = await ProcessingRepository(db).claim_pending("worker-status")
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert result is None
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "file_id"),
+    [
+        ("missing", MISSING),
+        ("null", None),
+        ("string", "not-an-object-id"),
+        ("integer", 42),
+        ("empty-array", []),
+    ],
+    ids=["missing", "null", "string", "integer", "empty-array"],
+)
+async def test_claim_excludes_invalid_file_id_values_without_mutation(
+    testing_context, monkeypatch, case, file_id
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=file_id,
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document_id})
+
+    result = await ProcessingRepository(db).claim_pending("worker-invalid-file")
+
+    after = await collection.find_one({"_id": document_id})
+    assert result is None, f"file_id case {case!r} was unexpectedly claimed"
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_excludes_array_containing_objectids_without_mutation(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=[ObjectId(), ObjectId()],
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document_id})
+
+    result = await ProcessingRepository(db).claim_pending("worker-array-file")
+
+    after = await collection.find_one({"_id": document_id})
+    assert after == before, (
+        "MongoDB reclamó o modificó un documento cuyo file_id es un array "
+        "con elementos ObjectId"
+    )
+    assert result is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "next_retry_at", "eligible"),
+    [
+        ("missing", MISSING, True),
+        ("null", None, True),
+        ("past", FIXED_NOW - timedelta(seconds=1), True),
+        ("equal", FIXED_NOW, True),
+        ("future", FIXED_NOW + timedelta(seconds=1), False),
+    ],
+    ids=["missing", "null", "past", "equal", "future"],
+)
+async def test_claim_respects_next_retry_at_eligibility(
+    testing_context,
+    monkeypatch,
+    case,
+    next_retry_at,
+    eligible,
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    document = await _create_pending_pdf(db, resources)
+    collection = db[settings.mongo_collection]
+    document_filter = {"_id": document["document_id"]}
+    if next_retry_at is MISSING:
+        await collection.update_one(
+            document_filter,
+            {"$unset": {"next_retry_at": ""}},
+        )
+    else:
+        await collection.update_one(
+            document_filter,
+            {"$set": {"next_retry_at": next_retry_at}},
+        )
+    before = await collection.find_one(document_filter)
+
+    result = await ProcessingRepository(db).claim_pending("worker-retry-time")
+
+    after = await collection.find_one(document_filter)
+    if eligible:
+        assert isinstance(result, DocumentModel), f"{case} should be eligible"
+        assert result.id == str(document["document_id"])
+        assert _normalize_datetime(result.heartbeat_at) == now
+        assert after["status"] == DocumentStatus.PROCESSING.value
+    else:
+        assert result is None
+        assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_selects_oldest_created_at_then_smallest_id(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    tied_time = FIXED_NOW - timedelta(minutes=2)
+    oldest = await _create_pending_pdf(
+        db,
+        resources,
+        created_at=FIXED_NOW - timedelta(minutes=3),
+    )
+    tied_a = await _create_pending_pdf(db, resources, created_at=tied_time)
+    tied_b = await _create_pending_pdf(db, resources, created_at=tied_time)
+    tied_first = min(
+        (tied_a, tied_b),
+        key=lambda item: item["document_id"],
+    )
+    repository = ProcessingRepository(db)
+
+    first = await repository.claim_pending("worker-order-1")
+    second = await repository.claim_pending("worker-order-2")
+
+    assert first is not None
+    assert first.id == str(oldest["document_id"])
+    assert second is not None
+    assert second.id == str(tied_first["document_id"])
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cycle_case",
+    ["missing", "null", "existing"],
+)
+async def test_claim_initializes_or_preserves_cycle_on_real_mongodb(
+    testing_context, monkeypatch, cycle_case
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    existing_cycle = str(uuid.uuid4())
+    fields = {}
+    if cycle_case == "null":
+        fields["processing_cycle_id"] = None
+    elif cycle_case == "existing":
+        fields["processing_cycle_id"] = existing_cycle
+    document = await _create_pending_pdf(db, resources, fields=fields)
+    if cycle_case == "missing":
+        await db[settings.mongo_collection].update_one(
+            {"_id": document["document_id"]},
+            {"$unset": {"processing_cycle_id": ""}},
+        )
+
+    claimed = await ProcessingRepository(db).claim_pending("worker-cycle")
+
+    assert claimed is not None
+    uuid.UUID(claimed.fencing_token)
+    if cycle_case == "existing":
+        assert claimed.processing_cycle_id == existing_cycle
+    else:
+        uuid.UUID(claimed.processing_cycle_id)
+    assert claimed.fencing_token != claimed.processing_cycle_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_preserves_retry_count_and_cycle_but_renews_fencing_token(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    existing_cycle = str(uuid.uuid4())
+    previous_token = str(uuid.uuid4())
+    document = await _create_pending_pdf(
+        db,
+        resources,
+        fields={
+            "attempt_count": 7,
+            "processing_cycle_id": existing_cycle,
+            "fencing_token": previous_token,
+        },
+    )
+
+    claimed = await ProcessingRepository(db).claim_pending("worker-retry")
+
+    assert claimed is not None
+    assert claimed.attempt_count == 7
+    assert claimed.processing_cycle_id == existing_cycle
+    assert claimed.fencing_token != previous_token
+    uuid.UUID(claimed.fencing_token)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_two_concurrent_workers_cannot_claim_the_same_document(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document = await _create_pending_pdf(
+        db,
+        resources,
+        fields={"attempt_count": 5},
+    )
+    first_repository = ProcessingRepository(db)
+    second_repository = ProcessingRepository(db)
+    barrier = asyncio.Barrier(2)
+
+    async def claim_after_barrier(repository, worker_id):
+        await barrier.wait()
+        return await repository.claim_pending(worker_id)
+
+    first, second = await asyncio.gather(
+        claim_after_barrier(first_repository, "worker-concurrent-a"),
+        claim_after_barrier(second_repository, "worker-concurrent-b"),
+    )
+
+    winners = [result for result in (first, second) if result is not None]
+    losers = [result for result in (first, second) if result is None]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    winner = winners[0]
+
+    collection = db[settings.mongo_collection]
+    persisted = await collection.find_one({"_id": document["document_id"]})
+    assert persisted is not None
+    assert persisted["status"] == DocumentStatus.PROCESSING.value
+    assert persisted["worker_id"] == winner.worker_id
+    assert persisted["worker_id"] in {
+        "worker-concurrent-a",
+        "worker-concurrent-b",
+    }
+    assert persisted["fencing_token"] == winner.fencing_token
+    assert persisted["attempt_count"] == 5
+    assert await collection.count_documents(
+        {"_id": document["document_id"]}
+    ) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_active_upload_lease_does_not_block_processing_claim(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document = await _create_pending_pdf(db, resources)
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document["document_id"]})
+    assert _normalize_datetime(before["upload_lease_until"]) > datetime.now(
+        timezone.utc
+    )
+
+    claimed = await ProcessingRepository(db).claim_pending("worker-active-upload")
+
+    assert claimed is not None
+    assert claimed.id == str(document["document_id"])
+    persisted = await collection.find_one({"_id": document["document_id"]})
+    assert persisted["upload_owner_id"] == before["upload_owner_id"]
+    assert persisted["upload_fencing_token"] == before["upload_fencing_token"]
+    assert persisted["upload_lease_until"] == before["upload_lease_until"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dollar_prefixed_worker_id_is_persisted_literally(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document = await _create_pending_pdf(db, resources)
+    worker_id = "$integrationWorker"
+
+    claimed = await ProcessingRepository(db).claim_pending(worker_id)
+
+    assert claimed is not None
+    assert claimed.worker_id == worker_id
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert persisted["worker_id"] == worker_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_processing_collection_inherits_durable_write_concern(testing_context):
+    db, _ = testing_context
+    collection = ProcessingRepository(db).collection
+
+    assert collection.write_concern.document == {"w": 1, "j": True}
