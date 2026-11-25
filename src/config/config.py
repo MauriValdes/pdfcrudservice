@@ -1,7 +1,7 @@
 import ipaddress
 import re
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pymongo.uri_parser import parse_uri
 
@@ -41,6 +41,17 @@ class Settings(BaseSettings):
     mongo_db_dev: str = "pdf_database_dev"
     max_file_size_mb: int = 5
     mongo_collection: str = "processed_pdfs"
+    # ⏱️ Propiedad temporal de cargas PDF (independiente del worker).
+    upload_lease_seconds: int = Field(
+        default=120,
+        gt=0,
+        alias="UPLOAD_LEASE_SECONDS",
+    )
+    upload_lease_renew_interval_seconds: int = Field(
+        default=30,
+        gt=0,
+        alias="UPLOAD_LEASE_RENEW_INTERVAL_SECONDS",
+    )
     # 📡 Servicio de extracción (MS2)
     extract_service_url: str = Field(default="http://localhost:8002", alias="EXTRACT_SERVICE_URL")
     extract_service_timeout: int = Field(default=30, alias="EXTRACT_SERVICE_TIMEOUT")
@@ -58,6 +69,19 @@ class Settings(BaseSettings):
         impida el arranque del servicio.
         """
         return value.strip().upper()
+
+    @model_validator(mode="after")
+    def _validate_upload_lease_settings(self) -> "Settings":
+        """Exige renovar el lease antes de que venza."""
+        if (
+            self.upload_lease_renew_interval_seconds
+            >= self.upload_lease_seconds
+        ):
+            raise ValueError(
+                "UPLOAD_LEASE_RENEW_INTERVAL_SECONDS debe ser menor que "
+                "UPLOAD_LEASE_SECONDS."
+            )
+        return self
 
     def get_mongo_test_url(self) -> str:
         """Return a validated testing URI without ever falling back to MONGO_URL."""
