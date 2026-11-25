@@ -264,6 +264,54 @@ class DocumentRepository:
 
         return result.matched_count == 1
 
+    async def finalize_upload(
+        self,
+        document_id: str,
+        upload_owner_id: str,
+        upload_fencing_token: str,
+        file_id: ObjectId,
+    ) -> bool:
+        """Asocia el PDF ya confirmado en GridFS y pasa a pending atómicamente.
+
+        Retorna ``False`` si no se cumplen las condiciones de finalización.
+        Un error de conectividad puede dejar incierto el resultado de escritura.
+        """
+        if not ObjectId.is_valid(document_id):
+            raise ValueError("Identificador de documento inválido")
+        if not isinstance(file_id, ObjectId):
+            raise ValueError("file_id debe ser una instancia de ObjectId")
+
+        now = datetime.now(timezone.utc)
+        query = {
+            "_id": ObjectId(document_id),
+            "status": DocumentStatus.UPLOADING.value,
+            "upload_owner_id": upload_owner_id,
+            "upload_fencing_token": upload_fencing_token,
+            "upload_lease_until": {"$gte": now},
+            "$or": [
+                {"file_id": {"$exists": False}},
+                {"file_id": None},
+            ],
+        }
+        update = {
+            "$set": {
+                "file_id": file_id,
+                "status": DocumentStatus.PENDING.value,
+                "updated_at": now,
+            }
+        }
+
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as e:
+            raise DatabaseUnavailableError() from e
+
+        return result.matched_count == 1
+
     async def find_by_id(self, document_id: str) -> dict | None:
         """Busca un documento por su ObjectId. Devuelve None si el ID es inválido o no existe."""
         if not ObjectId.is_valid(document_id):
