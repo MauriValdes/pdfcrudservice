@@ -41,3 +41,12 @@ class DocumentModel(BaseModel):
     upload_owner_id: Optional[str] = None
     upload_lease_until: Optional[datetime] = None
     upload_fencing_token: Optional[str] = None
+
+    # Campos internos para la propiedad y los reintentos del procesamiento.
+    worker_id: Optional[str] = None
+    lease_until: Optional[datetime] = None
+    heartbeat_at: Optional[datetime] = None
+    fencing_token: Optional[str] = None
+    processing_cycle_id: Optional[str] = None
+    attempt_count: int = 0
+    next_retry_at: Optional[datetime] = None
