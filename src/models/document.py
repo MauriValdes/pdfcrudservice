@@ -48,5 +48,10 @@ class DocumentModel(BaseModel):
     heartbeat_at: Optional[datetime] = None
     fencing_token: Optional[str] = None
     processing_cycle_id: Optional[str] = None
+    processing_cycle_started_at: Optional[datetime] = None
     attempt_count: int = 0
+    last_attempt_at: Optional[datetime] = None
+    last_error: Optional[str] = None
     next_retry_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    failed_at: Optional[datetime] = None
