@@ -917,3 +917,310 @@ async def test_old_processing_owner_cannot_renew_after_new_owner_acquires_docume
     assert after["worker_id"] == new_worker_id
     assert after["fencing_token"] == new_fencing_token
     assert _normalize_datetime(after["lease_until"]) == new_lease_until
+
+
+async def _prepare_expired_processing_document(
+    db,
+    resources,
+    monkeypatch,
+    *,
+    worker_id="expired-owner",
+    status=DocumentStatus.PROCESSING.value,
+    old_worker_id=MISSING,
+):
+    document, claimed, now, cycle_id = await _claim_processing_document(
+        db,
+        resources,
+        monkeypatch,
+        worker_id=worker_id,
+        attempt_count=8,
+    )
+    fields = {
+        "lease_until": now - timedelta(seconds=1),
+        "heartbeat_at": now - timedelta(seconds=2),
+        "updated_at": now - timedelta(seconds=3),
+        "next_retry_at": now + timedelta(minutes=3),
+        "status": status,
+        "upload_owner_id": "upload-owner-preserved",
+        "upload_lease_until": now + timedelta(minutes=10),
+        "upload_fencing_token": "upload-token-preserved",
+    }
+    if old_worker_id is None:
+        fields["worker_id"] = None
+    elif old_worker_id is not MISSING:
+        fields["worker_id"] = old_worker_id
+    update = {"$set": fields}
+    if old_worker_id is MISSING:
+        update["$unset"] = {"worker_id": ""}
+    result = await db[settings.mongo_collection].update_one(
+        {"_id": document["document_id"], "checksum": document["checksum"]},
+        update,
+    )
+    assert result.matched_count == 1
+    before = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    return document, claimed, now, cycle_id, before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recover_expired_processing_persists_new_owner_and_preserves_metadata(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, old_claim, now, cycle_id, before = (
+        await _prepare_expired_processing_document(
+            db, resources, monkeypatch, old_worker_id="expired-owner"
+        )
+    )
+    new_worker_id = "recovery-owner"
+
+    recovered = await ProcessingRepository(db).recover_expired_processing(
+        new_worker_id
+    )
+
+    after = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"], "checksum": document["checksum"]}
+    )
+    assert recovered is not None
+    assert recovered.id == str(document["document_id"])
+    assert recovered.worker_id == new_worker_id
+    assert after["worker_id"] == new_worker_id
+    assert recovered.fencing_token != old_claim.fencing_token
+    assert after["fencing_token"] != before["fencing_token"]
+    assert recovered.fencing_token == after["fencing_token"]
+    assert len(uuid.UUID(after["fencing_token"]).hex) == 32
+    assert _normalize_datetime(after["lease_until"]) == now + timedelta(seconds=60)
+    assert _normalize_datetime(recovered.lease_until) == _normalize_datetime(
+        after["lease_until"]
+    )
+    assert _normalize_datetime(after["heartbeat_at"]) == now
+    assert _normalize_datetime(recovered.heartbeat_at) == _normalize_datetime(
+        after["heartbeat_at"]
+    )
+    assert after["status"] == DocumentStatus.PROCESSING.value
+    assert after["processing_cycle_id"] == before["processing_cycle_id"] == cycle_id
+    assert recovered.processing_cycle_id == after["processing_cycle_id"]
+    assert after["attempt_count"] == before["attempt_count"] == 8
+    assert recovered.attempt_count == after["attempt_count"]
+    assert after["next_retry_at"] == before["next_retry_at"]
+    assert _normalize_datetime(after["updated_at"]) == _normalize_datetime(
+        before["updated_at"]
+    )
+    for field in (
+        "upload_owner_id",
+        "upload_lease_until",
+        "upload_fencing_token",
+    ):
+        assert after[field] == before[field]
+
+
+@pytest.mark.parametrize(
+    ("case", "status", "old_worker_id", "eligible"),
+    [
+        ("expired-other-worker", DocumentStatus.PROCESSING.value, "old", True),
+        ("expired-worker-missing", DocumentStatus.PROCESSING.value, MISSING, True),
+        ("expired-worker-null", DocumentStatus.PROCESSING.value, None, True),
+        ("expired-same-worker", DocumentStatus.PROCESSING.value, "requester", False),
+        ("non-processing", DocumentStatus.PENDING.value, "old", False),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recover_expired_processing_applies_worker_and_status_eligibility(
+    testing_context,
+    monkeypatch,
+    case,
+    status,
+    old_worker_id,
+    eligible,
+):
+    db, resources = testing_context
+    _, _, now, _, _ = await _prepare_expired_processing_document(
+        db,
+        resources,
+        monkeypatch,
+        status=status,
+        old_worker_id=old_worker_id,
+    )
+    requester = "requester" if case == "expired-same-worker" else "new-worker"
+
+    recovered = await ProcessingRepository(db).recover_expired_processing(requester)
+
+    assert (recovered is not None) is eligible
+    assert now == FIXED_NOW
+
+
+@pytest.mark.parametrize("lease_delta", [timedelta(seconds=10), timedelta(0)])
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recover_expired_processing_rejects_live_and_exact_boundary_leases(
+    testing_context, monkeypatch, lease_delta
+):
+    db, resources = testing_context
+    document, _, now, _, _ = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id="expired-owner"
+    )
+    collection = db[settings.mongo_collection]
+    lease_until = now + lease_delta
+    updated = await collection.update_one(
+        {"_id": document["document_id"], "checksum": document["checksum"]},
+        {"$set": {"lease_until": lease_until}},
+    )
+    assert updated.matched_count == 1
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    recovered = await ProcessingRepository(db).recover_expired_processing(
+        "new-worker"
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert recovered is None
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_recovery_has_one_winner_and_fences_old_owner(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, old_claim, now, _, _ = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id="expired-owner"
+    )
+    first_repository = ProcessingRepository(db)
+    second_repository = ProcessingRepository(db)
+    barrier = asyncio.Barrier(2)
+
+    async def recover_after_barrier(repository, worker_id):
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await repository.recover_expired_processing(worker_id)
+
+    first, second = await asyncio.gather(
+        recover_after_barrier(first_repository, "recovery-worker-a"),
+        recover_after_barrier(second_repository, "recovery-worker-b"),
+    )
+
+    winners = [result for result in (first, second) if result is not None]
+    assert len(winners) == 1
+    winner = winners[0]
+    loser_result = second if first is not None else first
+    assert loser_result is None
+    assert winner.worker_id in {"recovery-worker-a", "recovery-worker-b"}
+    assert winner.fencing_token != old_claim.fencing_token
+
+    collection = db[settings.mongo_collection]
+    persisted = await collection.find_one({"_id": document["document_id"]})
+    assert persisted["worker_id"] == winner.worker_id
+    assert persisted["fencing_token"] == winner.fencing_token
+    assert winner.fencing_token == persisted["fencing_token"]
+    assert _normalize_datetime(persisted["lease_until"]) == now + timedelta(
+        seconds=60
+    )
+    assert await first_repository.renew_processing_lease(
+        old_claim.id,
+        old_claim.worker_id,
+        old_claim.fencing_token,
+    ) is False
+    assert await first_repository.renew_processing_lease(
+        winner.id,
+        winner.worker_id,
+        winner.fencing_token,
+    ) is True
+    assert await second_repository.recover_expired_processing(
+        "recovery-worker-loser"
+    ) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recover_expired_processing_selects_oldest_lease_before_creation_order(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+
+    newer_document, _, _, _, _ = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id="expired-owner-newer"
+    )
+    older_document, _, _, _, _ = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id="expired-owner-older"
+    )
+    collection = db[settings.mongo_collection]
+    older_lease = now - timedelta(seconds=20)
+    newer_lease = now - timedelta(seconds=5)
+    await collection.update_one(
+        {"_id": newer_document["document_id"]},
+        {"$set": {"lease_until": newer_lease}},
+    )
+    await collection.update_one(
+        {"_id": older_document["document_id"]},
+        {"$set": {"lease_until": older_lease}},
+    )
+
+    recovered = await ProcessingRepository(db).recover_expired_processing(
+        "lease-order-worker"
+    )
+
+    assert recovered is not None
+    assert recovered.id == str(older_document["document_id"])
+    assert _normalize_datetime(recovered.lease_until) == _normalize_datetime(
+        now + timedelta(seconds=60)
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recover_expired_processing_breaks_lease_ties_by_object_id(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+
+    first_document, _, _, _, _ = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id="tie-owner-first"
+    )
+    second_document, _, _, _, _ = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id="tie-owner-second"
+    )
+    collection = db[settings.mongo_collection]
+    tied_lease = now - timedelta(seconds=10)
+    for document in (first_document, second_document):
+        updated = await collection.update_one(
+            {"_id": document["document_id"]},
+            {"$set": {"lease_until": tied_lease}},
+        )
+        assert updated.matched_count == 1
+
+    expected_document_id = min(
+        first_document["document_id"],
+        second_document["document_id"],
+    )
+    recovered = await ProcessingRepository(db).recover_expired_processing(
+        "lease-tie-worker"
+    )
+
+    assert recovered is not None
+    assert recovered.id == str(expected_document_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recover_expired_processing_persists_dollar_prefixed_worker_id(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, _, _, _, _ = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id="expired-owner"
+    )
+    worker_id = "$recovery-worker"
+
+    recovered = await ProcessingRepository(db).recover_expired_processing(worker_id)
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"], "checksum": document["checksum"]}
+    )
+    assert recovered is not None
+    assert recovered.worker_id == worker_id
+    assert persisted["worker_id"] == worker_id

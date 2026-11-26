@@ -537,3 +537,155 @@ async def test_renewal_does_not_read_or_mutate_processing_or_upload_ownership_fi
     repo.collection.update_many.assert_not_awaited()
     repo.collection.replace_one.assert_not_awaited()
     repo.collection.aggregate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_processing_returns_updated_document_and_atomic_contract(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    previous_token = str(UUID(int=1))
+    raw_document = _claimed_document(
+        processing_cycle_id="cycle-preserved",
+        attempt_count=7,
+        fencing_token=previous_token,
+    )
+    raw_document.update(
+        {
+            "status": DocumentStatus.PROCESSING.value,
+            "next_retry_at": NOW + timedelta(minutes=2),
+            "upload_owner_id": "upload-owner",
+            "upload_lease_until": NOW + timedelta(minutes=10),
+            "upload_fencing_token": "upload-token",
+        }
+    )
+    repo.collection.find_one_and_update.return_value = raw_document
+    worker_id = "new-recovery-worker"
+
+    result = await repo.recover_expired_processing(worker_id)
+
+    assert isinstance(result, DocumentModel)
+    assert result.id == str(raw_document["_id"])
+    query, update, sort, kwargs = _call_parts(repo)
+    assert query == {
+        "status": DocumentStatus.PROCESSING.value,
+        "lease_until": {"$lt": NOW},
+        "$or": [
+            {"worker_id": {"$exists": False}},
+            {"worker_id": None},
+            {"worker_id": {"$ne": worker_id}},
+        ],
+    }
+    assert sort == [("lease_until", ASCENDING), ("_id", ASCENDING)]
+    assert kwargs == {
+        "sort": [("lease_until", ASCENDING), ("_id", ASCENDING)],
+        "return_document": ReturnDocument.AFTER,
+        "upsert": False,
+    }
+
+    fields = _set_stage(update)
+    assert set(fields) == {
+        "worker_id",
+        "lease_until",
+        "heartbeat_at",
+        "fencing_token",
+    }
+    assert _literal_value(fields["worker_id"]) == worker_id
+    assert fields["lease_until"] == NOW + timedelta(seconds=60)
+    assert fields["heartbeat_at"] == NOW
+    new_token = UUID(_literal_value(fields["fencing_token"]))
+    assert str(new_token) != previous_token
+    assert DocumentStatus(result.status) is DocumentStatus.PROCESSING
+
+    protected_fields = {
+        "updated_at",
+        "processing_cycle_id",
+        "attempt_count",
+        "next_retry_at",
+        "upload_owner_id",
+        "upload_lease_until",
+        "upload_fencing_token",
+    }
+    assert not protected_fields.intersection(fields)
+    assert repo.collection.find_one_and_update.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_processing_returns_none_without_eligible_document(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.return_value = None
+
+    result = await repo.recover_expired_processing("recovery-worker")
+
+    assert result is None
+    repo.collection.find_one_and_update.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "connection_error",
+    [
+        ServerSelectionTimeoutError("unavailable"),
+        AutoReconnect("unavailable"),
+        ConnectionFailure("unavailable"),
+        NetworkTimeout("unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_expired_processing_translates_connectivity_errors(
+    repo_with_mocks, fixed_clock, connection_error
+):
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.side_effect = connection_error
+
+    with pytest.raises(DatabaseUnavailableError):
+        await repo.recover_expired_processing("recovery-worker")
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_processing_propagates_unexpected_errors(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.side_effect = RuntimeError(
+        "unexpected recovery failure"
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected recovery failure"):
+        await repo.recover_expired_processing("recovery-worker")
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_processing_uses_only_one_atomic_operation(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.return_value = None
+
+    await repo.recover_expired_processing("recovery-worker")
+
+    repo.collection.find_one_and_update.assert_awaited_once()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find.assert_not_called()
+    repo.collection.update_one.assert_not_awaited()
+    repo.collection.update_many.assert_not_awaited()
+    repo.collection.replace_one.assert_not_awaited()
+    repo.collection.aggregate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_processing_protects_dollar_prefixed_worker_id(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.return_value = _claimed_document(
+        fencing_token=str(UUID(int=1))
+    )
+    worker_id = "$recovery-worker"
+
+    await repo.recover_expired_processing(worker_id)
+
+    _, update, _, _ = _call_parts(repo)
+    worker_expression = _set_stage(update)["worker_id"]
+    assert worker_expression == {"$literal": worker_id}

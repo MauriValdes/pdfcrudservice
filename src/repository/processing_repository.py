@@ -93,6 +93,53 @@ class ProcessingRepository:
             document_data["id"] = str(document_id)
         return DocumentModel.model_validate(document_data)
 
+    async def recover_expired_processing(
+        self,
+        worker_id: str,
+    ) -> DocumentModel | None:
+        now = datetime.now(timezone.utc)
+        fencing_token = str(uuid4())
+
+        query = {
+            "status": "processing",
+            "lease_until": {"$lt": now},
+            "$or": [
+                {"worker_id": {"$exists": False}},
+                {"worker_id": None},
+                {"worker_id": {"$ne": worker_id}},
+            ],
+        }
+        update = [
+            {
+                "$set": {
+                    "worker_id": {"$literal": worker_id},
+                    "lease_until": now + timedelta(seconds=60),
+                    "heartbeat_at": now,
+                    "fencing_token": {"$literal": fencing_token},
+                }
+            }
+        ]
+
+        try:
+            document_data = await self.collection.find_one_and_update(
+                query,
+                update,
+                sort=[("lease_until", ASCENDING), ("_id", ASCENDING)],
+                return_document=ReturnDocument.AFTER,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        if document_data is None:
+            return None
+
+        document_data = dict(document_data)
+        document_id = document_data.pop("_id", None)
+        if document_id is not None:
+            document_data["id"] = str(document_id)
+        return DocumentModel.model_validate(document_data)
+
     async def renew_processing_lease(
         self,
         document_id: str,
