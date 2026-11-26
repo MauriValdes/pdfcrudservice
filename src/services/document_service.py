@@ -61,6 +61,31 @@ class DocumentService:
             upload_lease_until,
         )
 
+    async def renew_upload_lease(
+        self,
+        document: DocumentModel,
+    ) -> datetime | None:
+        """Renueva una vez el lease de carga si se conserva su propiedad."""
+        if (
+            not document.id
+            or not document.upload_owner_id
+            or not document.upload_fencing_token
+        ):
+            raise ValueError(
+                "El documento debe tener id, propietario y token de carga."
+            )
+
+        upload_lease_until = datetime.now(timezone.utc) + timedelta(
+            seconds=settings.upload_lease_seconds
+        )
+        renewed = await self.repository.renew_upload_lease(
+            document.id,
+            document.upload_owner_id,
+            document.upload_fencing_token,
+            upload_lease_until,
+        )
+        return upload_lease_until if renewed else None
+
     async def submit_pdf(self, file_bytes: bytes, filename: str) -> DocumentResponse:
         """Guarda los metadatos básicos del PDF en la base de datos.
 

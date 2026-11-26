@@ -8,6 +8,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, call
 from uuid import UUID
 
+from src.config.config import settings
 from src.services.document_service import DocumentService
 from src.core.exceptions import DatabaseUnavailableError
 from src.models.document import DocumentModel, DocumentStatus
@@ -269,6 +270,110 @@ async def test_acquire_upload_ownership_rejects_non_positive_lease_duration(
         )
 
     repository.acquire_upload_ownership.assert_not_awaited()
+    assert repository.method_calls == []
+
+
+@pytest.mark.asyncio
+async def test_renew_upload_lease_returns_requested_utc_expiration(monkeypatch):
+    lease_duration_seconds = 47
+    monkeypatch.setattr(settings, "upload_lease_seconds", lease_duration_seconds)
+    document = build_owned_upload_document("upload-owner", "upload-fencing-token")
+    document.worker_id = "different-worker"
+    document.fencing_token = "different-worker-fencing-token"
+    before_document = document.model_dump()
+    repository = AsyncMock()
+    repository.renew_upload_lease.return_value = True
+    service = DocumentService(repository=repository)
+
+    before = datetime.now(timezone.utc)
+    result = await service.renew_upload_lease(document)
+    after = datetime.now(timezone.utc)
+
+    repository.renew_upload_lease.assert_awaited_once()
+    document_id, owner_id, fencing_token, requested_expiration = (
+        repository.renew_upload_lease.await_args.args
+    )
+    assert document_id == document.id
+    assert owner_id == "upload-owner"
+    assert fencing_token == "upload-fencing-token"
+    assert before + timedelta(seconds=lease_duration_seconds) <= (
+        requested_expiration
+    ) <= after + timedelta(seconds=lease_duration_seconds)
+    assert requested_expiration.tzinfo == timezone.utc
+    assert requested_expiration.utcoffset() == timedelta(0)
+    assert result is requested_expiration
+    assert repository.method_calls == [
+        call.renew_upload_lease(
+            document.id,
+            "upload-owner",
+            "upload-fencing-token",
+            requested_expiration,
+        )
+    ]
+    assert document.model_dump() == before_document
+
+
+@pytest.mark.asyncio
+async def test_renew_upload_lease_returns_none_when_repository_rejects():
+    document = build_owned_upload_document("upload-owner", "upload-fencing-token")
+    before_document = document.model_dump()
+    repository = AsyncMock()
+    repository.renew_upload_lease.return_value = False
+    service = DocumentService(repository=repository)
+
+    result = await service.renew_upload_lease(document)
+
+    assert result is None
+    repository.renew_upload_lease.assert_awaited_once()
+    assert repository.method_calls == [
+        call.renew_upload_lease(
+            document.id,
+            "upload-owner",
+            "upload-fencing-token",
+            repository.renew_upload_lease.await_args.args[3],
+        )
+    ]
+    assert document.model_dump() == before_document
+
+
+@pytest.mark.asyncio
+async def test_renew_upload_lease_propagates_database_unavailable_instance():
+    document = build_owned_upload_document("upload-owner", "upload-fencing-token")
+    error = DatabaseUnavailableError()
+    repository = AsyncMock()
+    repository.renew_upload_lease.side_effect = error
+    service = DocumentService(repository=repository)
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await service.renew_upload_lease(document)
+
+    assert raised.value is error
+    repository.renew_upload_lease.assert_awaited_once()
+    assert len(repository.method_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", None),
+        ("id", ""),
+        ("upload_owner_id", None),
+        ("upload_owner_id", ""),
+        ("upload_fencing_token", None),
+        ("upload_fencing_token", ""),
+    ],
+)
+@pytest.mark.asyncio
+async def test_renew_upload_lease_rejects_missing_ownership_data(field, value):
+    document = build_owned_upload_document("upload-owner", "upload-fencing-token")
+    setattr(document, field, value)
+    repository = AsyncMock()
+    service = DocumentService(repository=repository)
+
+    with pytest.raises(ValueError):
+        await service.renew_upload_lease(document)
+
+    repository.renew_upload_lease.assert_not_awaited()
     assert repository.method_calls == []
 
 
