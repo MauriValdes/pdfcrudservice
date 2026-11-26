@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 import uuid
 
-from bson import ObjectId
+from bson import BSON, ObjectId
 
 from src.models.document import DocumentModel, DocumentStatus
 from src.schemas.document import DocumentResponse
@@ -249,3 +249,154 @@ def test_processing_fields_survive_serialization_round_trip():
     assert restored.processing_cycle_id == processing_cycle_id
     assert restored.attempt_count == 3
     assert restored.next_retry_at == next_retry_at
+
+
+NEW_PROCESSING_FIELDS = (
+    "processing_cycle_started_at",
+    "last_attempt_at",
+    "last_error",
+    "completed_at",
+    "failed_at",
+)
+
+
+def test_new_processing_fields_default_to_none_and_accept_explicit_none():
+    """Los nuevos metadatos son opcionales y no cambian defaults existentes."""
+    document = build_document()
+    explicit_none = build_document(
+        processing_cycle_started_at=None,
+        last_attempt_at=None,
+        last_error=None,
+        completed_at=None,
+        failed_at=None,
+    )
+
+    assert all(getattr(document, field) is None for field in NEW_PROCESSING_FIELDS)
+    assert all(
+        getattr(explicit_none, field) is None for field in NEW_PROCESSING_FIELDS
+    )
+    assert document.status == DocumentStatus.PENDING
+    assert document.attempt_count == 0
+    assert document.content is None
+    assert document.error_message is None
+
+
+def test_legacy_document_without_new_processing_fields_remains_valid():
+    """Documentos anteriores reciben defaults para los campos nuevos."""
+    legacy_data = {
+        # Repositories convert MongoDB's ObjectId to the model's string id.
+        "id": str(ObjectId()),
+        "filename": "legacy-processing.pdf",
+        "checksum": "legacy-processing-checksum",
+        "size_bytes": 256,
+        "status": DocumentStatus.PENDING.value,
+        "error_message": "mensaje público existente",
+        "attempt_count": 2,
+    }
+
+    document = DocumentModel.model_validate(legacy_data)
+
+    assert all(getattr(document, field) is None for field in NEW_PROCESSING_FIELDS)
+    assert document.id == legacy_data["id"]
+    assert document.status == DocumentStatus.PENDING
+    assert document.attempt_count == 2
+    assert document.error_message == "mensaje público existente"
+
+
+def test_new_processing_timestamps_accept_utc_and_survive_model_round_trip():
+    """Las cuatro fechas UTC sobreviven model_dump/model_validate."""
+    timestamps = {
+        "processing_cycle_started_at": datetime(
+            2026, 11, 26, 10, 0, 0, 123000, tzinfo=timezone.utc
+        ),
+        "last_attempt_at": datetime(
+            2026, 11, 26, 10, 1, 2, 234000, tzinfo=timezone.utc
+        ),
+        "completed_at": datetime(
+            2026, 11, 26, 10, 2, 3, 345000, tzinfo=timezone.utc
+        ),
+        "failed_at": datetime(
+            2026, 11, 26, 10, 3, 4, 456000, tzinfo=timezone.utc
+        ),
+    }
+
+    document = build_document(**timestamps)
+    dumped = document.model_dump()
+    restored = DocumentModel.model_validate(dumped)
+
+    for field, value in timestamps.items():
+        assert getattr(document, field) == value
+        assert dumped[field] == value
+        assert getattr(restored, field) == value
+        assert getattr(restored, field).tzinfo is timezone.utc
+
+
+def test_new_processing_timestamps_survive_bson_millisecond_round_trip():
+    """BSON mantiene fechas con precisión de milisegundos."""
+    timestamps = {
+        "processing_cycle_started_at": datetime(
+            2026, 11, 26, 10, 0, 0, 123456, tzinfo=timezone.utc
+        ),
+        "last_attempt_at": datetime(
+            2026, 11, 26, 10, 1, 2, 234567, tzinfo=timezone.utc
+        ),
+        "completed_at": datetime(
+            2026, 11, 26, 10, 2, 3, 345678, tzinfo=timezone.utc
+        ),
+        "failed_at": datetime(
+            2026, 11, 26, 10, 3, 4, 456789, tzinfo=timezone.utc
+        ),
+    }
+    last_error = "classified internal error"
+    document = build_document(**timestamps, last_error=last_error)
+
+    stored_document = BSON.encode(
+        document.model_dump(by_alias=True, exclude={"id"})
+    )
+    decoded_document = BSON(stored_document).decode()
+    restored = DocumentModel.model_validate(decoded_document)
+
+    for field, value in timestamps.items():
+        expected_milliseconds = value.replace(
+            microsecond=(value.microsecond // 1000) * 1000
+        )
+        expected_naive_utc = expected_milliseconds.replace(tzinfo=None)
+        assert decoded_document[field] == expected_naive_utc
+        assert getattr(restored, field) == expected_naive_utc
+    assert decoded_document["last_error"] == last_error
+    assert restored.last_error == last_error
+
+
+def test_last_error_is_independent_and_survives_model_round_trip():
+    """last_error es metadata interna distinta de error_message."""
+    document = build_document(
+        error_message="Error seguro para el cliente",
+        last_error="HTTP 503 upstream unavailable",
+    )
+
+    restored = DocumentModel.model_validate(document.model_dump())
+
+    assert document.last_error == "HTTP 503 upstream unavailable"
+    assert document.error_message == "Error seguro para el cliente"
+    assert restored.last_error == document.last_error
+    assert restored.error_message == document.error_message
+    assert build_document(last_error=None).last_error is None
+
+
+def test_new_processing_fields_are_excluded_from_public_response_serialization():
+    """El DTO público ignora metadata añadida al modelo de persistencia."""
+    document = build_document(
+        id=str(ObjectId()),
+        processing_cycle_started_at=datetime(
+            2026, 11, 26, 10, 0, tzinfo=timezone.utc
+        ),
+        last_attempt_at=datetime(2026, 11, 26, 10, 1, tzinfo=timezone.utc),
+        last_error="internal classified error",
+        completed_at=datetime(2026, 11, 26, 10, 2, tzinfo=timezone.utc),
+        failed_at=datetime(2026, 11, 26, 10, 3, tzinfo=timezone.utc),
+    )
+
+    response = DocumentResponse.model_validate(document.model_dump())
+
+    assert set(NEW_PROCESSING_FIELDS).isdisjoint(DocumentResponse.model_fields)
+    assert set(NEW_PROCESSING_FIELDS).isdisjoint(response.model_dump())
