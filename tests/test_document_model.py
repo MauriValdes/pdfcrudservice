@@ -400,3 +400,102 @@ def test_new_processing_fields_are_excluded_from_public_response_serialization()
 
     assert set(NEW_PROCESSING_FIELDS).isdisjoint(DocumentResponse.model_fields)
     assert set(NEW_PROCESSING_FIELDS).isdisjoint(response.model_dump())
+
+
+ORIGINAL_CLEANUP_FIELDS = (
+    "original_cleanup_status",
+    "original_deleted_at",
+)
+
+
+def test_original_cleanup_fields_default_to_none_independently_of_document_status():
+    """El estado del documento no registra ni autoriza limpieza implícitamente."""
+    document = build_document(status=DocumentStatus.COMPLETED)
+
+    assert all(
+        getattr(document, field) is None for field in ORIGINAL_CLEANUP_FIELDS
+    )
+    assert document.status == DocumentStatus.COMPLETED
+
+
+def test_legacy_document_without_original_cleanup_fields_remains_valid():
+    """Documentos legacy reciben defaults sin cambiar estado ni file_id."""
+    file_id = ObjectId()
+    legacy_data = {
+        "filename": "legacy-cleanup.pdf",
+        "checksum": "legacy-cleanup-checksum",
+        "size_bytes": 512,
+        "status": DocumentStatus.COMPLETED.value,
+        "content": "texto ya extraído",
+        "file_id": file_id,
+    }
+
+    document = DocumentModel.model_validate(legacy_data)
+
+    assert all(
+        getattr(document, field) is None for field in ORIGINAL_CLEANUP_FIELDS
+    )
+    assert document.status == DocumentStatus.COMPLETED
+    assert document.content == "texto ya extraído"
+    assert document.file_id == file_id
+
+
+def test_pending_original_cleanup_fields_survive_model_round_trip_with_file_id():
+    """El marcador pending se serializa sin perder resultado ni referencia GridFS."""
+    file_id = ObjectId()
+    original = build_document(
+        status=DocumentStatus.COMPLETED,
+        content="texto extraído",
+        page_count=3,
+        file_id=file_id,
+        original_cleanup_status="pending",
+        original_deleted_at=None,
+    )
+
+    dumped = original.model_dump()
+    restored = DocumentModel.model_validate(dumped)
+
+    assert dumped["original_cleanup_status"] == "pending"
+    assert dumped["original_deleted_at"] is None
+    assert restored.original_cleanup_status == "pending"
+    assert restored.original_deleted_at is None
+    assert restored.status == DocumentStatus.COMPLETED
+    assert restored.content == "texto extraído"
+    assert restored.page_count == 3
+    assert restored.file_id == file_id
+
+
+def test_completed_original_cleanup_survives_bson_millisecond_round_trip():
+    """BSON conserva la confirmación de limpieza en UTC a precisión de milisegundos."""
+    deleted_at = datetime(
+        2026, 11, 27, 12, 34, 56, 789456, tzinfo=timezone.utc
+    )
+    file_id = ObjectId()
+    document = build_document(
+        status=DocumentStatus.COMPLETED,
+        file_id=file_id,
+        original_cleanup_status="completed",
+        original_deleted_at=deleted_at,
+    )
+
+    stored_document = BSON.encode(
+        document.model_dump(by_alias=True, exclude={"id"})
+    )
+    decoded_document = BSON(stored_document).decode()
+    restored = DocumentModel.model_validate(decoded_document)
+
+    expected_milliseconds = deleted_at.replace(
+        microsecond=(deleted_at.microsecond // 1000) * 1000
+    )
+    expected_naive_utc = expected_milliseconds.replace(tzinfo=None)
+    assert decoded_document["original_cleanup_status"] == "completed"
+    assert decoded_document["original_deleted_at"] == expected_naive_utc
+    assert restored.original_cleanup_status == "completed"
+    assert restored.original_deleted_at == expected_naive_utc
+    assert restored.file_id == file_id
+    assert restored.status == DocumentStatus.COMPLETED
+
+
+def test_original_cleanup_fields_are_excluded_from_public_response():
+    """Los campos internos de limpieza no forman parte del DTO público."""
+    assert set(ORIGINAL_CLEANUP_FIELDS).isdisjoint(DocumentResponse.model_fields)
