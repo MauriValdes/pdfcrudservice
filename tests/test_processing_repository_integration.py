@@ -259,6 +259,48 @@ async def _unset_raw_fields(db, document_id, *field_names):
     assert result.matched_count == 1
 
 
+async def _insert_processing_attempt_document(
+    db,
+    resources,
+    *,
+    attempt_count=0,
+    fields=None,
+    unset_fields=(),
+):
+    """Inserta un documento processing propio para probar la autorización."""
+    worker_id = "attempt-worker"
+    fencing_token = "attempt-fencing-token"
+    processing_cycle_id = "attempt-cycle-id"
+    document_fields = {
+        "status": DocumentStatus.PROCESSING.value,
+        "worker_id": worker_id,
+        "fencing_token": fencing_token,
+        "processing_cycle_id": processing_cycle_id,
+        "processing_cycle_started_at": FIXED_NOW - timedelta(minutes=1),
+        "lease_until": FIXED_NOW,
+        "updated_at": FIXED_NOW - timedelta(seconds=2),
+    }
+    if attempt_count is not MISSING:
+        document_fields["attempt_count"] = attempt_count
+    document_fields.update(fields or {})
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=ObjectId(),
+        fields=document_fields,
+    )
+    fields_to_unset = list(unset_fields)
+    if attempt_count is MISSING:
+        fields_to_unset.append("attempt_count")
+    await _unset_raw_fields(db, document_id, *fields_to_unset)
+    return {
+        "document_id": document_id,
+        "worker_id": worker_id,
+        "fencing_token": fencing_token,
+        "processing_cycle_id": processing_cycle_id,
+    }
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_claim_persists_successful_claim_and_returns_document_model(
@@ -1909,3 +1951,633 @@ async def test_recover_expired_processing_persists_dollar_prefixed_worker_id(
     assert recovered is not None
     assert recovered.worker_id == worker_id
     assert persisted["worker_id"] == worker_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_authorizes_five_attempts_then_rejects_sixth(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_attempt_document(db, resources)
+    repository = ProcessingRepository(db)
+
+    returned_counts = []
+    for expected_count in range(1, 6):
+        result = await repository.record_ms2_attempt(
+            str(fixture["document_id"]),
+            fixture["worker_id"],
+            fixture["fencing_token"],
+            fixture["processing_cycle_id"],
+        )
+        assert result == expected_count
+        returned_counts.append(result)
+
+    collection = db[settings.mongo_collection]
+    before_sixth = await collection.find_one({"_id": fixture["document_id"]})
+    rejected = await repository.record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+    after_sixth = await collection.find_one({"_id": fixture["document_id"]})
+
+    assert returned_counts == [1, 2, 3, 4, 5]
+    assert rejected is None
+    assert after_sixth == before_sixth
+    assert after_sixth["attempt_count"] == 5
+    assert _normalize_datetime(after_sixth["last_attempt_at"]) == now
+    assert _normalize_datetime(after_sixth["updated_at"]) == now
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_treats_missing_counter_as_zero(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=MISSING,
+    )
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+    assert result == 1
+    assert persisted["attempt_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "attempt_count", "expected_type"),
+    [
+        ("bson-int32", 0, int),
+        ("bson-int64", Int64(0), Int64),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_accepts_bson_integer_counters(
+    testing_context, monkeypatch, case, attempt_count, expected_type
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=attempt_count,
+    )
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+    assert result == 1
+    assert type(persisted["attempt_count"]) is expected_type
+    assert persisted["attempt_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "fields"),
+    [
+        ("wrong-status", {"status": DocumentStatus.PENDING.value}),
+        ("array-status", {"status": [DocumentStatus.PROCESSING.value]}),
+        ("wrong-worker", {"worker_id": "other-worker"}),
+        ("array-worker-containing-owner", {"worker_id": ["attempt-worker"]}),
+        ("null-worker", {"worker_id": None}),
+        ("wrong-fencing-token", {"fencing_token": "stale-token"}),
+        (
+            "array-fencing-token-containing-current",
+            {"fencing_token": ["attempt-fencing-token"]},
+        ),
+        ("null-fencing-token", {"fencing_token": None}),
+        ("wrong-cycle-id", {"processing_cycle_id": "different-cycle"}),
+        (
+            "array-cycle-id-containing-current",
+            {"processing_cycle_id": ["attempt-cycle-id"]},
+        ),
+        ("empty-cycle-id", {"processing_cycle_id": ""}),
+        ("integer-cycle-id", {"processing_cycle_id": 7}),
+        ("expired-lease", {"lease_until": FIXED_NOW - timedelta(milliseconds=1)}),
+        ("string-lease", {"lease_until": "2026-11-25T12:00:00Z"}),
+        ("array-lease-containing-date", {"lease_until": [FIXED_NOW]}),
+        ("null-lease", {"lease_until": None}),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_rejects_invalid_ownership_without_mutation(
+    testing_context, monkeypatch, case, fields
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=0,
+        fields=fields,
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": fixture["document_id"]})
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    after = await collection.find_one({"_id": fixture["document_id"]})
+    assert result is None, f"ownership case {case!r} must not authorize an attempt"
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("case", "started_at", "eligible", "unset_fields"),
+    [
+        ("cycle-started-now", FIXED_NOW, True, ()),
+        (
+            "one-millisecond-before-window-end",
+            FIXED_NOW - timedelta(minutes=10) + timedelta(milliseconds=1),
+            True,
+            (),
+        ),
+        (
+            "exact-window-end",
+            FIXED_NOW - timedelta(minutes=10),
+            False,
+            (),
+        ),
+        (
+            "one-millisecond-after-window-end",
+            FIXED_NOW - timedelta(minutes=10) - timedelta(milliseconds=1),
+            False,
+            (),
+        ),
+        (
+            "future-cycle-start",
+            FIXED_NOW + timedelta(milliseconds=1),
+            False,
+            (),
+        ),
+        ("null-cycle-start", None, False, ()),
+        ("wrong-type-cycle-start", "2026-11-25T11:00:00Z", False, ()),
+        (
+            "array-cycle-start-containing-date",
+            [FIXED_NOW - timedelta(minutes=1)],
+            False,
+            (),
+        ),
+        ("missing-cycle-start", MISSING, False, ("processing_cycle_started_at",)),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_enforces_cycle_window_boundaries(
+    testing_context, monkeypatch, case, started_at, eligible, unset_fields
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    fields = {}
+    if started_at is not MISSING:
+        fields["processing_cycle_started_at"] = started_at
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=0,
+        fields=fields,
+        unset_fields=unset_fields,
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": fixture["document_id"]})
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    after = await collection.find_one({"_id": fixture["document_id"]})
+    if eligible:
+        assert result == 1, case
+        assert after["attempt_count"] == 1
+        assert _normalize_datetime(after["last_attempt_at"]) == now
+    else:
+        assert result is None, case
+        assert after == before
+
+
+@pytest.mark.parametrize(
+    ("case", "attempt_count"),
+    [
+        ("explicit-null", None),
+        ("negative", -1),
+        ("five", 5),
+        ("greater-than-five", 6),
+        ("boolean-true", True),
+        ("boolean-false", False),
+        ("numeric-string", "0"),
+        ("double-zero", 0.0),
+        ("decimal128-zero", Decimal128("0")),
+        ("array-containing-zero", [0]),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_rejects_invalid_counters_without_mutation(
+    testing_context, monkeypatch, case, attempt_count
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=attempt_count,
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": fixture["document_id"]})
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    after = await collection.find_one({"_id": fixture["document_id"]})
+    assert result is None, f"attempt_count case {case!r} must be rejected"
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("last_attempt_at", "not-a-date"),
+        ("last_attempt_at", False),
+        ("last_attempt_at", 0),
+        ("last_attempt_at", [FIXED_NOW]),
+        ("updated_at", "not-a-date"),
+        ("updated_at", False),
+        ("updated_at", 0),
+        ("updated_at", [FIXED_NOW]),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_rejects_invalid_timestamp_types_without_repair(
+    testing_context, monkeypatch, field, value
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=0,
+        fields={field: value},
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": fixture["document_id"]})
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    after = await collection.find_one({"_id": fixture["document_id"]})
+    assert result is None
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("case", "field", "value", "expected"),
+    [
+        ("missing-last-attempt", "last_attempt_at", MISSING, FIXED_NOW),
+        ("null-last-attempt", "last_attempt_at", None, FIXED_NOW),
+        (
+            "past-last-attempt",
+            "last_attempt_at",
+            FIXED_NOW - timedelta(seconds=5),
+            FIXED_NOW,
+        ),
+        ("equal-last-attempt", "last_attempt_at", FIXED_NOW, FIXED_NOW),
+        (
+            "future-last-attempt",
+            "last_attempt_at",
+            FIXED_NOW + timedelta(seconds=5),
+            FIXED_NOW + timedelta(seconds=5),
+        ),
+        ("missing-updated-at", "updated_at", MISSING, FIXED_NOW),
+        ("null-updated-at", "updated_at", None, FIXED_NOW),
+        (
+            "past-updated-at",
+            "updated_at",
+            FIXED_NOW - timedelta(seconds=5),
+            FIXED_NOW,
+        ),
+        ("equal-updated-at", "updated_at", FIXED_NOW, FIXED_NOW),
+        (
+            "future-updated-at",
+            "updated_at",
+            FIXED_NOW + timedelta(seconds=5),
+            FIXED_NOW + timedelta(seconds=5),
+        ),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_preserves_monotonic_valid_timestamps(
+    testing_context, monkeypatch, case, field, value, expected
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fields = {} if value is MISSING else {field: value}
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=0,
+        fields=fields,
+        unset_fields=(field,) if value is MISSING else (),
+    )
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+    assert result == 1, case
+    assert _normalize_datetime(persisted["last_attempt_at"]) == (
+        expected if field == "last_attempt_at" else FIXED_NOW
+    )
+    assert _normalize_datetime(persisted["updated_at"]) == (
+        expected if field == "updated_at" else FIXED_NOW
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_does_not_regress_after_older_clock_capture(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    later_now = FIXED_NOW + timedelta(seconds=3)
+    captured_times = iter((later_now, FIXED_NOW))
+
+    class SequencedDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is timezone.utc
+            return next(captured_times)
+
+    monkeypatch.setattr(processing_repository, "datetime", SequencedDateTime)
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=0,
+        fields={
+            "lease_until": FIXED_NOW + timedelta(minutes=1),
+            "last_attempt_at": FIXED_NOW - timedelta(seconds=2),
+            "updated_at": FIXED_NOW - timedelta(seconds=1),
+        },
+    )
+    repository = ProcessingRepository(db)
+
+    first = await repository.record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+    second = await repository.record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+    assert (first, second) == (1, 2)
+    assert _normalize_datetime(persisted["last_attempt_at"]) == later_now
+    assert _normalize_datetime(persisted["updated_at"]) == later_now
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_preserves_every_non_authorized_field(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fields = {
+        "file_id": ObjectId(),
+        "heartbeat_at": FIXED_NOW - timedelta(seconds=8),
+        "next_retry_at": FIXED_NOW + timedelta(minutes=2),
+        "last_error": "previous error",
+        "error_message": "public error",
+        "content": "existing content",
+        "page_count": 7,
+        "completed_at": None,
+        "failed_at": None,
+        "upload_owner_id": "upload-owner",
+        "upload_lease_until": FIXED_NOW + timedelta(minutes=10),
+        "upload_fencing_token": "upload-fencing",
+    }
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=0,
+        fields=fields,
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": fixture["document_id"]})
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+    )
+
+    after = await collection.find_one({"_id": fixture["document_id"]})
+    authorized_fields = {"attempt_count", "last_attempt_at", "updated_at"}
+    assert result == 1
+    assert {
+        key: value for key, value in after.items() if key not in authorized_fields
+    } == {
+        key: value for key, value in before.items() if key not in authorized_fields
+    }
+    assert after["attempt_count"] == 1
+    assert _normalize_datetime(after["last_attempt_at"]) == FIXED_NOW
+    assert _normalize_datetime(after["updated_at"]) == FIXED_NOW
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_returns_none_for_missing_document(
+    testing_context, monkeypatch
+):
+    db, _ = testing_context
+    _freeze_claim_clock(monkeypatch)
+
+    result = await ProcessingRepository(db).record_ms2_attempt(
+        str(ObjectId()),
+        "worker-a",
+        "fencing-a",
+        "cycle-a",
+    )
+
+    assert result is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_record_ms2_attempt_rejects_stale_owner_after_real_recovery(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, old_claim, now, cycle_id, _ = (
+        await _prepare_expired_processing_document(
+            db,
+            resources,
+            monkeypatch,
+            old_worker_id="attempt-old-owner",
+        )
+    )
+    collection = db[settings.mongo_collection]
+    reset = await collection.update_one(
+        {"_id": document["document_id"]},
+        {"$set": {"attempt_count": 0}},
+    )
+    assert reset.matched_count == 1
+    repository = ProcessingRepository(db)
+
+    recovered = await repository.recover_expired_processing("attempt-new-owner")
+    assert recovered is not None
+    assert recovered.fencing_token != old_claim.fencing_token
+    assert recovered.processing_cycle_id == cycle_id
+
+    before_stale_attempt = await collection.find_one(
+        {"_id": document["document_id"]}
+    )
+    stale_result = await repository.record_ms2_attempt(
+        old_claim.id,
+        old_claim.worker_id,
+        old_claim.fencing_token,
+        cycle_id,
+    )
+    after_stale_attempt = await collection.find_one(
+        {"_id": document["document_id"]}
+    )
+    new_owner_result = await repository.record_ms2_attempt(
+        recovered.id,
+        recovered.worker_id,
+        recovered.fencing_token,
+        recovered.processing_cycle_id,
+    )
+
+    persisted = await collection.find_one({"_id": document["document_id"]})
+    assert stale_result is None
+    assert after_stale_attempt == before_stale_attempt
+    assert new_owner_result == 1
+    assert persisted["attempt_count"] == 1
+    assert _normalize_datetime(persisted["lease_until"]) > now
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_record_ms2_attempts_with_one_slot_have_one_winner(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=4,
+    )
+    barrier = asyncio.Barrier(2)
+    repository = ProcessingRepository(db)
+
+    async def record_after_barrier():
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await repository.record_ms2_attempt(
+            str(fixture["document_id"]),
+            fixture["worker_id"],
+            fixture["fencing_token"],
+            fixture["processing_cycle_id"],
+        )
+
+    first, second = await asyncio.gather(
+        record_after_barrier(),
+        record_after_barrier(),
+    )
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+    assert sorted(result for result in (first, second) if result is not None) == [5]
+    assert sum(result is None for result in (first, second)) == 1
+    assert persisted["attempt_count"] == 5
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_record_ms2_attempts_never_exceed_five(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_attempt_document(
+        db,
+        resources,
+        attempt_count=0,
+    )
+    barrier = asyncio.Barrier(8)
+    repository = ProcessingRepository(db)
+
+    async def record_after_barrier():
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await repository.record_ms2_attempt(
+            str(fixture["document_id"]),
+            fixture["worker_id"],
+            fixture["fencing_token"],
+            fixture["processing_cycle_id"],
+        )
+
+    results = await asyncio.gather(
+        *(record_after_barrier() for _ in range(8))
+    )
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+    successful = [result for result in results if result is not None]
+    assert sorted(successful) == [1, 2, 3, 4, 5]
+    assert sum(result is None for result in results) == 3
+    assert persisted["attempt_count"] == 5

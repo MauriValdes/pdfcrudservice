@@ -291,3 +291,131 @@ class ProcessingRepository:
             raise DatabaseUnavailableError() from error
 
         return result.matched_count == 1
+
+    async def record_ms2_attempt(
+        self,
+        document_id: str,
+        worker_id: str,
+        fencing_token: str,
+        processing_cycle_id: str,
+    ) -> int | None:
+        if not ObjectId.is_valid(document_id):
+            raise ValueError("Identificador de documento inválido")
+
+        object_id = ObjectId(document_id)
+        captured_now = datetime.now(timezone.utc)
+        now = captured_now.replace(
+            microsecond=(captured_now.microsecond // 1000) * 1000
+        )
+        window_start = now - timedelta(minutes=10)
+
+        valid_attempt_count = {
+            "$cond": [
+                {"$eq": [{"$type": "$attempt_count"}, "missing"]},
+                True,
+                {
+                    "$cond": [
+                        {
+                            "$in": [
+                                {"$type": "$attempt_count"},
+                                ["int", "long"],
+                            ]
+                        },
+                        {
+                            "$and": [
+                                {"$gte": ["$attempt_count", 0]},
+                                {"$lte": ["$attempt_count", 4]},
+                            ]
+                        },
+                        False,
+                    ]
+                },
+            ]
+        }
+        active_cycle = {
+            "$and": [
+                _existing_cycle_expression(now),
+                {
+                    "$gt": [
+                        "$processing_cycle_started_at",
+                        window_start,
+                    ]
+                },
+            ]
+        }
+        query = {
+            "_id": object_id,
+            "status": "processing",
+            "worker_id": worker_id,
+            "fencing_token": fencing_token,
+            "processing_cycle_id": processing_cycle_id,
+            "$expr": {
+                "$and": [
+                    {"$eq": [{"$type": "$status"}, "string"]},
+                    {"$eq": [{"$type": "$worker_id"}, "string"]},
+                    {"$eq": [{"$type": "$fencing_token"}, "string"]},
+                    {"$eq": [{"$type": "$lease_until"}, "date"]},
+                    {"$gte": ["$lease_until", now]},
+                    active_cycle,
+                    valid_attempt_count,
+                    {
+                        "$in": [
+                            {"$type": "$last_attempt_at"},
+                            ["missing", "null", "date"],
+                        ]
+                    },
+                    {
+                        "$in": [
+                            {"$type": "$updated_at"},
+                            ["missing", "null", "date"],
+                        ]
+                    },
+                ]
+            },
+        }
+        update = [
+            {
+                "$set": {
+                    "attempt_count": {
+                        "$add": [{"$ifNull": ["$attempt_count", 0]}, 1]
+                    },
+                    "last_attempt_at": {
+                        "$max": [
+                            {
+                                "$ifNull": [
+                                    "$last_attempt_at",
+                                    {"$literal": now},
+                                ]
+                            },
+                            {"$literal": now},
+                        ]
+                    },
+                    "updated_at": {
+                        "$max": [
+                            {
+                                "$ifNull": [
+                                    "$updated_at",
+                                    {"$literal": now},
+                                ]
+                            },
+                            {"$literal": now},
+                        ]
+                    },
+                }
+            }
+        ]
+
+        try:
+            document_data = await self.collection.find_one_and_update(
+                query,
+                update,
+                return_document=ReturnDocument.AFTER,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        if document_data is None:
+            return None
+
+        return int(document_data["attempt_count"])
