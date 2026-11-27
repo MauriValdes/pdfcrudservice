@@ -22,6 +22,21 @@ _UNAVAILABLE_ERRORS = (
     NetworkTimeout,
 )
 
+_DATETIME_TYPE = datetime
+
+_TRANSIENT_RETRY_CODES = frozenset(
+    {
+        "ms2_http_429",
+        "ms2_http_500",
+        "ms2_http_502",
+        "ms2_http_503",
+        "ms2_http_504",
+        "ms2_timeout",
+        "ms2_connection_error",
+        "ms2_protocol_error",
+    }
+)
+
 _FAILURE_PUBLIC_MESSAGES = {
     "ms2_invalid_input": "El archivo PDF no es válido.",
     "pdf_too_large": "El archivo PDF supera el tamaño máximo permitido.",
@@ -44,6 +59,47 @@ _PRIOR_PROCESSING_METADATA_FIELDS = (
     "heartbeat_at",
     "fencing_token",
 )
+
+
+def _validated_retry_arguments(
+    document_id: str,
+    worker_id: str,
+    fencing_token: str,
+    processing_cycle_id: str,
+    next_retry_at: datetime,
+) -> tuple[ObjectId, datetime, datetime]:
+    """Validate retry ownership inputs and normalize the retry instant and clock."""
+    if not isinstance(document_id, str) or not ObjectId.is_valid(document_id):
+        raise ValueError("Identificador de documento inválido")
+    if not isinstance(worker_id, str) or not worker_id:
+        raise ValueError("Identificador de worker inválido")
+    if not isinstance(fencing_token, str) or not fencing_token:
+        raise ValueError("Token de fencing inválido")
+    if not isinstance(processing_cycle_id, str) or not processing_cycle_id:
+        raise ValueError("Identificador de ciclo inválido")
+    if not isinstance(next_retry_at, _DATETIME_TYPE):
+        raise ValueError("La fecha del próximo intento debe ser datetime")
+
+    try:
+        if next_retry_at.tzinfo is None or next_retry_at.utcoffset() is None:
+            raise ValueError("La fecha del próximo intento debe incluir timezone")
+        normalized_retry_at = next_retry_at.astimezone(timezone.utc)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            "La fecha del próximo intento debe incluir timezone válido"
+        ) from error
+    normalized_retry_at = normalized_retry_at.replace(
+        microsecond=(normalized_retry_at.microsecond // 1000) * 1000
+    )
+
+    captured_now = datetime.now(timezone.utc)
+    now = captured_now.replace(
+        microsecond=(captured_now.microsecond // 1000) * 1000
+    )
+    if normalized_retry_at <= now:
+        raise ValueError("La fecha del próximo intento debe ser futura")
+
+    return ObjectId(document_id), now, normalized_retry_at
 
 
 def _new_cycle_expression() -> dict:
@@ -156,6 +212,67 @@ def _processing_terminal_query(
             ]
         },
     }
+
+
+def _retry_release_common_guards(now: datetime) -> list[dict]:
+    """Return cycle-window and heartbeat type guards for retry releases."""
+    return [
+        {
+            "$gt": [
+                "$processing_cycle_started_at",
+                now - timedelta(minutes=10),
+            ]
+        },
+        {
+            "$in": [
+                {"$type": "$heartbeat_at"},
+                ["missing", "null", "date"],
+            ]
+        },
+    ]
+
+
+def _retry_release_update(
+    now: datetime,
+    normalized_next_retry_at: datetime,
+    *,
+    failure_code: str | None = None,
+) -> list[dict]:
+    """Build the shared atomic transition that releases processing ownership."""
+    set_fields = {
+        "status": {"$literal": "pending"},
+        "next_retry_at": {
+            "$min": [
+                {"$literal": normalized_next_retry_at},
+                {"$add": ["$processing_cycle_started_at", 600000]},
+            ]
+        },
+        "updated_at": {
+            "$max": [
+                {"$ifNull": ["$updated_at", {"$literal": now}]},
+                {"$literal": now},
+            ]
+        },
+    }
+    if failure_code is not None:
+        set_fields["last_error"] = {"$literal": failure_code}
+
+    return [
+        {"$set": set_fields},
+        {
+            "$unset": [
+                "worker_id",
+                "fencing_token",
+                "lease_until",
+                "heartbeat_at",
+                "error_message",
+                "completed_at",
+                "failed_at",
+                "content",
+                "page_count",
+            ]
+        },
+    ]
 
 
 def _cycle_eligibility_expression(now: datetime) -> dict:
@@ -837,6 +954,153 @@ class ProcessingRepository:
                 ]
             },
         ]
+
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        return result.matched_count == 1
+
+    async def schedule_transient_retry(
+        self,
+        document_id: str,
+        worker_id: str,
+        fencing_token: str,
+        processing_cycle_id: str,
+        attempt_number: int,
+        failure_code: str,
+        next_retry_at: datetime,
+    ) -> bool:
+        """Release after an authorized, concluded transient HTTP attempt.
+
+        The caller must ensure that no authorized call can still return an
+        acceptable result; this repository cannot observe remote HTTP state.
+        """
+        if type(attempt_number) is not int or not 1 <= attempt_number <= 5:
+            raise ValueError("Número de intento inválido")
+        if not isinstance(failure_code, str):
+            raise ValueError("Código de fallo inválido")
+        if failure_code not in _TRANSIENT_RETRY_CODES:
+            raise ValueError("Código de fallo transitorio inválido")
+
+        object_id, now, normalized_retry_at = _validated_retry_arguments(
+            document_id,
+            worker_id,
+            fencing_token,
+            processing_cycle_id,
+            next_retry_at,
+        )
+        operation_guards = [
+            *_retry_release_common_guards(now),
+            {"$in": [{"$type": "$attempt_count"}, ["int", "long"]]},
+            {"$eq": ["$attempt_count", attempt_number]},
+            {"$lt": ["$attempt_count", 5]},
+            {"$eq": [{"$type": "$last_attempt_at"}, "date"]},
+        ]
+        query = _processing_terminal_query(
+            object_id,
+            worker_id,
+            fencing_token,
+            processing_cycle_id,
+            now,
+            operation_guards,
+        )
+        update = _retry_release_update(
+            now,
+            normalized_retry_at,
+            failure_code=failure_code,
+        )
+
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        return result.matched_count == 1
+
+    async def release_for_circuit_open(
+        self,
+        document_id: str,
+        worker_id: str,
+        fencing_token: str,
+        processing_cycle_id: str,
+        expected_attempt_count: int,
+        next_retry_at: datetime,
+    ) -> bool:
+        """Release without representing or consuming another HTTP attempt.
+
+        The caller must ensure that no authorized call can still return an
+        acceptable result; this repository cannot observe remote HTTP state.
+        """
+        if (
+            type(expected_attempt_count) is not int
+            or not 0 <= expected_attempt_count <= 5
+        ):
+            raise ValueError("Contador esperado de intentos inválido")
+
+        object_id, now, normalized_retry_at = _validated_retry_arguments(
+            document_id,
+            worker_id,
+            fencing_token,
+            processing_cycle_id,
+            next_retry_at,
+        )
+        operation_guards = _retry_release_common_guards(now)
+        if expected_attempt_count == 0:
+            operation_guards.extend(
+                [
+                    {
+                        "$or": [
+                            {"$eq": [{"$type": "$attempt_count"}, "missing"]},
+                            {
+                                "$and": [
+                                    {
+                                        "$in": [
+                                            {"$type": "$attempt_count"},
+                                            ["int", "long"],
+                                        ]
+                                    },
+                                    {"$eq": ["$attempt_count", 0]},
+                                ]
+                            },
+                        ]
+                    },
+                    {
+                        "$in": [
+                            {"$type": "$last_attempt_at"},
+                            ["missing", "null"],
+                        ]
+                    },
+                ]
+            )
+        else:
+            operation_guards.extend(
+                [
+                    {"$in": [{"$type": "$attempt_count"}, ["int", "long"]]},
+                    {"$eq": ["$attempt_count", expected_attempt_count]},
+                    {"$lte": ["$attempt_count", 4]},
+                    {"$eq": [{"$type": "$last_attempt_at"}, "date"]},
+                ]
+            )
+
+        query = _processing_terminal_query(
+            object_id,
+            worker_id,
+            fencing_token,
+            processing_cycle_id,
+            now,
+            operation_guards,
+        )
+        update = _retry_release_update(now, normalized_retry_at)
 
         try:
             result = await self.collection.update_one(

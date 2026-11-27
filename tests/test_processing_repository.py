@@ -1,7 +1,7 @@
 """Pruebas unitarias RED del reclamo y renovación de leases de procesamiento."""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
@@ -1975,3 +1975,374 @@ async def test_terminal_failure_operations_preserve_error_contract_without_retry
     repo.collection.find_one.assert_not_awaited()
     repo.collection.find_one_and_update.assert_not_awaited()
     repo.collection.update_many.assert_not_awaited()
+
+
+_TRANSIENT_RETRY_CODES = (
+    "ms2_http_429",
+    "ms2_http_500",
+    "ms2_http_502",
+    "ms2_http_503",
+    "ms2_http_504",
+    "ms2_timeout",
+    "ms2_connection_error",
+    "ms2_protocol_error",
+)
+
+
+class _NoEffectiveOffset(tzinfo):
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+
+def _retry_arguments(document_id=None):
+    return (
+        *_terminal_arguments(document_id),
+        3,
+        "ms2_http_503",
+        NOW + timedelta(seconds=8),
+    )
+
+
+def _open_retry_arguments(document_id=None):
+    return (
+        *_terminal_arguments(document_id),
+        2,
+        NOW + timedelta(seconds=8),
+    )
+
+
+@pytest.mark.asyncio
+async def test_schedule_transient_retry_builds_one_atomic_bounded_release(
+    monkeypatch, repo_with_mocks
+):
+    calls = []
+    raw_now = NOW.replace(microsecond=987654)
+    now = NOW.replace(microsecond=987000)
+    proposed_retry_utc = (NOW + timedelta(seconds=8)).replace(microsecond=456789)
+    proposed_retry = proposed_retry_utc.astimezone(
+        timezone(timedelta(hours=-4))
+    )
+    normalized_retry = proposed_retry.replace(microsecond=456000)
+    normalized_retry = normalized_retry.astimezone(timezone.utc)
+
+    class CountingDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            calls.append(tz)
+            assert tz is timezone.utc
+            return raw_now
+
+    monkeypatch.setattr(processing_repository, "datetime", CountingDateTime)
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 1
+    document_id = ObjectId()
+
+    result = await repo.schedule_transient_retry(
+        *_terminal_arguments(document_id),
+        3,
+        "ms2_http_503",
+        proposed_retry,
+    )
+
+    assert result is True
+    assert calls == [timezone.utc]
+    query, update = repo.collection.update_one.call_args.args
+    assert query["_id"] == document_id
+    assert query["status"] == "processing"
+    assert query["worker_id"] == "worker-a"
+    assert query["fencing_token"] == "fencing-a"
+    assert query["processing_cycle_id"] == "cycle-a"
+    guards = query["$expr"]["$and"]
+    assert _terminal_common_guards(now) == guards[: len(_terminal_common_guards(now))]
+    assert {"$gt": ["$processing_cycle_started_at", now - timedelta(minutes=10)]} in guards
+    assert {"$eq": ["$attempt_count", 3]} in guards
+    assert {"$lt": ["$attempt_count", 5]} in guards
+    assert {"$eq": [{"$type": "$last_attempt_at"}, "date"]} in guards
+    assert {
+        "$in": [{"$type": "$heartbeat_at"}, ["missing", "null", "date"]]
+    } in guards
+    assert update[0]["$set"]["status"] == {"$literal": "pending"}
+    assert update[0]["$set"]["last_error"] == {"$literal": "ms2_http_503"}
+    assert update[0]["$set"]["next_retry_at"] == {
+        "$min": [
+            {"$literal": normalized_retry},
+            {"$add": ["$processing_cycle_started_at", 600000]},
+        ]
+    }
+    assert update[0]["$set"]["updated_at"] == {
+        "$max": [
+            {"$ifNull": ["$updated_at", {"$literal": now}]},
+            {"$literal": now},
+        ]
+    }
+    assert update[1]["$unset"] == [
+        "worker_id",
+        "fencing_token",
+        "lease_until",
+        "heartbeat_at",
+        "error_message",
+        "completed_at",
+        "failed_at",
+        "content",
+        "page_count",
+    ]
+    assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_code", _TRANSIENT_RETRY_CODES)
+async def test_schedule_transient_retry_accepts_only_closed_transient_codes(
+    repo_with_mocks, fixed_clock, failure_code
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 1
+
+    result = await repo.schedule_transient_retry(
+        *_terminal_arguments(),
+        3,
+        failure_code,
+        NOW + timedelta(seconds=8),
+    )
+
+    assert result is True
+    update = repo.collection.update_one.call_args.args[1]
+    assert update[0]["$set"]["last_error"] == {"$literal": failure_code}
+
+
+@pytest.mark.parametrize(
+    ("attempt_number", "failure_code"),
+    [
+        (0, "ms2_http_503"),
+        (6, "ms2_http_503"),
+        (True, "ms2_http_503"),
+        (3.0, "ms2_http_503"),
+        (3, "ms2_invalid_input"),
+        (3, "attempts_exhausted"),
+        (3, "cycle_window_exhausted"),
+        (3, "$where"),
+        (3, ["ms2_http_503"]),
+        (3, RuntimeError("must not persist exception text")),
+    ],
+)
+@pytest.mark.asyncio
+async def test_schedule_transient_retry_rejects_invalid_arguments_before_mongodb(
+    repo_with_mocks, fixed_clock, attempt_number, failure_code
+):
+    repo = repo_with_mocks
+    with pytest.raises(ValueError):
+        await repo.schedule_transient_retry(
+            *_terminal_arguments(),
+            attempt_number,
+            failure_code,
+            NOW + timedelta(seconds=8),
+        )
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("operation", "next_retry_at"),
+    [
+        (operation, next_retry_at)
+        for operation in ("schedule_transient_retry", "release_for_circuit_open")
+        for next_retry_at in (
+            "not-a-datetime",
+            NOW.replace(tzinfo=None),
+            NOW.replace(tzinfo=_NoEffectiveOffset()),
+            NOW,
+            NOW - timedelta(milliseconds=1),
+            NOW + timedelta(microseconds=999),
+        )
+    ],
+)
+@pytest.mark.asyncio
+async def test_retry_operations_reject_invalid_retry_instants_before_mongodb(
+    repo_with_mocks, fixed_clock, operation, next_retry_at
+):
+    repo = repo_with_mocks
+    with pytest.raises(ValueError):
+        if operation == "schedule_transient_retry":
+            await repo.schedule_transient_retry(
+                *_terminal_arguments(),
+                3,
+                "ms2_http_503",
+                next_retry_at,
+            )
+        else:
+            await repo.release_for_circuit_open(
+                *_terminal_arguments(),
+                2,
+                next_retry_at,
+            )
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("operation", "argument_index", "invalid_value"),
+    [
+        (operation, argument_index, invalid_value)
+        for operation in ("schedule_transient_retry", "release_for_circuit_open")
+        for argument_index, invalid_value in (
+            (0, None),
+            (0, "not-an-object-id"),
+            (1, ""),
+            (1, 3),
+            (2, ""),
+            (2, None),
+            (3, ""),
+            (3, []),
+        )
+    ],
+)
+@pytest.mark.asyncio
+async def test_retry_operations_reject_invalid_shared_arguments(
+    repo_with_mocks, fixed_clock, operation, argument_index, invalid_value
+):
+    repo = repo_with_mocks
+    arguments = list(
+        _retry_arguments()
+        if operation == "schedule_transient_retry"
+        else _open_retry_arguments()
+    )
+    arguments[argument_index] = invalid_value
+
+    with pytest.raises(ValueError):
+        await getattr(repo, operation)(*arguments)
+
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("schedule_transient_retry", _retry_arguments),
+        ("release_for_circuit_open", _open_retry_arguments),
+    ],
+)
+@pytest.mark.asyncio
+async def test_retry_operations_return_false_for_unmatched_atomic_write(
+    repo_with_mocks, fixed_clock, operation, arguments
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 0
+
+    result = await getattr(repo, operation)(*arguments())
+
+    assert result is False
+    repo.collection.update_one.assert_awaited_once()
+    assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_release_for_circuit_open_preserves_attempt_state_and_last_error(
+    monkeypatch, repo_with_mocks
+):
+    raw_now = NOW.replace(microsecond=765432)
+    now = NOW.replace(microsecond=765000)
+
+    class CountingDateTime:
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            assert tz is timezone.utc
+            return raw_now
+
+    monkeypatch.setattr(processing_repository, "datetime", CountingDateTime)
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 1
+
+    result = await repo.release_for_circuit_open(
+        *_terminal_arguments(),
+        2,
+        NOW + timedelta(seconds=8),
+    )
+
+    assert result is True
+    assert CountingDateTime.calls == 1
+    query, update = repo.collection.update_one.call_args.args
+    guards = query["$expr"]["$and"]
+    assert {"$eq": ["$attempt_count", 2]} in guards
+    assert {"$lte": ["$attempt_count", 4]} in guards
+    assert {"$eq": [{"$type": "$last_attempt_at"}, "date"]} in guards
+    assert {"$gt": ["$processing_cycle_started_at", now - timedelta(minutes=10)]} in guards
+    assert "last_error" not in update[0]["$set"]
+    assert "attempt_count" not in update[0]["$set"]
+    assert "last_attempt_at" not in update[0]["$set"]
+    assert update[0]["$set"]["next_retry_at"]["$min"][1] == {
+        "$add": ["$processing_cycle_started_at", 600000]
+    }
+    assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
+    repo.collection.update_one.assert_awaited_once()
+
+
+@pytest.mark.parametrize("expected_attempt_count", [-1, 6, True, 1.0, "2"])
+@pytest.mark.asyncio
+async def test_release_for_circuit_open_rejects_invalid_expected_counter(
+    repo_with_mocks, fixed_clock, expected_attempt_count
+):
+    repo = repo_with_mocks
+    with pytest.raises(ValueError):
+        await repo.release_for_circuit_open(
+            *_terminal_arguments(),
+            expected_attempt_count,
+            NOW + timedelta(seconds=8),
+        )
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("schedule_transient_retry", lambda: _retry_arguments()),
+        ("release_for_circuit_open", lambda: _open_retry_arguments()),
+    ],
+)
+@pytest.mark.parametrize(
+    "write_error",
+    [
+        ServerSelectionTimeoutError("unavailable"),
+        AutoReconnect("unavailable"),
+        ConnectionFailure("unavailable"),
+        NetworkTimeout("unavailable"),
+        WriteConcernError("ambiguous acknowledgement"),
+        RuntimeError("unexpected write failure"),
+        asyncio.CancelledError(),
+    ],
+)
+@pytest.mark.asyncio
+async def test_retry_operations_preserve_single_write_error_contract(
+    repo_with_mocks, fixed_clock, operation, arguments, write_error
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.side_effect = write_error
+
+    if isinstance(
+        write_error,
+        (
+            ServerSelectionTimeoutError,
+            AutoReconnect,
+            ConnectionFailure,
+            NetworkTimeout,
+        ),
+    ):
+        with pytest.raises(DatabaseUnavailableError) as raised:
+            await getattr(repo, operation)(*arguments())
+        assert raised.value.__cause__ is write_error
+    else:
+        with pytest.raises(type(write_error)) as raised:
+            await getattr(repo, operation)(*arguments())
+        assert raised.value is write_error
+
+    repo.collection.update_one.assert_awaited_once()
+    assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()

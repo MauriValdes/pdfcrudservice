@@ -1744,6 +1744,652 @@ async def test_recover_expired_processing_accepts_coherent_exhausted_cycle(
     assert _normalize_datetime(after["next_retry_at"]) == now - timedelta(seconds=1)
 
 
+def _retry_owner_arguments(claimed):
+    return (
+        claimed.id,
+        claimed.worker_id,
+        claimed.fencing_token,
+        claimed.processing_cycle_id,
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_transient_retry_releases_owner_and_preserves_cycle_and_original_pdf(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, cycle_id = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=0
+    )
+    repository = ProcessingRepository(db)
+    attempt_number = await repository.record_ms2_attempt(
+        *_retry_owner_arguments(claimed)
+    )
+    assert attempt_number == 1
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document["document_id"]})
+    upload_fields = {
+        field: before[field]
+        for field in (
+            "upload_owner_id",
+            "upload_lease_until",
+            "upload_fencing_token",
+        )
+    }
+    await collection.update_one(
+        {"_id": document["document_id"]},
+        {
+            "$set": {
+                "last_error": "previous-safe-code",
+                "error_message": "mensaje transitorio obsoleto",
+                "content": "stale output",
+                "page_count": 7,
+                "completed_at": None,
+                "failed_at": None,
+                "updated_at": now + timedelta(seconds=5),
+            }
+        },
+    )
+    before = await collection.find_one({"_id": document["document_id"]})
+    proposed_retry = now + timedelta(seconds=8)
+
+    released = await repository.schedule_transient_retry(
+        *_retry_owner_arguments(claimed),
+        attempt_number,
+        "ms2_http_503",
+        proposed_retry,
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert released is True
+    expected = dict(before)
+    expected.update(
+        {
+            "status": DocumentStatus.PENDING.value,
+            "next_retry_at": proposed_retry.astimezone(timezone.utc).replace(
+                tzinfo=None
+            ),
+            "last_error": "ms2_http_503",
+        }
+    )
+    removed_fields = (
+        "worker_id",
+        "fencing_token",
+        "lease_until",
+        "heartbeat_at",
+        "error_message",
+        "completed_at",
+        "failed_at",
+        "content",
+        "page_count",
+    )
+    for field in removed_fields:
+        expected.pop(field)
+    assert after == expected
+    assert _normalize_datetime(after["updated_at"]) == now + timedelta(seconds=5)
+    assert after["attempt_count"] == 1
+    assert _normalize_datetime(after["last_attempt_at"]) == now
+    assert after["processing_cycle_id"] == cycle_id
+    assert after["processing_cycle_started_at"] == before["processing_cycle_started_at"]
+    for field, value in upload_fields.items():
+        assert after[field] == value
+    assert after["file_id"] == document["file_id"]
+    assert after["checksum"] == document["checksum"]
+    assert await GridFSRepository(db).read(document["file_id"]) == document["pdf_bytes"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "counter_case",
+    [
+        "missing",
+        "zero",
+        "positive",
+    ],
+)
+@pytest.mark.asyncio
+async def test_circuit_open_release_preserves_counter_timestamp_and_last_error(
+    testing_context, monkeypatch, counter_case
+):
+    db, resources = testing_context
+    initial_count = 2 if counter_case == "positive" else 0
+    document, claimed, now, cycle_id = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=initial_count
+    )
+    collection = db[settings.mongo_collection]
+    if counter_case == "missing":
+        await collection.update_one(
+            {"_id": document["document_id"]},
+            {
+                "$unset": {
+                    "attempt_count": "",
+                    "last_attempt_at": "",
+                    "last_error": "",
+                }
+            },
+        )
+        expected_count = 0
+    elif counter_case == "positive":
+        await collection.update_one(
+            {"_id": document["document_id"]},
+            {
+                "$set": {
+                    "last_attempt_at": now + timedelta(seconds=3),
+                    "last_error": "ms2_http_429",
+                }
+            },
+        )
+        expected_count = initial_count
+    else:
+        await collection.update_one(
+            {"_id": document["document_id"]},
+            {"$set": {"last_error": "ms2_timeout"}},
+        )
+        expected_count = 0
+    before = await collection.find_one({"_id": document["document_id"]})
+    previous_attempt = before.get("last_attempt_at", MISSING)
+    previous_error = before.get("last_error", MISSING)
+
+    proposed_retry = now + timedelta(seconds=12)
+    released = await ProcessingRepository(db).release_for_circuit_open(
+        *_retry_owner_arguments(claimed),
+        expected_count,
+        proposed_retry,
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert released is True
+    assert after["status"] == DocumentStatus.PENDING.value
+    assert _normalize_datetime(after["next_retry_at"]) == proposed_retry
+    if "attempt_count" in before:
+        assert after["attempt_count"] == before["attempt_count"]
+    else:
+        assert "attempt_count" not in after
+    assert after.get("last_attempt_at", MISSING) == previous_attempt
+    assert after.get("last_error", MISSING) == previous_error
+    if previous_error is MISSING:
+        assert "last_error" not in after
+    assert after["processing_cycle_id"] == cycle_id
+    assert after["processing_cycle_started_at"] == before["processing_cycle_started_at"]
+    assert after["file_id"] == document["file_id"]
+    assert after["checksum"] == document["checksum"]
+    assert await GridFSRepository(db).read(document["file_id"]) == document["pdf_bytes"]
+    for field in ("worker_id", "fencing_token", "lease_until", "heartbeat_at"):
+        assert field not in after
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("proposed_delta", "expected_delta"),
+    [
+        (timedelta(minutes=9, seconds=59), timedelta(minutes=9, seconds=59)),
+        (timedelta(minutes=10), timedelta(minutes=10)),
+        (timedelta(minutes=12), timedelta(minutes=10)),
+    ],
+    ids=["before-deadline", "at-deadline", "after-deadline"],
+)
+@pytest.mark.asyncio
+async def test_retry_schedule_clamps_proposed_instant_to_cycle_deadline(
+    testing_context, monkeypatch, proposed_delta, expected_delta
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=0
+    )
+    repository = ProcessingRepository(db)
+    attempt_number = await repository.record_ms2_attempt(
+        *_retry_owner_arguments(claimed)
+    )
+    deadline = now + timedelta(minutes=10)
+    proposed = now + proposed_delta
+    assert now < proposed
+    before = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert _normalize_datetime(now) == FIXED_NOW
+    assert before["status"] == DocumentStatus.PROCESSING.value
+    assert before["attempt_count"] == attempt_number == 1
+    assert before["processing_cycle_id"] == claimed.processing_cycle_id
+    assert before["processing_cycle_started_at"] == now.replace(tzinfo=None)
+    assert _normalize_datetime(before["lease_until"]) >= now
+
+    released = await repository.schedule_transient_retry(
+        *_retry_owner_arguments(claimed),
+        attempt_number,
+        "ms2_timeout",
+        proposed,
+    )
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert released is True
+    assert _normalize_datetime(persisted["next_retry_at"]) == now + expected_delta
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_date_is_clamped_to_deadline_then_claimed_and_exhausted(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, cycle_id = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=0
+    )
+    repository = ProcessingRepository(db)
+    attempt_number = await repository.record_ms2_attempt(
+        *_retry_owner_arguments(claimed)
+    )
+    assert attempt_number == 1
+    deadline = now + timedelta(minutes=10)
+    before = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert _normalize_datetime(now) == FIXED_NOW
+    assert before["status"] == DocumentStatus.PROCESSING.value
+    assert before["attempt_count"] == attempt_number
+    assert before["processing_cycle_id"] == cycle_id
+    assert before["processing_cycle_started_at"] == now.replace(tzinfo=None)
+    assert _normalize_datetime(before["lease_until"]) >= now
+
+    released = await repository.schedule_transient_retry(
+        *_retry_owner_arguments(claimed),
+        attempt_number,
+        "ms2_timeout",
+        deadline + timedelta(minutes=2),
+    )
+
+    collection = db[settings.mongo_collection]
+    pending = await collection.find_one({"_id": document["document_id"]})
+    assert released is True
+    assert _normalize_datetime(pending["next_retry_at"]) == deadline
+    assert pending["status"] == DocumentStatus.PENDING.value
+    assert pending["processing_cycle_id"] == cycle_id
+    assert await repository.claim_pending("too-early-worker") is None
+
+    _freeze_claim_clock(monkeypatch, deadline)
+    reclaimed = await repository.claim_pending("deadline-worker")
+    assert reclaimed is not None
+    assert reclaimed.id == str(document["document_id"])
+    assert reclaimed.processing_cycle_id == cycle_id
+    assert reclaimed.fencing_token != claimed.fencing_token
+    assert await repository.record_ms2_attempt(
+        reclaimed.id,
+        reclaimed.worker_id,
+        reclaimed.fencing_token,
+        reclaimed.processing_cycle_id,
+    ) is None
+    assert await repository.fail_exhausted_processing(
+        reclaimed.id,
+        reclaimed.worker_id,
+        reclaimed.fencing_token,
+        reclaimed.processing_cycle_id,
+    ) is True
+    terminal = await collection.find_one({"_id": document["document_id"]})
+    assert terminal["status"] == DocumentStatus.FAILED.value
+    assert terminal["last_error"] == "cycle_window_exhausted"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_claim_is_ineligible_before_schedule_and_eligible_at_schedule(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, cycle_id = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=0
+    )
+    repository = ProcessingRepository(db)
+    attempt_number = await repository.record_ms2_attempt(
+        *_retry_owner_arguments(claimed)
+    )
+    scheduled_at = now + timedelta(seconds=20)
+    released = await repository.schedule_transient_retry(
+        *_retry_owner_arguments(claimed),
+        attempt_number,
+        "ms2_connection_error",
+        scheduled_at,
+    )
+    assert released is True
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert _normalize_datetime(persisted["next_retry_at"]) == scheduled_at
+    assert await repository.claim_pending("early-worker") is None
+
+    _freeze_claim_clock(monkeypatch, scheduled_at)
+    reclaimed = await repository.claim_pending("eligible-worker")
+    assert reclaimed is not None
+    assert reclaimed.id == str(document["document_id"])
+    assert reclaimed.processing_cycle_id == cycle_id
+    assert reclaimed.fencing_token != claimed.fencing_token
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_circuit_open_release_races_attempt_authorization_atomically(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=0
+    )
+    repository = ProcessingRepository(db)
+    barrier = asyncio.Barrier(2)
+
+    async def release_after_barrier():
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await repository.release_for_circuit_open(
+            *_retry_owner_arguments(claimed), 0, now + timedelta(seconds=5)
+        )
+
+    async def authorize_after_barrier():
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await repository.record_ms2_attempt(*_retry_owner_arguments(claimed))
+
+    release_result, attempt_result = await asyncio.gather(
+        release_after_barrier(),
+        authorize_after_barrier(),
+    )
+
+    final = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    if release_result:
+        assert attempt_result is None
+        assert final["status"] == DocumentStatus.PENDING.value
+        assert "worker_id" not in final
+        assert "attempt_count" not in final or final["attempt_count"] == 0
+    else:
+        assert attempt_result == 1
+        assert final["status"] == DocumentStatus.PROCESSING.value
+        assert final["attempt_count"] == 1
+        assert _normalize_datetime(final["last_attempt_at"]) == now
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_release_races_terminal_completion_with_one_winner(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=0
+    )
+    repository = ProcessingRepository(db)
+    attempt_number = await repository.record_ms2_attempt(
+        *_retry_owner_arguments(claimed)
+    )
+    barrier = asyncio.Barrier(2)
+
+    # Esta carrera comprueba exclusión atómica; no recomienda liberar mientras
+    # todavía pueda aceptarse el resultado de una llamada HTTP.
+    async def release_after_barrier():
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await repository.release_for_circuit_open(
+            *_retry_owner_arguments(claimed),
+            attempt_number,
+            now + timedelta(seconds=5),
+        )
+
+    async def complete_after_barrier():
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await repository.complete_processing(
+            *_retry_owner_arguments(claimed),
+            attempt_number,
+            "accepted extraction",
+            1,
+        )
+
+    release_result, completion_result = await asyncio.gather(
+        release_after_barrier(),
+        complete_after_barrier(),
+    )
+
+    final = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert release_result != completion_result
+    if release_result:
+        assert final["status"] == DocumentStatus.PENDING.value
+        assert "worker_id" not in final
+    else:
+        assert final["status"] == DocumentStatus.COMPLETED.value
+        assert final["content"] == "accepted extraction"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_previous_owner_cannot_write_after_retry_claim_is_replaced(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, old_claim, now, cycle_id = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=0
+    )
+    repository = ProcessingRepository(db)
+    attempt_number = await repository.record_ms2_attempt(
+        *_retry_owner_arguments(old_claim)
+    )
+    scheduled_at = now + timedelta(seconds=5)
+    assert await repository.schedule_transient_retry(
+        *_retry_owner_arguments(old_claim),
+        attempt_number,
+        "ms2_http_504",
+        scheduled_at,
+    ) is True
+    _freeze_claim_clock(monkeypatch, scheduled_at)
+    new_claim = await repository.claim_pending("replacement-worker")
+    assert new_claim is not None
+    assert new_claim.fencing_token != old_claim.fencing_token
+    assert new_claim.processing_cycle_id == cycle_id
+    before = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+
+    assert await repository.renew_processing_lease(
+        old_claim.id, old_claim.worker_id, old_claim.fencing_token
+    ) is False
+    assert await repository.record_ms2_attempt(
+        *_retry_owner_arguments(old_claim)
+    ) is None
+    assert await repository.complete_processing(
+        *_retry_owner_arguments(old_claim),
+        attempt_number,
+        "stale result",
+        1,
+    ) is False
+    assert await repository.fail_processing(
+        *_retry_owner_arguments(old_claim),
+        attempt_number,
+        "pdf_unprocessable",
+    ) is False
+    assert await repository.fail_exhausted_processing(
+        *_retry_owner_arguments(old_claim)
+    ) is False
+    assert await repository.release_for_circuit_open(
+        *_retry_owner_arguments(old_claim),
+        attempt_number,
+        scheduled_at + timedelta(seconds=5),
+    ) is False
+    assert await repository.schedule_transient_retry(
+        *_retry_owner_arguments(old_claim),
+        attempt_number,
+        "ms2_http_504",
+        scheduled_at + timedelta(seconds=5),
+    ) is False
+    after = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_transient_retry_rejects_fifth_attempt_and_incoherent_attempt_metadata(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=5
+    )
+    collection = db[settings.mongo_collection]
+    await collection.update_one(
+        {"_id": document["document_id"]},
+        {"$set": {"last_attempt_at": now}},
+    )
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    exhausted = await ProcessingRepository(db).schedule_transient_retry(
+        *_retry_owner_arguments(claimed),
+        5,
+        "ms2_http_500",
+        now + timedelta(seconds=8),
+    )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert exhausted is False
+    assert after == before
+
+    exhausted_open = await ProcessingRepository(db).release_for_circuit_open(
+        *_retry_owner_arguments(claimed),
+        5,
+        now + timedelta(seconds=8),
+    )
+    exhausted_open_after = await collection.find_one(
+        {"_id": document["document_id"]}
+    )
+    assert exhausted_open is False
+    assert exhausted_open_after == before
+
+    await collection.update_one(
+        {"_id": document["document_id"]},
+        {"$set": {"attempt_count": "3"}},
+    )
+    await collection.update_one(
+        {"_id": document["document_id"]},
+        {"$set": {"last_attempt_at": now}},
+    )
+    malformed_before = await collection.find_one(
+        {"_id": document["document_id"]}
+    )
+    malformed = await ProcessingRepository(db).release_for_circuit_open(
+        *_retry_owner_arguments(claimed),
+        3,
+        now + timedelta(seconds=8),
+    )
+    malformed_after = await collection.find_one(
+        {"_id": document["document_id"]}
+    )
+    assert malformed is False
+    assert malformed_after == malformed_before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_fourth_transient_attempt_can_be_released_and_stale_counter_cannot(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    repository = ProcessingRepository(db)
+    doc_four, claim_four, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=3, worker_id="retry-fourth"
+    )
+    attempt_four = await repository.record_ms2_attempt(
+        *_retry_owner_arguments(claim_four)
+    )
+    assert attempt_four == 4
+    assert await repository.schedule_transient_retry(
+        *_retry_owner_arguments(claim_four),
+        4,
+        "ms2_http_503",
+        now + timedelta(seconds=8),
+    ) is True
+    persisted_four = await db[settings.mongo_collection].find_one(
+        {"_id": doc_four["document_id"]}
+    )
+    assert persisted_four["status"] == DocumentStatus.PENDING.value
+    assert persisted_four["attempt_count"] == 4
+
+    doc_stale, claim_stale, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=0, worker_id="retry-stale-counter"
+    )
+    assert await repository.record_ms2_attempt(
+        *_retry_owner_arguments(claim_stale)
+    ) == 1
+    before = await db[settings.mongo_collection].find_one(
+        {"_id": doc_stale["document_id"]}
+    )
+
+    stale_release = await repository.release_for_circuit_open(
+        *_retry_owner_arguments(claim_stale),
+        0,
+        now + timedelta(seconds=8),
+    )
+
+    after = await db[settings.mongo_collection].find_one(
+        {"_id": doc_stale["document_id"]}
+    )
+    assert stale_release is False
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("operation", ["schedule_transient_retry", "release_for_circuit_open"])
+@pytest.mark.asyncio
+async def test_retry_operations_reject_exactly_exhausted_cycle_without_mutation(
+    testing_context, monkeypatch, operation
+):
+    db, resources = testing_context
+    document, claimed, now, _ = await _claim_processing_document(
+        db, resources, monkeypatch, attempt_count=2, worker_id=f"window-{operation}"
+    )
+    started_at = now - timedelta(minutes=10)
+    retry_at = now + timedelta(seconds=30)
+    updated = await db[settings.mongo_collection].update_one(
+        {"_id": document["document_id"]},
+        {
+            "$set": {
+                "processing_cycle_started_at": started_at,
+                "last_attempt_at": now + timedelta(seconds=5),
+                "next_retry_at": retry_at,
+            }
+        },
+    )
+    assert updated.matched_count == 1
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document["document_id"]})
+    assert before["status"] == DocumentStatus.PROCESSING.value
+    assert before["processing_cycle_id"] == claimed.processing_cycle_id
+    assert before["processing_cycle_started_at"] == started_at.replace(tzinfo=None)
+    assert before["attempt_count"] == 2
+    assert isinstance(before["last_attempt_at"], datetime)
+    assert _normalize_datetime(before["lease_until"]) >= now
+    assert before["worker_id"] == claimed.worker_id
+    assert before["fencing_token"] == claimed.fencing_token
+    assert before["next_retry_at"] == retry_at.replace(tzinfo=None)
+
+    if operation == "schedule_transient_retry":
+        result = await ProcessingRepository(db).schedule_transient_retry(
+            *_retry_owner_arguments(claimed),
+            2,
+            "ms2_timeout",
+            retry_at,
+        )
+    else:
+        result = await ProcessingRepository(db).release_for_circuit_open(
+            *_retry_owner_arguments(claimed),
+            2,
+            retry_at,
+        )
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert result is False
+    assert after == before
+
+
 @pytest.mark.parametrize(
     ("case", "set_fields", "unset_fields"),
     [
