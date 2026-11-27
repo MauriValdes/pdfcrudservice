@@ -1572,3 +1572,406 @@ async def test_complete_processing_propagates_cancellation_without_retry(
     repo.collection.find_one.assert_not_awaited()
     repo.collection.find_one_and_update.assert_not_awaited()
     repo.collection.update_many.assert_not_awaited()
+
+
+_RED_FAILURE_MESSAGES = {
+    "ms2_invalid_input": "El archivo PDF no es válido.",
+    "pdf_too_large": "El archivo PDF supera el tamaño máximo permitido.",
+    "pdf_unprocessable": "No se pudo procesar el archivo PDF.",
+}
+_RED_EXHAUSTION_MESSAGES = {
+    "attempts_exhausted": "Se agotaron los intentos de procesamiento.",
+    "cycle_window_exhausted": "Se agotó el tiempo disponible para el procesamiento.",
+}
+
+
+def _terminal_common_guards(now):
+    return [
+        {"$eq": [{"$type": "$status"}, "string"]},
+        {"$eq": [{"$type": "$worker_id"}, "string"]},
+        {"$eq": [{"$type": "$fencing_token"}, "string"]},
+        {"$eq": [{"$type": "$lease_until"}, "date"]},
+        {"$gte": ["$lease_until", now]},
+        _existing_cycle_expression(now),
+        {"$in": [{"$type": "$updated_at"}, ["missing", "null", "date"]]},
+        {"$in": [{"$type": "$completed_at"}, ["missing", "null"]]},
+        {"$in": [{"$type": "$failed_at"}, ["missing", "null"]]},
+        {"$in": [{"$type": "$next_retry_at"}, ["missing", "null", "date"]]},
+    ]
+
+
+def _terminal_arguments(document_id=None):
+    return (
+        str(document_id or ObjectId()),
+        "worker-a",
+        "fencing-a",
+        "cycle-a",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_code", "public_message"),
+    list(_RED_FAILURE_MESSAGES.items()),
+)
+async def test_fail_processing_builds_atomic_literal_safe_update(
+    monkeypatch, repo_with_mocks, failure_code, public_message
+):
+    calls = []
+    raw_now = NOW.replace(microsecond=987654)
+    normalized_now = NOW.replace(microsecond=987000)
+
+    class CountingDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            calls.append(tz)
+            assert tz is timezone.utc
+            return raw_now
+
+    monkeypatch.setattr(processing_repository, "datetime", CountingDateTime)
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 1
+    document_id = ObjectId()
+
+    result = await repo.fail_processing(
+        *_terminal_arguments(document_id), 3, failure_code
+    )
+
+    assert result is True
+    assert calls == [timezone.utc]
+    query, update = repo.collection.update_one.call_args.args
+    assert query == {
+        "_id": document_id,
+        "status": "processing",
+        "worker_id": "worker-a",
+        "fencing_token": "fencing-a",
+        "processing_cycle_id": "cycle-a",
+        "$expr": {
+            "$and": [
+                *_terminal_common_guards(normalized_now),
+                {"$in": [{"$type": "$attempt_count"}, ["int", "long"]]},
+                {"$eq": ["$attempt_count", 3]},
+                {"$eq": [{"$type": "$last_attempt_at"}, "date"]},
+            ]
+        },
+    }
+    assert update == [
+        {
+            "$set": {
+                "status": {"$literal": "failed"},
+                "error_message": {"$literal": public_message},
+                "last_error": {"$literal": failure_code},
+                "failed_at": {"$literal": normalized_now},
+                "updated_at": {
+                    "$max": [
+                        {
+                            "$ifNull": [
+                                "$updated_at",
+                                {"$literal": normalized_now},
+                            ]
+                        },
+                        {"$literal": normalized_now},
+                    ]
+                },
+            }
+        },
+        {
+            "$unset": [
+                "lease_until",
+                "next_retry_at",
+                "completed_at",
+                "content",
+                "page_count",
+            ]
+        },
+    ]
+    assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+    repo.collection.find.assert_not_called()
+    repo.collection.update_many.assert_not_awaited()
+    repo.collection.replace_one.assert_not_awaited()
+    repo.collection.aggregate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fail_exhausted_processing_builds_atomic_priority_pipeline(
+    monkeypatch, repo_with_mocks
+):
+    calls = []
+    raw_now = NOW.replace(microsecond=345678)
+    normalized_now = NOW.replace(microsecond=345000)
+
+    class CountingDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            calls.append(tz)
+            assert tz is timezone.utc
+            return raw_now
+
+    monkeypatch.setattr(processing_repository, "datetime", CountingDateTime)
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 1
+    document_id = ObjectId()
+    attempts_exhausted = {
+        "$and": [
+            {"$in": [{"$type": "$attempt_count"}, ["int", "long"]]},
+            {"$eq": ["$attempt_count", 5]},
+        ]
+    }
+    valid_attempt_state = {
+        "$or": [
+            {
+                "$and": [
+                    {"$eq": [{"$type": "$attempt_count"}, "missing"]},
+                    {
+                        "$in": [
+                            {"$type": "$last_attempt_at"},
+                            ["missing", "null"],
+                        ]
+                    },
+                ]
+            },
+            {
+                "$and": [
+                    {"$in": [{"$type": "$attempt_count"}, ["int", "long"]]},
+                    {"$eq": ["$attempt_count", 0]},
+                    {
+                        "$in": [
+                            {"$type": "$last_attempt_at"},
+                            ["missing", "null"],
+                        ]
+                    },
+                ]
+            },
+            {
+                "$and": [
+                    {"$in": [{"$type": "$attempt_count"}, ["int", "long"]]},
+                    {"$gte": ["$attempt_count", 1]},
+                    {"$lte": ["$attempt_count", 5]},
+                    {"$eq": [{"$type": "$last_attempt_at"}, "date"]},
+                ]
+            },
+        ]
+    }
+    window_exhausted = {
+        "$lte": [
+            "$processing_cycle_started_at",
+            normalized_now - timedelta(minutes=10),
+        ]
+    }
+
+    result = await repo.fail_exhausted_processing(*_terminal_arguments(document_id))
+
+    assert result is True
+    assert calls == [timezone.utc]
+    query, update = repo.collection.update_one.call_args.args
+    assert query == {
+        "_id": document_id,
+        "status": "processing",
+        "worker_id": "worker-a",
+        "fencing_token": "fencing-a",
+        "processing_cycle_id": "cycle-a",
+        "$expr": {
+            "$and": [
+                *_terminal_common_guards(normalized_now),
+                valid_attempt_state,
+                {"$or": [attempts_exhausted, window_exhausted]},
+            ]
+        },
+    }
+    assert update == [
+        {
+            "$set": {
+                "status": {"$literal": "failed"},
+                "error_message": {
+                    "$cond": [
+                        attempts_exhausted,
+                        {"$literal": _RED_EXHAUSTION_MESSAGES["attempts_exhausted"]},
+                        {
+                            "$literal": _RED_EXHAUSTION_MESSAGES[
+                                "cycle_window_exhausted"
+                            ]
+                        },
+                    ]
+                },
+                "last_error": {
+                    "$cond": [
+                        attempts_exhausted,
+                        {"$literal": "attempts_exhausted"},
+                        {"$literal": "cycle_window_exhausted"},
+                    ]
+                },
+                "failed_at": {"$literal": normalized_now},
+                "updated_at": {
+                    "$max": [
+                        {
+                            "$ifNull": [
+                                "$updated_at",
+                                {"$literal": normalized_now},
+                            ]
+                        },
+                        {"$literal": normalized_now},
+                    ]
+                },
+            }
+        },
+        {
+            "$unset": [
+                "lease_until",
+                "next_retry_at",
+                "completed_at",
+                "content",
+                "page_count",
+            ]
+        },
+    ]
+    assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("attempt_number", "failure_code"),
+    [
+        (0, "ms2_invalid_input"),
+        (6, "ms2_invalid_input"),
+        (True, "ms2_invalid_input"),
+        (1.0, "ms2_invalid_input"),
+        (1, "attempts_exhausted"),
+        (1, "cycle_window_exhausted"),
+        (1, "$where"),
+        (1, ["ms2_invalid_input"]),
+        (1, RuntimeError("do not persist exception text")),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fail_processing_rejects_unapproved_arguments_without_mongodb(
+    repo_with_mocks, fixed_clock, attempt_number, failure_code
+):
+    repo = repo_with_mocks
+    with pytest.raises(ValueError):
+        await repo.fail_processing(
+            *_terminal_arguments(), attempt_number, failure_code
+        )
+    repo.collection.update_one.assert_not_awaited()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["fail_processing", "fail_exhausted_processing"],
+)
+@pytest.mark.parametrize(
+    ("argument_index", "invalid_value"),
+    [
+        (0, None),
+        (0, "not-an-object-id"),
+        (1, ""),
+        (1, 3),
+        (2, ""),
+        (2, None),
+        (3, ""),
+        (3, []),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_failure_rejects_invalid_shared_arguments_without_mongodb(
+    repo_with_mocks, fixed_clock, operation, argument_index, invalid_value
+):
+    repo = repo_with_mocks
+    arguments = list(_terminal_arguments())
+    if operation == "fail_processing":
+        arguments.extend([1, "ms2_invalid_input"])
+    arguments[argument_index] = invalid_value
+
+    with pytest.raises(ValueError):
+        await getattr(repo, operation)(*arguments)
+    repo.collection.update_one.assert_not_awaited()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+    repo.collection.find.assert_not_called()
+    repo.collection.update_many.assert_not_awaited()
+    repo.collection.replace_one.assert_not_awaited()
+    repo.collection.aggregate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("fail_processing", lambda: (*_terminal_arguments(), 1, "ms2_invalid_input")),
+        ("fail_exhausted_processing", lambda: _terminal_arguments()),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_failure_operations_return_false_without_extra_operations(
+    repo_with_mocks, fixed_clock, operation, arguments
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 0
+
+    result = await getattr(repo, operation)(*arguments())
+
+    assert result is False
+    repo.collection.update_one.assert_awaited_once()
+    assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+    repo.collection.find.assert_not_called()
+    repo.collection.update_many.assert_not_awaited()
+    repo.collection.replace_one.assert_not_awaited()
+    repo.collection.aggregate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        ("fail_processing", lambda: (*_terminal_arguments(), 1, "ms2_invalid_input")),
+        ("fail_exhausted_processing", lambda: _terminal_arguments()),
+    ],
+)
+@pytest.mark.parametrize(
+    "write_error",
+    [
+        ServerSelectionTimeoutError("unavailable"),
+        AutoReconnect("unavailable"),
+        ConnectionFailure("unavailable"),
+        NetworkTimeout("unavailable"),
+        WriteConcernError("write concern was not confirmed"),
+        WTimeoutError("write concern timed out"),
+        RuntimeError("unexpected terminal write failure"),
+        asyncio.CancelledError(),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_failure_operations_preserve_error_contract_without_retry(
+    repo_with_mocks, fixed_clock, operation, arguments, write_error
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.side_effect = write_error
+    method = getattr(repo, operation)
+
+    if isinstance(
+        write_error,
+        (
+            ServerSelectionTimeoutError,
+            AutoReconnect,
+            ConnectionFailure,
+            NetworkTimeout,
+        ),
+    ):
+        with pytest.raises(DatabaseUnavailableError) as raised:
+            await method(*arguments())
+        assert raised.value.__cause__ is write_error
+    else:
+        with pytest.raises(type(write_error)) as raised:
+            await method(*arguments())
+        assert raised.value is write_error
+
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+    repo.collection.update_many.assert_not_awaited()

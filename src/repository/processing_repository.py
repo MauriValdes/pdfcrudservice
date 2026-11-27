@@ -22,6 +22,17 @@ _UNAVAILABLE_ERRORS = (
     NetworkTimeout,
 )
 
+_FAILURE_PUBLIC_MESSAGES = {
+    "ms2_invalid_input": "El archivo PDF no es válido.",
+    "pdf_too_large": "El archivo PDF supera el tamaño máximo permitido.",
+    "pdf_unprocessable": "No se pudo procesar el archivo PDF.",
+}
+
+_EXHAUSTION_PUBLIC_MESSAGES = {
+    "attempts_exhausted": "Se agotaron los intentos de procesamiento.",
+    "cycle_window_exhausted": "Se agotó el tiempo disponible para el procesamiento.",
+}
+
 _PRIOR_PROCESSING_METADATA_FIELDS = (
     "last_attempt_at",
     "last_error",
@@ -91,6 +102,59 @@ def _existing_cycle_expression(now: datetime) -> dict:
             {"$eq": [{"$type": "$processing_cycle_started_at"}, "date"]},
             {"$lte": ["$processing_cycle_started_at", now]},
         ]
+    }
+
+
+def _processing_terminal_query(
+    object_id,
+    worker_id: str,
+    fencing_token: str,
+    processing_cycle_id: str,
+    now: datetime,
+    operation_guards: list[dict],
+) -> dict:
+    """Compose common atomic ownership and state guards for terminal writes."""
+    return {
+        "_id": object_id,
+        "status": "processing",
+        "worker_id": worker_id,
+        "fencing_token": fencing_token,
+        "processing_cycle_id": processing_cycle_id,
+        "$expr": {
+            "$and": [
+                {"$eq": [{"$type": "$status"}, "string"]},
+                {"$eq": [{"$type": "$worker_id"}, "string"]},
+                {"$eq": [{"$type": "$fencing_token"}, "string"]},
+                {"$eq": [{"$type": "$lease_until"}, "date"]},
+                {"$gte": ["$lease_until", now]},
+                _existing_cycle_expression(now),
+                {
+                    "$in": [
+                        {"$type": "$updated_at"},
+                        ["missing", "null", "date"],
+                    ]
+                },
+                {
+                    "$in": [
+                        {"$type": "$completed_at"},
+                        ["missing", "null"],
+                    ]
+                },
+                {
+                    "$in": [
+                        {"$type": "$failed_at"},
+                        ["missing", "null"],
+                    ]
+                },
+                {
+                    "$in": [
+                        {"$type": "$next_retry_at"},
+                        ["missing", "null", "date"],
+                    ]
+                },
+                *operation_guards,
+            ]
+        },
     }
 
 
@@ -527,6 +591,249 @@ class ProcessingRepository:
                     "error_message",
                     "last_error",
                     "failed_at",
+                ]
+            },
+        ]
+
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        return result.matched_count == 1
+
+    async def fail_processing(
+        self,
+        document_id: str,
+        worker_id: str,
+        fencing_token: str,
+        processing_cycle_id: str,
+        attempt_number: int,
+        failure_code: str,
+    ) -> bool:
+        """Persist a permanent failure for a previously authorized, concluded attempt."""
+        if not isinstance(document_id, str) or not ObjectId.is_valid(document_id):
+            raise ValueError("Identificador de documento inválido")
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("Identificador de worker inválido")
+        if not isinstance(fencing_token, str) or not fencing_token:
+            raise ValueError("Token de fencing inválido")
+        if not isinstance(processing_cycle_id, str) or not processing_cycle_id:
+            raise ValueError("Identificador de ciclo inválido")
+        if type(attempt_number) is not int or not 1 <= attempt_number <= 5:
+            raise ValueError("Número de intento inválido")
+        if not isinstance(failure_code, str):
+            raise ValueError("Código de fallo inválido")
+        if failure_code not in _FAILURE_PUBLIC_MESSAGES:
+            raise ValueError("Código de fallo inválido")
+
+        object_id = ObjectId(document_id)
+        captured_now = datetime.now(timezone.utc)
+        now = captured_now.replace(
+            microsecond=(captured_now.microsecond // 1000) * 1000
+        )
+        operation_guards = [
+            {"$in": [{"$type": "$attempt_count"}, ["int", "long"]]},
+            {"$eq": ["$attempt_count", attempt_number]},
+            {"$eq": [{"$type": "$last_attempt_at"}, "date"]},
+        ]
+        query = _processing_terminal_query(
+            object_id,
+            worker_id,
+            fencing_token,
+            processing_cycle_id,
+            now,
+            operation_guards,
+        )
+        update = [
+            {
+                "$set": {
+                    "status": {"$literal": "failed"},
+                    "error_message": {
+                        "$literal": _FAILURE_PUBLIC_MESSAGES[failure_code]
+                    },
+                    "last_error": {"$literal": failure_code},
+                    "failed_at": {"$literal": now},
+                    "updated_at": {
+                        "$max": [
+                            {
+                                "$ifNull": [
+                                    "$updated_at",
+                                    {"$literal": now},
+                                ]
+                            },
+                            {"$literal": now},
+                        ]
+                    },
+                }
+            },
+            {
+                "$unset": [
+                    "lease_until",
+                    "next_retry_at",
+                    "completed_at",
+                    "content",
+                    "page_count",
+                ]
+            },
+        ]
+
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        return result.matched_count == 1
+
+    async def fail_exhausted_processing(
+        self,
+        document_id: str,
+        worker_id: str,
+        fencing_token: str,
+        processing_cycle_id: str,
+    ) -> bool:
+        """Fail an exhausted budget only after the caller rules out pending results.
+
+        The repository cannot observe the state of remote HTTP calls.
+        """
+        if not isinstance(document_id, str) or not ObjectId.is_valid(document_id):
+            raise ValueError("Identificador de documento inválido")
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("Identificador de worker inválido")
+        if not isinstance(fencing_token, str) or not fencing_token:
+            raise ValueError("Token de fencing inválido")
+        if not isinstance(processing_cycle_id, str) or not processing_cycle_id:
+            raise ValueError("Identificador de ciclo inválido")
+
+        object_id = ObjectId(document_id)
+        captured_now = datetime.now(timezone.utc)
+        now = captured_now.replace(
+            microsecond=(captured_now.microsecond // 1000) * 1000
+        )
+        attempts_exhausted = {
+            "$and": [
+                {"$in": [{"$type": "$attempt_count"}, ["int", "long"]]},
+                {"$eq": ["$attempt_count", 5]},
+            ]
+        }
+        window_exhausted = {
+            "$lte": [
+                "$processing_cycle_started_at",
+                now - timedelta(minutes=10),
+            ]
+        }
+        valid_attempt_state = {
+            "$or": [
+                {
+                    "$and": [
+                        {"$eq": [{"$type": "$attempt_count"}, "missing"]},
+                        {
+                            "$in": [
+                                {"$type": "$last_attempt_at"},
+                                ["missing", "null"],
+                            ]
+                        },
+                    ]
+                },
+                {
+                    "$and": [
+                        {
+                            "$in": [
+                                {"$type": "$attempt_count"},
+                                ["int", "long"],
+                            ]
+                        },
+                        {"$eq": ["$attempt_count", 0]},
+                        {
+                            "$in": [
+                                {"$type": "$last_attempt_at"},
+                                ["missing", "null"],
+                            ]
+                        },
+                    ]
+                },
+                {
+                    "$and": [
+                        {
+                            "$in": [
+                                {"$type": "$attempt_count"},
+                                ["int", "long"],
+                            ]
+                        },
+                        {"$gte": ["$attempt_count", 1]},
+                        {"$lte": ["$attempt_count", 5]},
+                        {"$eq": [{"$type": "$last_attempt_at"}, "date"]},
+                    ]
+                },
+            ]
+        }
+        operation_guards = [
+            valid_attempt_state,
+            {"$or": [attempts_exhausted, window_exhausted]},
+        ]
+        query = _processing_terminal_query(
+            object_id,
+            worker_id,
+            fencing_token,
+            processing_cycle_id,
+            now,
+            operation_guards,
+        )
+        update = [
+            {
+                "$set": {
+                    "status": {"$literal": "failed"},
+                    "error_message": {
+                        "$cond": [
+                            attempts_exhausted,
+                            {
+                                "$literal": _EXHAUSTION_PUBLIC_MESSAGES[
+                                    "attempts_exhausted"
+                                ]
+                            },
+                            {
+                                "$literal": _EXHAUSTION_PUBLIC_MESSAGES[
+                                    "cycle_window_exhausted"
+                                ]
+                            },
+                        ]
+                    },
+                    "last_error": {
+                        "$cond": [
+                            attempts_exhausted,
+                            {"$literal": "attempts_exhausted"},
+                            {"$literal": "cycle_window_exhausted"},
+                        ]
+                    },
+                    "failed_at": {"$literal": now},
+                    "updated_at": {
+                        "$max": [
+                            {
+                                "$ifNull": [
+                                    "$updated_at",
+                                    {"$literal": now},
+                                ]
+                            },
+                            {"$literal": now},
+                        ]
+                    },
+                }
+            },
+            {
+                "$unset": [
+                    "lease_until",
+                    "next_retry_at",
+                    "completed_at",
+                    "content",
+                    "page_count",
                 ]
             },
         ]
