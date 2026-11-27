@@ -399,6 +399,7 @@ async def test_atomic_authorization_none_stops_before_http_and_persistence(
     document = _document(attempt_count=5)
     repository, gridfs, ms2 = _dependencies()
     repository.record_ms2_attempt.return_value = None
+    repository.fail_exhausted_processing.return_value = False
 
     outcome = await processor.process_claimed_document(
         document,
@@ -410,9 +411,15 @@ async def test_atomic_authorization_none_stops_before_http_and_persistence(
     assert outcome is processor.ProcessingResult.ATTEMPT_NOT_AUTHORIZED
     processor.read_claimed_pdf.assert_awaited_once()
     repository.record_ms2_attempt.assert_awaited_once()
+    repository.fail_exhausted_processing.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+    )
     ms2.extract.assert_not_awaited()
     repository.complete_processing.assert_not_awaited()
-    repository.fail_exhausted_processing.assert_not_awaited()
+    repository.fail_processing.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -434,6 +441,7 @@ async def test_authorization_exception_propagates_without_retry_or_http(monkeypa
 
     assert raised.value is error
     repository.record_ms2_attempt.assert_awaited_once()
+    repository.fail_exhausted_processing.assert_not_awaited()
     ms2.extract.assert_not_awaited()
     repository.complete_processing.assert_not_awaited()
 
@@ -464,14 +472,13 @@ async def test_snapshot_attempt_count_never_replaces_atomic_authorization(
 @pytest.mark.parametrize(
     "error",
     [
-        MS2HTTPError(422, "permanent_input", None),
         MS2TransportError("timeout"),
         MS2InvalidResponseError("invalid response"),
     ],
-    ids=["http-error", "transport-error", "invalid-success-response"],
+    ids=["transport-error", "invalid-success-response"],
 )
 @pytest.mark.asyncio
-async def test_ms2_errors_propagate_without_terminal_persistence(
+async def test_transport_and_invalid_response_errors_propagate_without_terminal_persistence(
     monkeypatch, error
 ):
     processor = _load_processor()
@@ -494,6 +501,294 @@ async def test_ms2_errors_propagate_without_terminal_persistence(
     repository.complete_processing.assert_not_awaited()
     repository.fail_processing.assert_not_awaited()
     repository.schedule_transient_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "failure_code"),
+    [
+        (400, "ms2_invalid_input"),
+        (413, "pdf_too_large"),
+        (422, "pdf_unprocessable"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("confirmed", "expected"),
+    [
+        (True, "FAILED_PERMANENT"),
+        (False, "RESULT_NOT_CONFIRMED"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_known_permanent_http_errors_persist_once_with_exact_failure_code(
+    monkeypatch,
+    status_code,
+    failure_code,
+    confirmed,
+    expected,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    attempt_number = 4
+    repository.record_ms2_attempt.return_value = attempt_number
+    repository.fail_processing.return_value = confirmed
+    error = MS2HTTPError(status_code, "permanent_input", None)
+    ms2.extract.side_effect = error
+
+    outcome = await processor.process_claimed_document(
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+    )
+
+    assert outcome is getattr(processor.ProcessingResult, expected)
+    repository.record_ms2_attempt.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+    )
+    ms2.extract.assert_awaited_once_with(b"%PDF-test", document.filename)
+    repository.fail_processing.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+        attempt_number,
+        failure_code,
+    )
+    repository.complete_processing.assert_not_awaited()
+    repository.fail_exhausted_processing.assert_not_awaited()
+    repository.schedule_transient_retry.assert_not_awaited()
+    repository.release_for_circuit_open.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_permanent_failure_write_exception_propagates_without_repeating(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 2
+    error = DatabaseUnavailableError("permanent failure acknowledgement uncertain")
+    repository.fail_processing.side_effect = error
+    ms2.extract.side_effect = MS2HTTPError(413, "permanent_input", None)
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert raised.value is error
+    ms2.extract.assert_awaited_once()
+    repository.fail_processing.assert_awaited_once()
+    repository.complete_processing.assert_not_awaited()
+    repository.fail_exhausted_processing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_none_authorization_confirms_exhaustion_when_conditional_write_matches(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document(attempt_count=5)
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = None
+    repository.fail_exhausted_processing.return_value = True
+
+    outcome = await processor.process_claimed_document(
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+    )
+
+    assert outcome is processor.ProcessingResult.FAILED_EXHAUSTED
+    repository.record_ms2_attempt.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+    )
+    repository.fail_exhausted_processing.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+    )
+    ms2.extract.assert_not_awaited()
+    repository.complete_processing.assert_not_awaited()
+    repository.fail_processing.assert_not_awaited()
+    repository.schedule_transient_retry.assert_not_awaited()
+    repository.release_for_circuit_open.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_write_exception_propagates_without_http(monkeypatch):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = None
+    error = DatabaseUnavailableError("exhaustion write unavailable")
+    repository.fail_exhausted_processing.side_effect = error
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert raised.value is error
+    repository.record_ms2_attempt.assert_awaited_once()
+    repository.fail_exhausted_processing.assert_awaited_once()
+    ms2.extract.assert_not_awaited()
+    repository.complete_processing.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        MS2HTTPError(503, "transient", "3"),
+        MS2HTTPError(404, "unclassified", None),
+        MS2HTTPError(400, "unclassified", None),
+        MS2HTTPError(404, "permanent_input", None),
+    ],
+    ids=[
+        "transient-http",
+        "unclassified-http",
+        "known-status-wrong-classification",
+        "permanent-classification-unmapped-status",
+    ],
+)
+@pytest.mark.asyncio
+async def test_nonpermanent_or_mismatched_http_errors_propagate_unchanged(
+    monkeypatch, error
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    ms2.extract.side_effect = error
+
+    with pytest.raises(MS2HTTPError) as raised:
+        await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert raised.value is error
+    ms2.extract.assert_awaited_once()
+    repository.fail_processing.assert_not_awaited()
+    repository.fail_exhausted_processing.assert_not_awaited()
+    repository.complete_processing.assert_not_awaited()
+    repository.schedule_transient_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ms2_http_error_outside_extract_is_not_treated_as_permanent(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    error = MS2HTTPError(400, "permanent_input", None)
+    repository.record_ms2_attempt.side_effect = error
+
+    with pytest.raises(MS2HTTPError) as raised:
+        await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert raised.value is error
+    repository.record_ms2_attempt.assert_awaited_once()
+    ms2.extract.assert_not_awaited()
+    repository.fail_processing.assert_not_awaited()
+    repository.fail_exhausted_processing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_permanent_failure_wins_concurrent_heartbeat_completion(
+    monkeypatch,
+):
+    processor = _load_processor()
+    from src.worker.heartbeat import run_with_heartbeat
+
+    periodic_renewal_started = asyncio.Event()
+    release_periodic_renewal = asyncio.Event()
+    failure_persisted = asyncio.Event()
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 1
+    ms2.extract.side_effect = MS2HTTPError(422, "permanent_input", None)
+
+    async def renew(*_args):
+        if repository.renew_processing_lease.await_count == 1:
+            return True
+        periodic_renewal_started.set()
+        await release_periodic_renewal.wait()
+        return False
+
+    async def fail_processing(*_args):
+        await periodic_renewal_started.wait()
+        failure_persisted.set()
+        release_periodic_renewal.set()
+        return True
+
+    repository.renew_processing_lease.side_effect = renew
+    repository.fail_processing.side_effect = fail_processing
+
+    async def fast_heartbeat(
+        snapshot,
+        *,
+        processing_repository,
+        operation,
+    ):
+        return await run_with_heartbeat(
+            snapshot,
+            processing_repository=processing_repository,
+            operation=operation,
+            heartbeat_interval_seconds=0.001,
+        )
+
+    monkeypatch.setattr(processor, "run_with_heartbeat", fast_heartbeat)
+    monkeypatch.setattr(
+        processor,
+        "read_claimed_pdf",
+        AsyncMock(return_value=b"%PDF-test"),
+    )
+
+    outcome = await asyncio.wait_for(
+        processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        ),
+        timeout=1.0,
+    )
+
+    assert outcome is processor.ProcessingResult.FAILED_PERMANENT
+    assert failure_persisted.is_set()
+    assert periodic_renewal_started.is_set()
+    repository.fail_processing.assert_awaited_once()
+    repository.complete_processing.assert_not_awaited()
 
 
 @pytest.mark.asyncio

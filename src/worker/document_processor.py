@@ -8,8 +8,15 @@ from src.models.document import DocumentModel
 from src.repository.gridfs_repository import GridFSRepository
 from src.repository.processing_repository import ProcessingRepository
 from src.worker.heartbeat import run_with_heartbeat
-from src.worker.ms2_client import MS2Client
+from src.worker.ms2_client import MS2Client, MS2HTTPError
 from src.worker.pdf_reader import read_claimed_pdf
+
+
+_PERMANENT_FAILURE_CODES = {
+    400: "ms2_invalid_input",
+    413: "pdf_too_large",
+    422: "pdf_unprocessable",
+}
 
 
 class ProcessingResult(Enum):
@@ -18,6 +25,8 @@ class ProcessingResult(Enum):
     COMPLETED = "completed"
     ATTEMPT_NOT_AUTHORIZED = "attempt_not_authorized"
     RESULT_NOT_CONFIRMED = "result_not_confirmed"
+    FAILED_PERMANENT = "failed_permanent"
+    FAILED_EXHAUSTED = "failed_exhausted"
 
 
 async def process_claimed_document(
@@ -30,7 +39,9 @@ async def process_claimed_document(
     """Process one claimed document with at most one authorized MS2 extraction.
 
     The caller is responsible for preventing concurrent invocations for the
-    same claim. Cancellation cannot establish whether remote effects occurred.
+    same claim. When deciding exhaustion, no other processing for the claim or
+    acceptable authorized result may be pending for this acquisition.
+    Cancellation cannot establish whether remote effects occurred.
     """
     snapshot = document.model_copy(deep=True)
 
@@ -78,12 +89,45 @@ async def process_claimed_document(
             processing_cycle_id,
         )
         if attempt_number is None:
+            confirmed = await processing_repository.fail_exhausted_processing(
+                document_id,
+                worker_id,
+                fencing_token,
+                processing_cycle_id,
+            )
+
+            if confirmed:
+                return ProcessingResult.FAILED_EXHAUSTED
+
             return ProcessingResult.ATTEMPT_NOT_AUTHORIZED
 
-        result = await ms2_client.extract(
-            pdf_bytes,
-            filename,
-        )
+        try:
+            result = await ms2_client.extract(
+                pdf_bytes,
+                filename,
+            )
+        except MS2HTTPError as error:
+            failure_code = _PERMANENT_FAILURE_CODES.get(error.status_code)
+
+            if (
+                error.classification != "permanent_input"
+                or failure_code is None
+            ):
+                raise
+
+            confirmed = await processing_repository.fail_processing(
+                document_id,
+                worker_id,
+                fencing_token,
+                processing_cycle_id,
+                attempt_number,
+                failure_code,
+            )
+
+            if confirmed:
+                return ProcessingResult.FAILED_PERMANENT
+
+            return ProcessingResult.RESULT_NOT_CONFIRMED
 
         confirmed = await processing_repository.complete_processing(
             document_id,
