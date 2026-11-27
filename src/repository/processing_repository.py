@@ -419,3 +419,125 @@ class ProcessingRepository:
             return None
 
         return int(document_data["attempt_count"])
+
+    async def complete_processing(
+        self,
+        document_id: str,
+        worker_id: str,
+        fencing_token: str,
+        processing_cycle_id: str,
+        attempt_number: int,
+        content: str,
+        page_count: int,
+    ) -> bool:
+        if not isinstance(document_id, str) or not ObjectId.is_valid(document_id):
+            raise ValueError("Identificador de documento inválido")
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("Identificador de worker inválido")
+        if not isinstance(fencing_token, str) or not fencing_token:
+            raise ValueError("Token de fencing inválido")
+        if not isinstance(processing_cycle_id, str) or not processing_cycle_id:
+            raise ValueError("Identificador de ciclo inválido")
+        if type(attempt_number) is not int or not 1 <= attempt_number <= 5:
+            raise ValueError("Número de intento inválido")
+        if not isinstance(content, str):
+            raise ValueError("El contenido debe ser texto")
+        if type(page_count) is not int or not 0 <= page_count <= 2**63 - 1:
+            raise ValueError("Número de páginas inválido")
+
+        object_id = ObjectId(document_id)
+        captured_now = datetime.now(timezone.utc)
+        now = captured_now.replace(
+            microsecond=(captured_now.microsecond // 1000) * 1000
+        )
+
+        query = {
+            "_id": object_id,
+            "status": "processing",
+            "worker_id": worker_id,
+            "fencing_token": fencing_token,
+            "processing_cycle_id": processing_cycle_id,
+            "$expr": {
+                "$and": [
+                    {"$eq": [{"$type": "$status"}, "string"]},
+                    {"$eq": [{"$type": "$worker_id"}, "string"]},
+                    {"$eq": [{"$type": "$fencing_token"}, "string"]},
+                    {"$eq": [{"$type": "$lease_until"}, "date"]},
+                    {"$gte": ["$lease_until", now]},
+                    _existing_cycle_expression(now),
+                    {
+                        "$in": [
+                            {"$type": "$attempt_count"},
+                            ["int", "long"],
+                        ]
+                    },
+                    {"$eq": ["$attempt_count", attempt_number]},
+                    {"$eq": [{"$type": "$last_attempt_at"}, "date"]},
+                    {
+                        "$in": [
+                            {"$type": "$updated_at"},
+                            ["missing", "null", "date"],
+                        ]
+                    },
+                    {
+                        "$in": [
+                            {"$type": "$completed_at"},
+                            ["missing", "null"],
+                        ]
+                    },
+                    {
+                        "$in": [
+                            {"$type": "$next_retry_at"},
+                            ["missing", "null", "date"],
+                        ]
+                    },
+                    {
+                        "$in": [
+                            {"$type": "$failed_at"},
+                            ["missing", "null"],
+                        ]
+                    },
+                ]
+            },
+        }
+        update = [
+            {
+                "$set": {
+                    "content": {"$literal": content},
+                    "page_count": {"$literal": page_count},
+                    "status": {"$literal": "completed"},
+                    "completed_at": {"$literal": now},
+                    "updated_at": {
+                        "$max": [
+                            {
+                                "$ifNull": [
+                                    "$updated_at",
+                                    {"$literal": now},
+                                ]
+                            },
+                            {"$literal": now},
+                        ]
+                    },
+                }
+            },
+            {
+                "$unset": [
+                    "lease_until",
+                    "next_retry_at",
+                    "error_message",
+                    "last_error",
+                    "failed_at",
+                ]
+            },
+        ]
+
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        return result.matched_count == 1
