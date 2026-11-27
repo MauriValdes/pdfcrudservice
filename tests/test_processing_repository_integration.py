@@ -4345,6 +4345,418 @@ async def test_fail_processing_claim_authorized_attempt_and_preserve_original_pd
     assert await gridfs.read(document["file_id"]) == document["pdf_bytes"]
 
 
+async def _insert_completed_cleanup_candidate(
+    db,
+    resources,
+    *,
+    fields=None,
+    unset_fields=(),
+):
+    """Crea un documento fixture completed con identidad de limpieza conocida."""
+    fixture = await _insert_processing_completion_document(
+        db,
+        resources,
+        fields={
+            "content": "",
+            "page_count": 0,
+            "completed_at": FIXED_NOW,
+            "original_cleanup_status": "pending",
+            "original_deleted_at": None,
+            **(fields or {}),
+        },
+        unset_fields=unset_fields,
+    )
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]},
+        {"file_id": 1},
+    )
+    status = (fields or {}).get("status", DocumentStatus.COMPLETED.value)
+    result = await db[settings.mongo_collection].update_one(
+        {"_id": fixture["document_id"]},
+        {"$set": {"status": status}},
+    )
+    assert result.matched_count == 1
+    return {**fixture, "file_id": persisted["file_id"]}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_validate_original_cleanup_candidate_accepts_exact_pending_identity(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_completed_cleanup_candidate(db, resources)
+
+    result = await ProcessingRepository(db).validate_original_cleanup_candidate(
+        str(fixture["document_id"]),
+        fixture["processing_cycle_id"],
+        FIXED_NOW,
+        fixture["file_id"],
+    )
+
+    assert result is True
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cleanup_primitives_recover_gridfs_delete_before_confirm_without_reextracting(
+    testing_context, monkeypatch
+):
+    """Prueba primitivas con recursos controlados; no autoriza una ruta operativa."""
+    db, resources = testing_context
+    document, claimed, now, cycle_id, attempt_number = (
+        await _claim_and_record_processing_attempt(db, resources, monkeypatch)
+    )
+    repository = ProcessingRepository(db)
+    content = "resultado persistido sin reextracción"
+    completed = await repository.complete_processing(
+        claimed.id,
+        claimed.worker_id,
+        claimed.fencing_token,
+        cycle_id,
+        attempt_number,
+        content,
+        2,
+    )
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert completed is True
+
+    candidate = await repository.validate_original_cleanup_candidate(
+        claimed.id,
+        cycle_id,
+        now,
+        document["file_id"],
+    )
+    assert candidate is True
+
+    from src.repository.gridfs_cleanup_repository import GridFSCleanupRepository
+
+    cleanup_repository = GridFSCleanupRepository(
+        db,
+        gridfs_repository=GridFSRepository(db),
+    )
+    # Interrupción simulada: se elimina y verifica, pero aún no se confirma metadata.
+    assert (
+        await cleanup_repository.delete_and_verify_absent(document["file_id"])
+        is True
+    )
+    after_first_delete = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert after_first_delete["status"] == DocumentStatus.COMPLETED.value
+    assert after_first_delete["original_cleanup_status"] == "pending"
+    assert after_first_delete["original_deleted_at"] is None
+    assert after_first_delete == persisted
+    assert await db["fs.files"].find_one({"_id": document["file_id"]}) is None
+    assert (
+        await db["fs.chunks"].find_one({"files_id": document["file_id"]})
+        is None
+    )
+    # Validar de nuevo antes de repetir el borrado exacto tras la interrupción.
+    assert (
+        await repository.validate_original_cleanup_candidate(
+            claimed.id,
+            cycle_id,
+            now,
+            document["file_id"],
+        )
+        is True
+    )
+    # Recuperación idempotente: vuelve a comprobar ausencia antes de confirmar.
+    assert (
+        await cleanup_repository.delete_and_verify_absent(document["file_id"])
+        is True
+    )
+
+    confirmed_at = now + timedelta(seconds=1, microseconds=456789)
+    confirmation = await repository.confirm_original_cleanup(
+        claimed.id,
+        cycle_id,
+        now,
+        document["file_id"],
+        confirmed_at,
+    )
+    after_first_confirmation = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    allowed_confirmation_fields = {
+        "original_cleanup_status",
+        "original_deleted_at",
+        "updated_at",
+    }
+    assert {
+        key: value
+        for key, value in after_first_confirmation.items()
+        if key not in allowed_confirmation_fields
+    } == {
+        key: value
+        for key, value in persisted.items()
+        if key not in allowed_confirmation_fields
+    }
+    repeated_confirmation = await repository.confirm_original_cleanup(
+        claimed.id,
+        cycle_id,
+        now,
+        document["file_id"],
+        confirmed_at + timedelta(seconds=1),
+    )
+    after = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+
+    assert confirmation is processing_repository.CleanupConfirmation.CONFIRMED
+    assert (
+        repeated_confirmation
+        is processing_repository.CleanupConfirmation.ALREADY_CONFIRMED
+    )
+    assert after == after_first_confirmation
+    assert after["status"] == DocumentStatus.COMPLETED.value
+    assert after["content"] == persisted["content"] == content
+    assert after["page_count"] == persisted["page_count"] == 2
+    assert after["file_id"] == persisted["file_id"] == document["file_id"]
+    assert after["original_cleanup_status"] == "completed"
+    assert _normalize_datetime(after["original_deleted_at"]) == (
+        confirmed_at.replace(
+            microsecond=(confirmed_at.microsecond // 1000) * 1000
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "fields", "unset_fields", "identity_override"),
+    [
+        ("not-completed", {"status": DocumentStatus.PENDING.value}, (), {}),
+        (
+            "legacy-marker",
+            {},
+            ("original_cleanup_status",),
+            {},
+        ),
+        (
+            "wrong-cycle",
+            {},
+            (),
+            {"processing_cycle_id": "stale-cycle"},
+        ),
+        (
+            "wrong-completed-at",
+            {},
+            (),
+            {"completed_at": FIXED_NOW + timedelta(milliseconds=1)},
+        ),
+        ("wrong-file-id", {}, (), {"file_id": ObjectId()}),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_validate_original_cleanup_candidate_rejects_stale_or_legacy_identity(
+    testing_context,
+    monkeypatch,
+    case,
+    fields,
+    unset_fields,
+    identity_override,
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_completed_cleanup_candidate(
+        db,
+        resources,
+        fields=fields,
+        unset_fields=unset_fields,
+    )
+    cycle_id = identity_override.get(
+        "processing_cycle_id", fixture["processing_cycle_id"]
+    )
+    completed_at = identity_override.get("completed_at", FIXED_NOW)
+    file_id = identity_override.get("file_id", fixture["file_id"])
+
+    result = await ProcessingRepository(db).validate_original_cleanup_candidate(
+        str(fixture["document_id"]),
+        cycle_id,
+        completed_at,
+        file_id,
+    )
+
+    assert result is False, case
+
+
+@pytest.mark.parametrize("reference_shape", ["scalar", "array"])
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_validate_original_cleanup_candidate_rejects_reference_in_any_state(
+    testing_context, monkeypatch, reference_shape
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_completed_cleanup_candidate(db, resources)
+    referenced_file_id = (
+        fixture["file_id"]
+        if reference_shape == "scalar"
+        else [fixture["file_id"]]
+    )
+    await _insert_raw_pending(
+        db,
+        resources,
+        fields={
+            "status": DocumentStatus.FAILED.value,
+            "file_id": referenced_file_id,
+        },
+    )
+
+    result = await ProcessingRepository(db).validate_original_cleanup_candidate(
+        str(fixture["document_id"]),
+        fixture["processing_cycle_id"],
+        FIXED_NOW,
+        fixture["file_id"],
+    )
+
+    assert result is False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_concurrent_calls_preserve_first_timestamp(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_completed_cleanup_candidate(db, resources)
+    repository = ProcessingRepository(db)
+    confirmed_at_values = [
+        FIXED_NOW + timedelta(seconds=1, microseconds=789456),
+        FIXED_NOW + timedelta(seconds=2, microseconds=123987),
+    ]
+    barrier = asyncio.Barrier(2)
+
+    async def confirm(confirmed_at):
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        result = await repository.confirm_original_cleanup(
+            str(fixture["document_id"]),
+            fixture["processing_cycle_id"],
+            FIXED_NOW,
+            fixture["file_id"],
+            confirmed_at,
+        )
+        return result, confirmed_at
+
+    results = await asyncio.gather(
+        *(confirm(confirmed_at) for confirmed_at in confirmed_at_values)
+    )
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+
+    confirmation = processing_repository.CleanupConfirmation
+    assert sorted(result.value for result, _ in results) == sorted(
+        [
+            confirmation.CONFIRMED.value,
+            confirmation.ALREADY_CONFIRMED.value,
+        ]
+    )
+    winning_timestamps = [
+        confirmed_at
+        for result, confirmed_at in results
+        if result is confirmation.CONFIRMED
+    ]
+    assert len(winning_timestamps) == 1
+    assert persisted["status"] == DocumentStatus.COMPLETED.value
+    assert persisted["original_cleanup_status"] == "completed"
+    assert _normalize_datetime(persisted["original_deleted_at"]) == (
+        winning_timestamps[0].replace(
+            microsecond=(winning_timestamps[0].microsecond // 1000) * 1000
+        )
+    )
+    assert _normalize_datetime(persisted["updated_at"]) >= _normalize_datetime(
+        persisted["original_deleted_at"]
+    )
+    assert persisted["file_id"] == fixture["file_id"]
+    assert persisted["content"] == ""
+    assert persisted["page_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("case", "fields", "supplied_cycle_id"),
+    [
+        ("stale-cycle", {}, "different-cycle"),
+        ("invalid-marker", {"original_cleanup_status": "not-pending"}, None),
+        ("boolean-page-count", {"page_count": True}, None),
+        ("negative-page-count", {"page_count": -1}, None),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cleanup_candidate_and_confirmation_reject_malformed_or_stale_document_unchanged(
+    testing_context,
+    monkeypatch,
+    case,
+    fields,
+    supplied_cycle_id,
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_completed_cleanup_candidate(
+        db,
+        resources,
+        fields=fields,
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": fixture["document_id"]})
+    cycle_id = supplied_cycle_id or fixture["processing_cycle_id"]
+    repository = ProcessingRepository(db)
+
+    candidate = await repository.validate_original_cleanup_candidate(
+        str(fixture["document_id"]),
+        cycle_id,
+        FIXED_NOW,
+        fixture["file_id"],
+    )
+    confirmation = await repository.confirm_original_cleanup(
+        str(fixture["document_id"]),
+        cycle_id,
+        FIXED_NOW,
+        fixture["file_id"],
+        FIXED_NOW + timedelta(seconds=1),
+    )
+    after = await collection.find_one({"_id": fixture["document_id"]})
+
+    assert candidate is False, case
+    assert confirmation is processing_repository.CleanupConfirmation.STALE, case
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_keeps_future_updated_at_monotonic(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_completed_cleanup_candidate(db, resources)
+    future_updated_at = FIXED_NOW + timedelta(days=3, microseconds=789000)
+    await db[settings.mongo_collection].update_one(
+        {"_id": fixture["document_id"]},
+        {"$set": {"updated_at": future_updated_at}},
+    )
+
+    result = await ProcessingRepository(db).confirm_original_cleanup(
+        str(fixture["document_id"]),
+        fixture["processing_cycle_id"],
+        FIXED_NOW,
+        fixture["file_id"],
+        FIXED_NOW + timedelta(seconds=1),
+    )
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+
+    assert result is processing_repository.CleanupConfirmation.CONFIRMED
+    assert _normalize_datetime(persisted["updated_at"]) == future_updated_at
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_fail_processing_allows_concluded_attempt_after_window_with_live_lease(

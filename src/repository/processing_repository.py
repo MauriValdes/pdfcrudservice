@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from uuid import uuid4
 
 from bson import ObjectId
@@ -23,6 +24,114 @@ _UNAVAILABLE_ERRORS = (
 )
 
 _DATETIME_TYPE = datetime
+
+
+class CleanupConfirmation(Enum):
+    CONFIRMED = "confirmed"
+    ALREADY_CONFIRMED = "already_confirmed"
+    STALE = "stale"
+
+
+def _validated_cleanup_arguments(
+    document_id: str,
+    processing_cycle_id: str,
+    completed_at: datetime,
+    file_id: ObjectId,
+    *,
+    confirmed_at: datetime | None = None,
+    validate_confirmed_at: bool = False,
+) -> tuple[ObjectId, str, datetime, ObjectId, datetime | None]:
+    """Validate cleanup identity and normalize supplied BSON dates."""
+    if not isinstance(document_id, str) or not ObjectId.is_valid(document_id):
+        raise ValueError("Identificador de documento inválido")
+    if not isinstance(processing_cycle_id, str) or not processing_cycle_id:
+        raise ValueError("Identificador de ciclo inválido")
+    if not isinstance(file_id, ObjectId):
+        raise ValueError("Identificador GridFS inválido")
+
+    def normalize(value: datetime, field_name: str) -> datetime:
+        if not isinstance(value, _DATETIME_TYPE):
+            raise ValueError(f"{field_name} debe ser datetime")
+        try:
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"{field_name} debe incluir timezone")
+            value = value.astimezone(timezone.utc)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(f"{field_name} debe incluir timezone válido") from error
+        return value.replace(microsecond=(value.microsecond // 1000) * 1000)
+
+    normalized_completed_at = normalize(completed_at, "completed_at")
+    normalized_confirmed_at = (
+        normalize(confirmed_at, "confirmed_at")
+        if validate_confirmed_at
+        else None
+    )
+    return (
+        ObjectId(document_id),
+        processing_cycle_id,
+        normalized_completed_at,
+        file_id,
+        normalized_confirmed_at,
+    )
+
+
+def _cleanup_identity_query(
+    document_object_id: ObjectId,
+    processing_cycle_id: str,
+    completed_at: datetime,
+    file_id: ObjectId,
+    *,
+    marker: str,
+    confirmation: bool = False,
+) -> dict:
+    """Build the exact candidate or reconciliation identity filter."""
+    guards = [
+        {"$eq": [{"$type": "$status"}, "string"]},
+        {"$eq": [{"$type": "$processing_cycle_id"}, "string"]},
+        {"$eq": [{"$type": "$completed_at"}, "date"]},
+        {"$eq": [{"$type": "$file_id"}, "objectId"]},
+        {"$eq": [{"$type": "$content"}, "string"]},
+        {"$in": [{"$type": "$page_count"}, ["int", "long"]]},
+        {"$gte": ["$page_count", 0]},
+        {
+            "$eq": [
+                {"$type": "$original_cleanup_status"},
+                "string",
+            ]
+        },
+    ]
+    if marker == "pending":
+        guards.append(
+            {
+                "$in": [
+                    {"$type": "$original_deleted_at"},
+                    ["missing", "null"],
+                ]
+            }
+        )
+        if confirmation:
+            guards.append(
+                {
+                    "$in": [
+                        {"$type": "$updated_at"},
+                        ["missing", "null", "date"],
+                    ]
+                }
+            )
+    else:
+        guards.append(
+            {"$eq": [{"$type": "$original_deleted_at"}, "date"]}
+        )
+
+    return {
+        "_id": document_object_id,
+        "status": "completed",
+        "processing_cycle_id": processing_cycle_id,
+        "completed_at": completed_at,
+        "file_id": file_id,
+        "original_cleanup_status": marker,
+        "$expr": {"$and": guards},
+    }
 
 _TRANSIENT_RETRY_CODES = frozenset(
     {
@@ -1128,3 +1237,141 @@ class ProcessingRepository:
             raise DatabaseUnavailableError() from error
 
         return result.matched_count == 1
+
+    async def validate_original_cleanup_candidate(
+        self,
+        document_id: str,
+        processing_cycle_id: str,
+        completed_at: datetime,
+        file_id: ObjectId,
+    ) -> bool:
+        """Check a pending cleanup candidate and point-in-time references only.
+
+        This read-only check neither authorizes deletion nor closes races with
+        concurrent writers; callers must enforce the external safety policy.
+        """
+        (
+            document_object_id,
+            normalized_cycle_id,
+            normalized_completed_at,
+            normalized_file_id,
+            _,
+        ) = _validated_cleanup_arguments(
+            document_id,
+            processing_cycle_id,
+            completed_at,
+            file_id,
+        )
+        query = _cleanup_identity_query(
+            document_object_id,
+            normalized_cycle_id,
+            normalized_completed_at,
+            normalized_file_id,
+            marker="pending",
+        )
+        try:
+            candidate = await self.collection.find_one(query, {"_id": 1})
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+        if candidate is None:
+            return False
+
+        reference_query = {
+            "_id": {"$ne": document_object_id},
+            "file_id": {"$in": [normalized_file_id]},
+        }
+        try:
+            reference = await self.collection.find_one(reference_query, {"_id": 1})
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+        return reference is None
+
+    async def confirm_original_cleanup(
+        self,
+        document_id: str,
+        processing_cycle_id: str,
+        completed_at: datetime,
+        file_id: ObjectId,
+        confirmed_at: datetime,
+    ) -> CleanupConfirmation:
+        """Conditionally record cleanup confirmation without claiming exactly-once.
+
+        The physical deletion and any required durable audit authorization are
+        external preconditions; this method only updates confirmation metadata.
+        """
+        (
+            document_object_id,
+            normalized_cycle_id,
+            normalized_completed_at,
+            normalized_file_id,
+            normalized_confirmed_at,
+        ) = _validated_cleanup_arguments(
+            document_id,
+            processing_cycle_id,
+            completed_at,
+            file_id,
+            confirmed_at=confirmed_at,
+            validate_confirmed_at=True,
+        )
+        query = _cleanup_identity_query(
+            document_object_id,
+            normalized_cycle_id,
+            normalized_completed_at,
+            normalized_file_id,
+            marker="pending",
+            confirmation=True,
+        )
+        update = [
+            {
+                "$set": {
+                    "original_cleanup_status": {
+                        "$literal": "completed"
+                    },
+                    "original_deleted_at": {
+                        "$literal": normalized_confirmed_at
+                    },
+                    "updated_at": {
+                        "$max": [
+                            {
+                                "$ifNull": [
+                                    "$updated_at",
+                                    {"$literal": normalized_confirmed_at},
+                                ]
+                            },
+                            {"$literal": normalized_confirmed_at},
+                        ]
+                    },
+                }
+            }
+        ]
+        try:
+            result = await self.collection.update_one(
+                query,
+                update,
+                upsert=False,
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+
+        if result.matched_count == 1:
+            return CleanupConfirmation.CONFIRMED
+        if result.matched_count != 0:
+            return CleanupConfirmation.STALE
+
+        reconciliation_query = _cleanup_identity_query(
+            document_object_id,
+            normalized_cycle_id,
+            normalized_completed_at,
+            normalized_file_id,
+            marker="completed",
+        )
+        try:
+            reconciled = await self.collection.find_one(
+                reconciliation_query,
+                {"_id": 1},
+            )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
+        if reconciled is not None:
+            return CleanupConfirmation.ALREADY_CONFIRMED
+        return CleanupConfirmation.STALE

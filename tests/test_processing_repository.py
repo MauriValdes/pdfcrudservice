@@ -32,6 +32,11 @@ class FrozenDateTime:
         return NOW
 
 
+class NoOffsetTZ(tzinfo):
+    def utcoffset(self, dt):
+        return None
+
+
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 
 
@@ -2409,3 +2414,460 @@ async def test_retry_operations_preserve_single_write_error_contract(
     assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
     repo.collection.find_one.assert_not_awaited()
     repo.collection.find_one_and_update.assert_not_awaited()
+
+
+def _cleanup_identity():
+    return (
+        str(ObjectId()),
+        "cleanup-cycle",
+        datetime(2026, 1, 2, 3, 4, 5, 654321, tzinfo=timezone.utc),
+        ObjectId(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_validate_original_cleanup_candidate_uses_exact_identity_and_read_only_queries(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    document_id, cycle_id, completed_at, file_id = _cleanup_identity()
+    document_object_id = ObjectId(document_id)
+    normalized_completed_at = completed_at.replace(microsecond=654000)
+    repo.collection.find_one.side_effect = [{"_id": document_object_id}, None]
+
+    result = await repo.validate_original_cleanup_candidate(
+        document_id,
+        cycle_id,
+        completed_at,
+        file_id,
+    )
+
+    assert result is True
+    candidate_query, projection = repo.collection.find_one.await_args_list[0].args
+    assert candidate_query == {
+        "_id": document_object_id,
+        "status": "completed",
+        "processing_cycle_id": cycle_id,
+        "completed_at": normalized_completed_at,
+        "file_id": file_id,
+        "original_cleanup_status": "pending",
+        "$expr": {
+            "$and": [
+                {"$eq": [{"$type": "$status"}, "string"]},
+                {"$eq": [{"$type": "$processing_cycle_id"}, "string"]},
+                {"$eq": [{"$type": "$completed_at"}, "date"]},
+                {"$eq": [{"$type": "$file_id"}, "objectId"]},
+                {"$eq": [{"$type": "$content"}, "string"]},
+                {"$in": [{"$type": "$page_count"}, ["int", "long"]]},
+                {"$gte": ["$page_count", 0]},
+                {
+                    "$eq": [
+                        {"$type": "$original_cleanup_status"},
+                        "string",
+                    ]
+                },
+                {
+                    "$in": [
+                        {"$type": "$original_deleted_at"},
+                        ["missing", "null"],
+                    ]
+                },
+            ]
+        },
+    }
+    assert projection == {"_id": 1}
+    reference_query = repo.collection.find_one.await_args_list[1].args[0]
+    assert reference_query == {
+        "_id": {"$ne": document_object_id},
+        "file_id": {"$in": [file_id]},
+    }
+    assert repo.collection.find_one.await_count == 2
+    repo.collection.update_one.assert_not_awaited()
+    repo.collection.update_many.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+
+
+@pytest.mark.parametrize("reference", ["scalar", "array"])
+@pytest.mark.asyncio
+async def test_validate_original_cleanup_candidate_rejects_shared_reference(
+    repo_with_mocks, reference
+):
+    repo = repo_with_mocks
+    document_id, cycle_id, completed_at, file_id = _cleanup_identity()
+    external_document = {"_id": ObjectId()}
+    if reference == "array":
+        external_document["file_id"] = [file_id]
+    else:
+        external_document["file_id"] = file_id
+    repo.collection.find_one.side_effect = [
+        {"_id": ObjectId(document_id)},
+        external_document,
+    ]
+
+    result = await repo.validate_original_cleanup_candidate(
+        document_id,
+        cycle_id,
+        completed_at,
+        file_id,
+    )
+
+    assert result is False
+    assert repo.collection.find_one.await_count == 2
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("document_id", "cycle_id", "completed_at", "file_id"),
+    [
+        ("invalid-object-id", "cleanup-cycle", NOW, ObjectId()),
+        (str(ObjectId()), "", NOW, ObjectId()),
+        (str(ObjectId()), "cleanup-cycle", NOW.replace(tzinfo=None), ObjectId()),
+        (str(ObjectId()), "cleanup-cycle", NOW, "not-an-object-id"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_validate_original_cleanup_candidate_rejects_invalid_arguments_before_mongo(
+    repo_with_mocks, document_id, cycle_id, completed_at, file_id
+):
+    repo = repo_with_mocks
+
+    with pytest.raises(ValueError):
+        await repo.validate_original_cleanup_candidate(
+            document_id,
+            cycle_id,
+            completed_at,
+            file_id,
+        )
+
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_original_cleanup_candidate_translates_mongo_unavailability(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    repo.collection.find_one.side_effect = AutoReconnect("MongoDB unavailable")
+    document_id, cycle_id, completed_at, file_id = _cleanup_identity()
+
+    with pytest.raises(DatabaseUnavailableError):
+        await repo.validate_original_cleanup_candidate(
+            document_id,
+            cycle_id,
+            completed_at,
+            file_id,
+        )
+
+    repo.collection.find_one.assert_awaited_once()
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validate_original_cleanup_candidate_propagates_cancellation(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    cancellation = asyncio.CancelledError()
+    repo.collection.find_one.side_effect = cancellation
+    document_id, cycle_id, completed_at, file_id = _cleanup_identity()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await repo.validate_original_cleanup_candidate(
+            document_id,
+            cycle_id,
+            completed_at,
+            file_id,
+        )
+
+    assert raised.value is cancellation
+    repo.collection.find_one.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_builds_conditional_monotonic_single_write(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    document_id, cycle_id, completed_at, file_id = _cleanup_identity()
+    normalized_completed_at = completed_at.replace(microsecond=654000)
+    confirmed_at = datetime(
+        2026, 1, 2, 3, 5, 6, 789456, tzinfo=timezone(timedelta(hours=2))
+    )
+    normalized_confirmed_at = confirmed_at.astimezone(timezone.utc).replace(
+        microsecond=789000
+    )
+    repo.collection.update_one.return_value.matched_count = 1
+
+    result = await repo.confirm_original_cleanup(
+        document_id,
+        cycle_id,
+        completed_at,
+        file_id,
+        confirmed_at,
+    )
+
+    assert result is processing_repository.CleanupConfirmation.CONFIRMED
+    query, update = repo.collection.update_one.call_args.args
+    assert query == {
+        "_id": ObjectId(document_id),
+        "status": "completed",
+        "processing_cycle_id": cycle_id,
+        "completed_at": normalized_completed_at,
+        "file_id": file_id,
+        "original_cleanup_status": "pending",
+        "$expr": {
+            "$and": [
+                {"$eq": [{"$type": "$status"}, "string"]},
+                {"$eq": [{"$type": "$processing_cycle_id"}, "string"]},
+                {"$eq": [{"$type": "$completed_at"}, "date"]},
+                {"$eq": [{"$type": "$file_id"}, "objectId"]},
+                {"$eq": [{"$type": "$content"}, "string"]},
+                {"$in": [{"$type": "$page_count"}, ["int", "long"]]},
+                {"$gte": ["$page_count", 0]},
+                {
+                    "$eq": [
+                        {"$type": "$original_cleanup_status"},
+                        "string",
+                    ]
+                },
+                {
+                    "$in": [
+                        {"$type": "$original_deleted_at"},
+                        ["missing", "null"],
+                    ]
+                },
+                {
+                    "$in": [
+                        {"$type": "$updated_at"},
+                        ["missing", "null", "date"],
+                    ]
+                },
+            ]
+        },
+    }
+    assert update == [
+        {
+            "$set": {
+                "original_cleanup_status": {"$literal": "completed"},
+                "original_deleted_at": {"$literal": normalized_confirmed_at},
+                "updated_at": {
+                    "$max": [
+                        {
+                            "$ifNull": [
+                                "$updated_at",
+                                {"$literal": normalized_confirmed_at},
+                            ]
+                        },
+                        {"$literal": normalized_confirmed_at},
+                    ]
+                },
+            }
+        }
+    ]
+    assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.update_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_recognizes_same_completed_identity_without_rewrite(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    document_id, cycle_id, completed_at, file_id = _cleanup_identity()
+    normalized_completed_at = completed_at.replace(microsecond=654000)
+    repo.collection.update_one.return_value.matched_count = 0
+    document_object_id = ObjectId(document_id)
+    repo.collection.find_one.return_value = {"_id": document_object_id}
+
+    result = await repo.confirm_original_cleanup(
+        document_id,
+        cycle_id,
+        completed_at,
+        file_id,
+        NOW,
+    )
+
+    assert result is processing_repository.CleanupConfirmation.ALREADY_CONFIRMED
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_awaited_once()
+    assert repo.collection.find_one.await_args.args[0] == {
+        "_id": document_object_id,
+        "status": "completed",
+        "processing_cycle_id": cycle_id,
+        "completed_at": normalized_completed_at,
+        "file_id": file_id,
+        "original_cleanup_status": "completed",
+        "$expr": {
+            "$and": [
+                {"$eq": [{"$type": "$status"}, "string"]},
+                {"$eq": [{"$type": "$processing_cycle_id"}, "string"]},
+                {"$eq": [{"$type": "$completed_at"}, "date"]},
+                {"$eq": [{"$type": "$file_id"}, "objectId"]},
+                {"$eq": [{"$type": "$content"}, "string"]},
+                {"$in": [{"$type": "$page_count"}, ["int", "long"]]},
+                {"$gte": ["$page_count", 0]},
+                {
+                    "$eq": [
+                        {"$type": "$original_cleanup_status"},
+                        "string",
+                    ]
+                },
+                {"$eq": [{"$type": "$original_deleted_at"}, "date"]},
+            ]
+        },
+    }
+    assert repo.collection.find_one.await_args.args[1] == {"_id": 1}
+
+
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_returns_stale_for_nonmatching_identity(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 0
+    repo.collection.find_one.return_value = None
+
+    result = await repo.confirm_original_cleanup(
+        *_cleanup_identity(),
+        NOW,
+    )
+
+    assert result is processing_repository.CleanupConfirmation.STALE
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("document_id", "cycle_id", "completed_at", "file_id", "confirmed_at"),
+    [
+        ("invalid-object-id", "cycle", NOW, ObjectId(), NOW),
+        (str(ObjectId()), "", NOW, ObjectId(), NOW),
+        (str(ObjectId()), "cycle", NOW.replace(tzinfo=None), ObjectId(), NOW),
+        (str(ObjectId()), "cycle", NOW, "not-an-object-id", NOW),
+        (str(ObjectId()), "cycle", NOW, ObjectId(), NOW.replace(tzinfo=None)),
+        (
+            str(ObjectId()),
+            "cycle",
+            NOW,
+            ObjectId(),
+            NOW.replace(tzinfo=NoOffsetTZ()),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_rejects_invalid_arguments_before_mongo(
+    repo_with_mocks,
+    document_id,
+    cycle_id,
+    completed_at,
+    file_id,
+    confirmed_at,
+):
+    repo = repo_with_mocks
+
+    with pytest.raises(ValueError):
+        await repo.confirm_original_cleanup(
+            document_id,
+            cycle_id,
+            completed_at,
+            file_id,
+            confirmed_at,
+        )
+
+    repo.collection.find_one.assert_not_awaited()
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_translates_reconciliation_connectivity_error(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 0
+    read_error = AutoReconnect("reconciliation unavailable")
+    repo.collection.find_one.side_effect = read_error
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await repo.confirm_original_cleanup(*_cleanup_identity(), NOW)
+
+    assert raised.value.__cause__ is read_error
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_propagates_ambiguous_write_error_for_retry(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    write_error = AutoReconnect("write response lost")
+    repo.collection.update_one.side_effect = write_error
+    identity = _cleanup_identity()
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await repo.confirm_original_cleanup(*identity, NOW)
+
+    assert raised.value.__cause__ is write_error
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "write_error",
+    [
+        WriteConcernError("write concern was not confirmed"),
+        RuntimeError("unexpected cleanup confirmation error"),
+        asyncio.CancelledError(),
+    ],
+)
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_preserves_nonconnectivity_errors_and_cancellation(
+    repo_with_mocks, write_error
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.side_effect = write_error
+    identity = _cleanup_identity()
+
+    with pytest.raises(type(write_error)) as raised:
+        await repo.confirm_original_cleanup(*identity, NOW)
+
+    assert raised.value is write_error
+    repo.collection.update_one.assert_awaited_once()
+    repo.collection.find_one.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_original_cleanup_reconciles_ambiguous_write_on_later_call(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    document_id, cycle_id, completed_at, file_id = _cleanup_identity()
+    write_error = AutoReconnect("first confirmation response lost")
+    repo.collection.update_one.side_effect = [
+        write_error,
+        MagicMock(matched_count=0),
+    ]
+    repo.collection.find_one.return_value = {
+        "_id": ObjectId(document_id),
+        "status": "completed",
+        "processing_cycle_id": cycle_id,
+        "completed_at": completed_at.replace(microsecond=654000),
+        "file_id": file_id,
+        "content": "preserved",
+        "page_count": 1,
+        "original_cleanup_status": "completed",
+        "original_deleted_at": NOW,
+    }
+    arguments = (document_id, cycle_id, completed_at, file_id, NOW)
+
+    with pytest.raises(DatabaseUnavailableError):
+        await repo.confirm_original_cleanup(*arguments)
+
+    result = await repo.confirm_original_cleanup(*arguments)
+
+    assert result is processing_repository.CleanupConfirmation.ALREADY_CONFIRMED
+    assert repo.collection.update_one.await_count == 2
+    repo.collection.find_one.assert_awaited_once()
