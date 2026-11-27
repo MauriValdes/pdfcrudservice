@@ -55,3 +55,9 @@ class DocumentModel(BaseModel):
     next_retry_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     failed_at: Optional[datetime] = None
+
+    # Estado interno de limpieza: None, "pending" o "completed".
+    original_cleanup_status: Optional[str] = None
+    # Instante en que se confirma la ausencia del PDF original y sus chunks.
+    original_deleted_at: Optional[datetime] = None
+    # file_id se conserva como referencia histórica tras confirmar la limpieza.
