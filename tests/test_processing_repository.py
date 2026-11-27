@@ -72,6 +72,99 @@ def _set_stage(update):
     return update[0]["$set"]
 
 
+def _new_cycle_expression():
+    no_cycle_id = {
+        "$in": [
+            {"$type": "$processing_cycle_id"},
+            ["missing", "null"],
+        ]
+    }
+    no_cycle_started_at = {
+        "$in": [
+            {"$type": "$processing_cycle_started_at"},
+            ["missing", "null"],
+        ]
+    }
+    no_prior_processing_metadata = {
+        "$and": [
+            {
+                "$in": [
+                    {"$type": f"${field}"},
+                    ["missing", "null"],
+                ]
+            }
+            for field in (
+                "last_attempt_at",
+                "last_error",
+                "completed_at",
+                "failed_at",
+                "next_retry_at",
+                "worker_id",
+                "lease_until",
+                "heartbeat_at",
+                "fencing_token",
+            )
+        ]
+    }
+    valid_initial_attempt_count = {
+        "$cond": [
+            {
+                "$in": [
+                    {"$type": "$attempt_count"},
+                    ["missing", "int", "long"],
+                ]
+            },
+            {"$eq": [{"$ifNull": ["$attempt_count", 0]}, 0]},
+            False,
+        ]
+    }
+    return {
+        "$and": [
+            no_cycle_id,
+            no_cycle_started_at,
+            valid_initial_attempt_count,
+            no_prior_processing_metadata,
+        ]
+    }
+
+
+def _existing_cycle_expression(now=NOW):
+    return {
+        "$and": [
+            {"$eq": [{"$type": "$processing_cycle_id"}, "string"]},
+            {"$ne": ["$processing_cycle_id", ""]},
+            {"$eq": [{"$type": "$processing_cycle_started_at"}, "date"]},
+            {"$lte": ["$processing_cycle_started_at", now]},
+        ]
+    }
+
+
+def _cycle_eligibility_expression(now=NOW):
+    return {
+        "$or": [
+            _new_cycle_expression(),
+            _existing_cycle_expression(now),
+        ]
+    }
+
+
+def _claim_update_parts(update):
+    assert isinstance(update, list)
+    assert len(update) == 1
+    assert "$replaceWith" in update[0], (
+        "claim_pending debe usar una actualización condicional conjunta "
+        "de los dos campos del ciclo"
+    )
+    root = update[0]["$replaceWith"]["$let"]
+    merge_objects = root["in"]["$mergeObjects"]
+    return (
+        root["vars"]["initialize_cycle"],
+        merge_objects[1]["$cond"],
+        merge_objects[2],
+        merge_objects,
+    )
+
+
 def _literal_value(expression):
     if isinstance(expression, dict) and "$literal" in expression:
         return expression["$literal"]
@@ -81,7 +174,8 @@ def _literal_value(expression):
 def _claimed_document(
     *,
     file_id=None,
-    processing_cycle_id=None,
+    processing_cycle_id="cycle-existing",
+    processing_cycle_started_at=NOW,
     attempt_count=4,
     fencing_token="previous-token",
 ):
@@ -102,6 +196,8 @@ def _claimed_document(
     }
     if processing_cycle_id is not ...:
         document["processing_cycle_id"] = processing_cycle_id
+    if processing_cycle_started_at is not ...:
+        document["processing_cycle_started_at"] = processing_cycle_started_at
     return document
 
 
@@ -131,9 +227,9 @@ async def test_claim_filters_pending_objectid_and_all_retry_time_cases(
     query, _, _, _ = _call_parts(repo)
     assert query["status"] == DocumentStatus.PENDING.value
     assert query["$expr"] == {
-        "$eq": [
-            {"$type": "$file_id"},
-            "objectId",
+        "$and": [
+            {"$eq": [{"$type": "$file_id"}, "objectId"]},
+            _cycle_eligibility_expression(),
         ]
     }
     assert query["$or"] == [
@@ -172,13 +268,17 @@ async def test_claim_sets_processing_owner_lease_and_consistent_timestamps(
     await repo.claim_pending("worker-a", lease_duration=lease_duration)
 
     _, update, _, kwargs = _call_parts(repo)
-    fields = _set_stage(update)
+    _, _, fields, merge_objects = _claim_update_parts(update)
     assert fields["status"] == DocumentStatus.PROCESSING.value
     assert _literal_value(fields["worker_id"]) == "worker-a"
-    assert fields["lease_until"] == NOW + timedelta(seconds=expected_seconds)
-    assert fields["heartbeat_at"] == NOW
-    assert fields["updated_at"] == NOW
+    assert _literal_value(fields["lease_until"]) == NOW + timedelta(
+        seconds=expected_seconds
+    )
+    assert _literal_value(fields["heartbeat_at"]) == NOW
+    assert _literal_value(fields["updated_at"]) == NOW
     assert kwargs["return_document"] == ReturnDocument.AFTER
+    assert kwargs["upsert"] is False
+    assert "$$ROOT" in merge_objects
 
 
 @pytest.mark.asyncio
@@ -191,7 +291,8 @@ async def test_claim_encodes_dollar_prefixed_worker_id_as_literal(
     await repo.claim_pending("$workerField")
 
     _, update, _, _ = _call_parts(repo)
-    assert _set_stage(update)["worker_id"] == {"$literal": "$workerField"}
+    _, _, fields, _ = _claim_update_parts(update)
+    assert fields["worker_id"] == {"$literal": "$workerField"}
 
 
 @pytest.mark.asyncio
@@ -202,7 +303,8 @@ async def test_claim_uses_sixty_second_default_lease(repo_with_mocks, fixed_cloc
     await repo.claim_pending("worker-a")
 
     _, update, _, _ = _call_parts(repo)
-    assert _set_stage(update)["lease_until"] == NOW + timedelta(seconds=60)
+    _, _, fields, _ = _claim_update_parts(update)
+    assert fields["lease_until"] == {"$literal": NOW + timedelta(seconds=60)}
 
 
 @pytest.mark.asyncio
@@ -216,7 +318,7 @@ async def test_each_claim_generates_a_new_string_fencing_token(
     await repo.claim_pending("worker-a")
 
     tokens = [
-        _literal_value(_set_stage(call.args[1])["fencing_token"])
+        _literal_value(_claim_update_parts(call.args[1])[2]["fencing_token"])
         for call in repo.collection.find_one_and_update.call_args_list
     ]
     assert len(tokens) == 2
@@ -225,7 +327,7 @@ async def test_each_claim_generates_a_new_string_fencing_token(
 
 
 @pytest.mark.asyncio
-async def test_claim_initializes_cycle_atomically_when_missing_or_null(
+async def test_claim_initializes_cycle_pair_with_one_original_document_condition(
     repo_with_mocks, fixed_clock
 ):
     repo = repo_with_mocks
@@ -234,13 +336,125 @@ async def test_claim_initializes_cycle_atomically_when_missing_or_null(
     await repo.claim_pending("worker-a")
 
     _, update, _, _ = _call_parts(repo)
-    expression = _set_stage(update)["processing_cycle_id"]
-    assert isinstance(expression, dict)
-    assert "$ifNull" in expression
-    source, initial_cycle = expression["$ifNull"]
-    assert source == "$processing_cycle_id"
-    assert isinstance(_literal_value(initial_cycle), str)
-    UUID(_literal_value(initial_cycle))
+    condition, cycle_pair_condition, claim_fields, merge_objects = (
+        _claim_update_parts(update)
+    )
+    assert condition == _new_cycle_expression()
+    assert cycle_pair_condition[0] == "$$initialize_cycle"
+    initial_pair = cycle_pair_condition[1]
+    initial_cycle = _literal_value(initial_pair["processing_cycle_id"])
+    initial_started_at = _literal_value(
+        initial_pair["processing_cycle_started_at"]
+    )
+    UUID(initial_cycle)
+    assert initial_started_at == NOW
+    assert cycle_pair_condition[2] == {}
+    assert merge_objects[0] == "$$ROOT"
+    assert set(initial_pair) == {
+        "processing_cycle_id",
+        "processing_cycle_started_at",
+    }
+    assert "attempt_count" not in claim_fields
+    assert "attempt_count" not in repr(merge_objects)
+
+
+@pytest.mark.asyncio
+async def test_claim_pipeline_preserves_existing_cycle_pair_from_original_document(
+    repo_with_mocks, fixed_clock
+):
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.return_value = None
+
+    await repo.claim_pending("worker-a")
+
+    _, update, _, _ = _call_parts(repo)
+    condition, cycle_pair_condition, _, merge_objects = _claim_update_parts(update)
+
+    assert condition == _new_cycle_expression()
+    assert cycle_pair_condition[0] == "$$initialize_cycle"
+    assert set(cycle_pair_condition[1]) == {
+        "processing_cycle_id",
+        "processing_cycle_started_at",
+    }
+    assert cycle_pair_condition[2] == {}
+    assert merge_objects[0] == "$$ROOT"
+    assert "$processing_cycle_id" not in repr(cycle_pair_condition[1])
+    assert "$processing_cycle_started_at" not in repr(cycle_pair_condition[1])
+
+
+@pytest.mark.asyncio
+async def test_claim_captures_utc_clock_once_for_cycle_and_lease(monkeypatch, repo_with_mocks):
+    calls = []
+
+    class CountingClock:
+        @classmethod
+        def now(cls, tz=None):
+            calls.append(tz)
+            assert tz is timezone.utc
+            return NOW
+
+    monkeypatch.setattr(processing_repository, "datetime", CountingClock)
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.return_value = None
+
+    await repo.claim_pending("worker-a")
+
+    assert calls == [timezone.utc]
+    _, update, _, _ = _call_parts(repo)
+    _, cycle_pair_condition, claim_fields, _ = _claim_update_parts(update)
+    initial_pair = cycle_pair_condition[1]
+    assert _literal_value(initial_pair["processing_cycle_started_at"]) == NOW
+    assert _literal_value(claim_fields["heartbeat_at"]) == NOW
+    assert _literal_value(claim_fields["lease_until"]) == NOW + timedelta(seconds=60)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence_field",
+    [
+        "last_attempt_at",
+        "last_error",
+        "completed_at",
+        "failed_at",
+        "next_retry_at",
+        "worker_id",
+        "lease_until",
+        "heartbeat_at",
+        "fencing_token",
+    ],
+)
+async def test_new_cycle_filter_rejects_prior_processing_evidence(
+    repo_with_mocks, fixed_clock, evidence_field
+):
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.return_value = None
+
+    await repo.claim_pending("worker-a")
+
+    query, _, _, _ = _call_parts(repo)
+    encoded_query = repr(query["$expr"])
+    assert evidence_field in encoded_query
+
+
+@pytest.mark.asyncio
+async def test_claim_preserves_unrelated_fields_and_upload_metadata(repo_with_mocks, fixed_clock):
+    repo = repo_with_mocks
+    repo.collection.find_one_and_update.return_value = None
+
+    await repo.claim_pending("worker-a")
+
+    _, update, _, _ = _call_parts(repo)
+    _, _, claim_fields, merge_objects = _claim_update_parts(update)
+    assert merge_objects[0] == "$$ROOT"
+    assert set(claim_fields) == {
+        "status",
+        "worker_id",
+        "lease_until",
+        "heartbeat_at",
+        "updated_at",
+        "fencing_token",
+    }
+    assert not any(key.startswith("upload_") for key in claim_fields)
 
 
 @pytest.mark.asyncio
@@ -251,7 +465,9 @@ async def test_claim_does_not_change_attempt_count(repo_with_mocks, fixed_clock)
     await repo.claim_pending("worker-a")
 
     _, update, _, _ = _call_parts(repo)
-    assert "attempt_count" not in _set_stage(update)
+    _, _, claim_fields, merge_objects = _claim_update_parts(update)
+    assert "attempt_count" not in claim_fields
+    assert all("attempt_count" not in repr(part) for part in merge_objects[1:])
 
 
 @pytest.mark.asyncio
@@ -520,6 +736,7 @@ async def test_renewal_does_not_read_or_mutate_processing_or_upload_ownership_fi
     update_fields = _pipeline_set(update)
     assert not {
         "processing_cycle_id",
+        "processing_cycle_started_at",
         "attempt_count",
         "worker_id",
         "fencing_token",
@@ -575,6 +792,7 @@ async def test_recover_expired_processing_returns_updated_document_and_atomic_co
             {"worker_id": None},
             {"worker_id": {"$ne": worker_id}},
         ],
+        "$expr": _existing_cycle_expression(),
     }
     assert sort == [("lease_until", ASCENDING), ("_id", ASCENDING)]
     assert kwargs == {
@@ -600,6 +818,7 @@ async def test_recover_expired_processing_returns_updated_document_and_atomic_co
     protected_fields = {
         "updated_at",
         "processing_cycle_id",
+        "processing_cycle_started_at",
         "attempt_count",
         "next_retry_at",
         "upload_owner_id",

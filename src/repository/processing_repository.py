@@ -22,6 +22,87 @@ _UNAVAILABLE_ERRORS = (
     NetworkTimeout,
 )
 
+_PRIOR_PROCESSING_METADATA_FIELDS = (
+    "last_attempt_at",
+    "last_error",
+    "completed_at",
+    "failed_at",
+    "next_retry_at",
+    "worker_id",
+    "lease_until",
+    "heartbeat_at",
+    "fencing_token",
+)
+
+
+def _new_cycle_expression() -> dict:
+    """Return the aggregation expression for an uninitialized processing cycle."""
+    no_cycle_id = {
+        "$in": [
+            {"$type": "$processing_cycle_id"},
+            ["missing", "null"],
+        ]
+    }
+    no_cycle_started_at = {
+        "$in": [
+            {"$type": "$processing_cycle_started_at"},
+            ["missing", "null"],
+        ]
+    }
+    no_prior_processing_metadata = {
+        "$and": [
+            {
+                "$in": [
+                    {"$type": f"${field}"},
+                    ["missing", "null"],
+                ]
+            }
+            for field in _PRIOR_PROCESSING_METADATA_FIELDS
+        ]
+    }
+    valid_initial_attempt_count = {
+        "$cond": [
+            {
+                "$in": [
+                    {"$type": "$attempt_count"},
+                    ["missing", "int", "long"],
+                ]
+            },
+            {"$eq": [{"$ifNull": ["$attempt_count", 0]}, 0]},
+            False,
+        ]
+    }
+    return {
+        "$and": [
+            no_cycle_id,
+            no_cycle_started_at,
+            valid_initial_attempt_count,
+            no_prior_processing_metadata,
+        ]
+    }
+
+
+def _existing_cycle_expression(now: datetime) -> dict:
+    """Return the aggregation expression for a coherent, started cycle."""
+    return {
+        "$and": [
+            {"$eq": [{"$type": "$processing_cycle_id"}, "string"]},
+            {"$ne": ["$processing_cycle_id", ""]},
+            {"$eq": [{"$type": "$processing_cycle_started_at"}, "date"]},
+            {"$lte": ["$processing_cycle_started_at", now]},
+        ]
+    }
+
+
+def _cycle_eligibility_expression(now: datetime) -> dict:
+    """Accept either a valid new-cycle candidate or a coherent existing cycle."""
+    return {
+        "$or": [
+            _new_cycle_expression(),
+            _existing_cycle_expression(now),
+        ]
+    }
+
 
 class ProcessingRepository:
     """Persistencia de las operaciones de propiedad de los trabajos."""
@@ -43,9 +124,9 @@ class ProcessingRepository:
         query = {
             "status": "pending",
             "$expr": {
-                "$eq": [
-                    {"$type": "$file_id"},
-                    "objectId",
+                "$and": [
+                    {"$eq": [{"$type": "$file_id"}, "objectId"]},
+                    _cycle_eligibility_expression(now),
                 ]
             },
             "$or": [
@@ -54,21 +135,42 @@ class ProcessingRepository:
                 {"next_retry_at": {"$lte": now}},
             ],
         }
+        claim_fields = {
+            "status": "processing",
+            "worker_id": {"$literal": worker_id},
+            "lease_until": {"$literal": now + lease_duration},
+            "heartbeat_at": now,
+            "updated_at": now,
+            "fencing_token": {"$literal": fencing_token},
+        }
         update = [
             {
-                "$set": {
-                    "status": "processing",
-                    "worker_id": {"$literal": worker_id},
-                    "lease_until": now + lease_duration,
-                    "heartbeat_at": now,
-                    "updated_at": now,
-                    "fencing_token": {"$literal": fencing_token},
-                    "processing_cycle_id": {
-                        "$ifNull": [
-                            "$processing_cycle_id",
-                            {"$literal": initial_cycle_id},
-                        ]
-                    },
+                "$replaceWith": {
+                    "$let": {
+                        "vars": {
+                            "initialize_cycle": _new_cycle_expression(),
+                        },
+                        "in": {
+                            "$mergeObjects": [
+                                "$$ROOT",
+                                {
+                                    "$cond": [
+                                        "$$initialize_cycle",
+                                        {
+                                            "processing_cycle_id": {
+                                                "$literal": initial_cycle_id,
+                                            },
+                                            "processing_cycle_started_at": {
+                                                "$literal": now,
+                                            },
+                                        },
+                                        {},
+                                    ]
+                                },
+                                claim_fields,
+                            ]
+                        },
+                    }
                 }
             }
         ]
@@ -108,6 +210,7 @@ class ProcessingRepository:
                 {"worker_id": None},
                 {"worker_id": {"$ne": worker_id}},
             ],
+            "$expr": _existing_cycle_expression(now),
         }
         update = [
             {

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from bson import ObjectId
+from bson import Decimal128, Int64, ObjectId
 
 from src.config.config import MONGO_TEST_DATABASE, settings
 from src.database.mongodb import MongoDB
@@ -217,6 +217,7 @@ async def _claim_processing_document(
         fields={
             "attempt_count": attempt_count,
             "processing_cycle_id": cycle_id,
+            "processing_cycle_started_at": now,
         },
     )
     claimed = await ProcessingRepository(db).claim_pending(worker_id)
@@ -248,6 +249,16 @@ async def _insert_raw_pending(db, resources, *, file_id=MISSING, fields=None):
     return document_id
 
 
+async def _unset_raw_fields(db, document_id, *field_names):
+    if not field_names:
+        return
+    result = await db[settings.mongo_collection].update_one(
+        {"_id": document_id},
+        {"$unset": {field: "" for field in field_names}},
+    )
+    assert result.matched_count == 1
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_claim_persists_successful_claim_and_returns_document_model(
@@ -258,7 +269,11 @@ async def test_claim_persists_successful_claim_and_returns_document_model(
     document = await _create_pending_pdf(
         db,
         resources,
-        fields={"attempt_count": 6},
+        fields={
+            "attempt_count": 6,
+            "processing_cycle_id": str(uuid.uuid4()),
+            "processing_cycle_started_at": now - timedelta(minutes=1),
+        },
     )
     repository = ProcessingRepository(db)
     worker_id = "integration-worker-success"
@@ -275,6 +290,9 @@ async def test_claim_persists_successful_claim_and_returns_document_model(
     assert _normalize_datetime(claimed.updated_at) == now
     uuid.UUID(claimed.fencing_token)
     uuid.UUID(claimed.processing_cycle_id)
+    assert _normalize_datetime(claimed.processing_cycle_started_at) == (
+        now - timedelta(minutes=1)
+    )
     assert claimed.fencing_token != claimed.processing_cycle_id
     assert claimed.attempt_count == 6
     assert claimed.file_id == document["file_id"]
@@ -290,6 +308,9 @@ async def test_claim_persists_successful_claim_and_returns_document_model(
     assert _normalize_datetime(persisted["updated_at"]) == now
     assert persisted["fencing_token"] == claimed.fencing_token
     assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert _normalize_datetime(persisted["processing_cycle_started_at"]) == (
+        now - timedelta(minutes=1)
+    )
     assert persisted["attempt_count"] == 6
     assert persisted["file_id"] == document["file_id"]
 
@@ -423,7 +444,16 @@ async def test_claim_respects_next_retry_at_eligibility(
 ):
     db, resources = testing_context
     now = _freeze_claim_clock(monkeypatch)
-    document = await _create_pending_pdf(db, resources)
+    cycle_id = str(uuid.uuid4())
+    cycle_started_at = now - timedelta(minutes=1)
+    document = await _create_pending_pdf(
+        db,
+        resources,
+        fields={
+            "processing_cycle_id": cycle_id,
+            "processing_cycle_started_at": cycle_started_at,
+        },
+    )
     collection = db[settings.mongo_collection]
     document_filter = {"_id": document["document_id"]}
     if next_retry_at is MISSING:
@@ -437,6 +467,10 @@ async def test_claim_respects_next_retry_at_eligibility(
             {"$set": {"next_retry_at": next_retry_at}},
         )
     before = await collection.find_one(document_filter)
+    assert before["processing_cycle_id"] == cycle_id
+    assert _normalize_datetime(before["processing_cycle_started_at"]) == (
+        cycle_started_at
+    )
 
     result = await ProcessingRepository(db).claim_pending("worker-retry-time")
 
@@ -485,7 +519,7 @@ async def test_claim_selects_oldest_created_at_then_smallest_id(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "cycle_case",
-    ["missing", "null", "existing"],
+    ["both-missing", "id-missing", "started-at-missing", "both-null", "existing"],
 )
 async def test_claim_initializes_or_preserves_cycle_on_real_mongodb(
     testing_context, monkeypatch, cycle_case
@@ -493,16 +527,39 @@ async def test_claim_initializes_or_preserves_cycle_on_real_mongodb(
     db, resources = testing_context
     _freeze_claim_clock(monkeypatch)
     existing_cycle = str(uuid.uuid4())
+    existing_started_at = FIXED_NOW - timedelta(minutes=2)
     fields = {}
-    if cycle_case == "null":
-        fields["processing_cycle_id"] = None
+    if cycle_case == "both-null":
+        fields.update(
+            {
+                "processing_cycle_id": None,
+                "processing_cycle_started_at": None,
+            }
+        )
+    elif cycle_case in {"id-missing", "started-at-missing"}:
+        fields.update(
+            {
+                "processing_cycle_id": None,
+                "processing_cycle_started_at": None,
+            }
+        )
     elif cycle_case == "existing":
-        fields["processing_cycle_id"] = existing_cycle
+        fields.update(
+            {
+                "processing_cycle_id": existing_cycle,
+                "processing_cycle_started_at": existing_started_at,
+            }
+        )
     document = await _create_pending_pdf(db, resources, fields=fields)
-    if cycle_case == "missing":
+    unset_fields = {}
+    if cycle_case in {"both-missing", "id-missing"}:
+        unset_fields["processing_cycle_id"] = ""
+    if cycle_case in {"both-missing", "started-at-missing"}:
+        unset_fields["processing_cycle_started_at"] = ""
+    if unset_fields:
         await db[settings.mongo_collection].update_one(
             {"_id": document["document_id"]},
-            {"$unset": {"processing_cycle_id": ""}},
+            {"$unset": unset_fields},
         )
 
     claimed = await ProcessingRepository(db).claim_pending("worker-cycle")
@@ -511,9 +568,464 @@ async def test_claim_initializes_or_preserves_cycle_on_real_mongodb(
     uuid.UUID(claimed.fencing_token)
     if cycle_case == "existing":
         assert claimed.processing_cycle_id == existing_cycle
+        expected_started_at = existing_started_at
     else:
         uuid.UUID(claimed.processing_cycle_id)
+        expected_started_at = FIXED_NOW
+        assert claimed.processing_cycle_started_at is not None
+        assert _normalize_datetime(claimed.processing_cycle_started_at) == FIXED_NOW
     assert claimed.fencing_token != claimed.processing_cycle_id
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert persisted is not None
+    assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert _normalize_datetime(
+        persisted["processing_cycle_started_at"]
+    ) == expected_started_at
+    assert persisted["attempt_count"] == 0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_initializes_new_cycle_when_attempt_count_is_absent(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=ObjectId(),
+        fields={
+            "processing_cycle_id": None,
+            "processing_cycle_started_at": None,
+        },
+    )
+    await _unset_raw_fields(db, document_id, "attempt_count")
+
+    claimed = await ProcessingRepository(db).claim_pending("worker-missing-count")
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document_id}
+    )
+    assert claimed is not None
+    uuid.UUID(claimed.processing_cycle_id)
+    assert _normalize_datetime(claimed.processing_cycle_started_at) == now
+    assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert _normalize_datetime(persisted["processing_cycle_started_at"]) == now
+    assert "attempt_count" not in persisted
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_initial_cycle_ignores_upload_metadata(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=ObjectId(),
+        fields={
+            "processing_cycle_id": None,
+            "processing_cycle_started_at": None,
+            "upload_owner_id": "upload-owner-still-present",
+            "upload_lease_until": now + timedelta(minutes=10),
+            "upload_fencing_token": "upload-token-still-present",
+        },
+    )
+
+    claimed = await ProcessingRepository(db).claim_pending("worker-upload-independent")
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document_id}
+    )
+    assert claimed is not None
+    assert _normalize_datetime(claimed.processing_cycle_started_at) == now
+    assert persisted["upload_owner_id"] == "upload-owner-still-present"
+    assert _normalize_datetime(persisted["upload_lease_until"]) == (
+        now + timedelta(minutes=10)
+    )
+    assert persisted["upload_fencing_token"] == "upload-token-still-present"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("last_attempt_at", FIXED_NOW - timedelta(seconds=1)),
+        ("last_error", "previous classified failure"),
+        ("completed_at", FIXED_NOW - timedelta(seconds=1)),
+        ("failed_at", FIXED_NOW - timedelta(seconds=1)),
+        ("next_retry_at", FIXED_NOW - timedelta(seconds=1)),
+        ("worker_id", "previous-worker"),
+        ("lease_until", FIXED_NOW - timedelta(seconds=1)),
+        ("heartbeat_at", FIXED_NOW - timedelta(seconds=1)),
+        ("fencing_token", "previous-fencing-token"),
+    ],
+)
+async def test_claim_rejects_empty_cycle_with_processing_evidence_without_mutation(
+    testing_context, monkeypatch, field, value
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=ObjectId(),
+        fields={
+            "processing_cycle_id": None,
+            "processing_cycle_started_at": None,
+            field: value,
+        },
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document_id})
+
+    result = await ProcessingRepository(db).claim_pending("worker-evidence-check")
+
+    after = await collection.find_one({"_id": document_id})
+    assert result is None, f"{field} is evidence of prior processing"
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("content", "manually supplied before processing"),
+        ("page_count", 0),
+        ("error_message", "manual annotation before processing"),
+    ],
+)
+async def test_claim_allows_and_preserves_public_fields_without_prior_processing(
+    testing_context, monkeypatch, field, value
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=ObjectId(),
+        fields={
+            "processing_cycle_id": None,
+            "processing_cycle_started_at": None,
+            field: value,
+        },
+    )
+
+    claimed = await ProcessingRepository(db).claim_pending("worker-public-fields")
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document_id}
+    )
+    assert claimed is not None
+    assert getattr(claimed, field) == value
+    assert persisted[field] == value
+    assert uuid.UUID(claimed.processing_cycle_id)
+    assert _normalize_datetime(claimed.processing_cycle_started_at) == now
+    assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert _normalize_datetime(persisted["processing_cycle_started_at"]) == now
+    assert claimed.attempt_count == 0
+    assert persisted["attempt_count"] == 0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("last_error", ""),
+        ("worker_id", False),
+        ("last_attempt_at", 0),
+        ("lease_until", []),
+        ("heartbeat_at", [None]),
+    ],
+    ids=[
+        "empty-string",
+        "false",
+        "zero",
+        "empty-array",
+        "array-containing-null",
+    ],
+)
+async def test_claim_rejects_falsy_non_null_internal_metadata_without_mutation(
+    testing_context, monkeypatch, field, value
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=ObjectId(),
+        fields={
+            "processing_cycle_id": None,
+            "processing_cycle_started_at": None,
+            field: value,
+        },
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document_id})
+
+    try:
+        result = await ProcessingRepository(db).claim_pending("worker-falsy-metadata")
+    except Exception as error:
+        result = error
+
+    after = await collection.find_one({"_id": document_id})
+    assert (result is None, after == before) == (True, True), (
+        f"{field}={value!r} is present, non-null internal metadata"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "attempt_count"),
+    [
+        ("explicit-null", None),
+        ("negative", -1),
+        ("boolean", True),
+        ("boolean-false", False),
+        ("array", [0]),
+        ("string", "0"),
+        ("double", 0.0),
+        ("decimal128", Decimal128("0")),
+    ],
+    ids=[
+        "explicit-null",
+        "negative",
+        "boolean",
+        "boolean-false",
+        "array-containing-zero",
+        "string",
+        "double",
+        "decimal128",
+    ],
+)
+async def test_claim_rejects_invalid_initial_attempt_count_without_mutation(
+    testing_context, monkeypatch, case, attempt_count
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=ObjectId(),
+        fields={
+            "processing_cycle_id": None,
+            "processing_cycle_started_at": None,
+            "attempt_count": attempt_count,
+        },
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document_id})
+
+    try:
+        result = await ProcessingRepository(db).claim_pending("worker-count-check")
+    except Exception as error:
+        result = error
+
+    after = await collection.find_one({"_id": document_id})
+    assert result is None, f"attempt_count case {case!r} must not be claimed"
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "attempt_count", "expected_type"),
+    [
+        ("bson-int32-zero", 0, int),
+        ("bson-int64-zero", Int64(0), Int64),
+    ],
+)
+async def test_claim_accepts_bson_int32_and_int64_zero_attempt_counts(
+    testing_context, monkeypatch, case, attempt_count, expected_type
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db,
+        resources,
+        file_id=ObjectId(),
+        fields={
+            "processing_cycle_id": None,
+            "processing_cycle_started_at": None,
+            "attempt_count": attempt_count,
+        },
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document_id})
+    assert type(before["attempt_count"]) is expected_type
+
+    claimed = await ProcessingRepository(db).claim_pending(f"worker-{case}")
+
+    after = await collection.find_one({"_id": document_id})
+    assert claimed is not None
+    assert type(after["attempt_count"]) is expected_type
+    assert after["attempt_count"] == 0
+    assert claimed.attempt_count == 0
+    assert _normalize_datetime(claimed.processing_cycle_started_at) == now
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "fields", "unset_fields"),
+    [
+        (
+            "id-without-start",
+            {"processing_cycle_id": "existing-cycle"},
+            ("processing_cycle_started_at",),
+        ),
+        (
+            "id-with-null-start",
+            {"processing_cycle_id": "existing-cycle", "processing_cycle_started_at": None},
+            (),
+        ),
+        (
+            "start-without-id",
+            {"processing_cycle_started_at": FIXED_NOW},
+            ("processing_cycle_id",),
+        ),
+        (
+            "start-with-null-id",
+            {"processing_cycle_id": None, "processing_cycle_started_at": FIXED_NOW},
+            (),
+        ),
+        (
+            "empty-id",
+            {"processing_cycle_id": "", "processing_cycle_started_at": FIXED_NOW},
+            (),
+        ),
+        (
+            "array-id-containing-string",
+            {"processing_cycle_id": ["existing-cycle"], "processing_cycle_started_at": FIXED_NOW},
+            (),
+        ),
+        (
+            "integer-id",
+            {"processing_cycle_id": 7, "processing_cycle_started_at": FIXED_NOW},
+            (),
+        ),
+        (
+            "string-date",
+            {"processing_cycle_id": "existing-cycle", "processing_cycle_started_at": "2026-11-25"},
+            (),
+        ),
+        (
+            "array-date-containing-date",
+            {"processing_cycle_id": "existing-cycle", "processing_cycle_started_at": [FIXED_NOW]},
+            (),
+        ),
+        (
+            "future-date",
+            {
+                "processing_cycle_id": "existing-cycle",
+                "processing_cycle_started_at": FIXED_NOW + timedelta(seconds=1),
+            },
+            (),
+        ),
+        (
+            "both-absent-positive-count",
+            {"attempt_count": 1},
+            ("processing_cycle_id", "processing_cycle_started_at"),
+        ),
+    ],
+)
+async def test_claim_rejects_inconsistent_cycle_without_mutation(
+    testing_context, monkeypatch, case, fields, unset_fields
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    document_id = await _insert_raw_pending(
+        db, resources, file_id=ObjectId(), fields=fields
+    )
+    await _unset_raw_fields(db, document_id, *unset_fields)
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document_id})
+
+    try:
+        result = await ProcessingRepository(db).claim_pending("worker-cycle-check")
+    except Exception as error:
+        result = error
+
+    after = await collection.find_one({"_id": document_id})
+    assert result is None, f"inconsistent cycle {case!r} must not be claimed"
+    assert after == before
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_preserves_expired_existing_cycle_and_fully_consumed_attempts(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    cycle_id = str(uuid.uuid4())
+    cycle_started_at = now - timedelta(minutes=11)
+    document = await _create_pending_pdf(
+        db,
+        resources,
+        fields={
+            "processing_cycle_id": cycle_id,
+            "processing_cycle_started_at": cycle_started_at,
+            "attempt_count": 5,
+            "last_attempt_at": now - timedelta(seconds=2),
+            "next_retry_at": now - timedelta(seconds=1),
+        },
+    )
+
+    claimed = await ProcessingRepository(db).claim_pending("worker-expired-cycle")
+
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert claimed is not None
+    assert claimed.processing_cycle_id == cycle_id
+    assert _normalize_datetime(claimed.processing_cycle_started_at) == cycle_started_at
+    assert claimed.attempt_count == 5
+    assert persisted["processing_cycle_id"] == cycle_id
+    assert _normalize_datetime(persisted["processing_cycle_started_at"]) == cycle_started_at
+    assert persisted["attempt_count"] == 5
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_automatic_retry_claim_preserves_original_cycle_and_window(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    cycle_id = str(uuid.uuid4())
+    cycle_started_at = now - timedelta(minutes=4)
+    document = await _create_pending_pdf(
+        db,
+        resources,
+        fields={
+            "processing_cycle_id": cycle_id,
+            "processing_cycle_started_at": cycle_started_at,
+            "attempt_count": 2,
+            "last_attempt_at": now - timedelta(seconds=5),
+            "last_error": "temporary upstream failure",
+            "next_retry_at": now - timedelta(seconds=1),
+        },
+    )
+
+    claimed = await ProcessingRepository(db).claim_pending("worker-auto-retry")
+
+    assert claimed is not None
+    assert claimed.processing_cycle_id == cycle_id
+    assert _normalize_datetime(claimed.processing_cycle_started_at) == cycle_started_at
+    assert claimed.attempt_count == 2
+    assert _normalize_datetime(claimed.last_attempt_at) == now - timedelta(seconds=5)
+    assert claimed.last_error == "temporary upstream failure"
+    assert _normalize_datetime(claimed.next_retry_at) == now - timedelta(seconds=1)
 
 
 @pytest.mark.integration
@@ -531,6 +1043,7 @@ async def test_claim_preserves_retry_count_and_cycle_but_renews_fencing_token(
         fields={
             "attempt_count": 7,
             "processing_cycle_id": existing_cycle,
+            "processing_cycle_started_at": FIXED_NOW - timedelta(minutes=3),
             "fencing_token": previous_token,
         },
     )
@@ -540,8 +1053,71 @@ async def test_claim_preserves_retry_count_and_cycle_but_renews_fencing_token(
     assert claimed is not None
     assert claimed.attempt_count == 7
     assert claimed.processing_cycle_id == existing_cycle
+    assert _normalize_datetime(claimed.processing_cycle_started_at) == (
+        FIXED_NOW - timedelta(minutes=3)
+    )
     assert claimed.fencing_token != previous_token
     uuid.UUID(claimed.fencing_token)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_first_claim_initializes_one_cycle_pair(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    now = _freeze_claim_clock(monkeypatch)
+    document = await _create_pending_pdf(
+        db,
+        resources,
+        fields={"attempt_count": 0},
+    )
+    collection = db[settings.mongo_collection]
+    await _unset_raw_fields(
+        db,
+        document["document_id"],
+        "processing_cycle_id",
+        "processing_cycle_started_at",
+    )
+    before = await collection.find_one({"_id": document["document_id"]})
+    assert "processing_cycle_id" not in before
+    assert "processing_cycle_started_at" not in before
+    assert before["attempt_count"] == 0
+
+    first_repository = ProcessingRepository(db)
+    second_repository = ProcessingRepository(db)
+    barrier = asyncio.Barrier(2)
+
+    async def claim_after_barrier(repository, worker_id):
+        await barrier.wait()
+        return await repository.claim_pending(worker_id)
+
+    first, second = await asyncio.gather(
+        claim_after_barrier(first_repository, "worker-first-cycle-a"),
+        claim_after_barrier(second_repository, "worker-first-cycle-b"),
+    )
+
+    winners = [result for result in (first, second) if result is not None]
+    losers = [result for result in (first, second) if result is None]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    winner = winners[0]
+
+    persisted = await collection.find_one({"_id": document["document_id"]})
+    assert persisted is not None
+    assert uuid.UUID(persisted["processing_cycle_id"])
+    assert _normalize_datetime(persisted["processing_cycle_started_at"]) == now
+    assert persisted["processing_cycle_id"] == winner.processing_cycle_id
+    assert _normalize_datetime(winner.processing_cycle_started_at) == now
+    assert persisted["fencing_token"] == winner.fencing_token
+    assert winner.attempt_count == persisted["attempt_count"] == 0
+    assert await collection.count_documents(
+        {
+            "_id": document["document_id"],
+            "processing_cycle_id": winner.processing_cycle_id,
+            "processing_cycle_started_at": now,
+        }
+    ) == 1
 
 
 @pytest.mark.integration
@@ -554,7 +1130,11 @@ async def test_two_concurrent_workers_cannot_claim_the_same_document(
     document = await _create_pending_pdf(
         db,
         resources,
-        fields={"attempt_count": 5},
+        fields={
+            "attempt_count": 5,
+            "processing_cycle_id": str(uuid.uuid4()),
+            "processing_cycle_started_at": FIXED_NOW - timedelta(minutes=1),
+        },
     )
     first_repository = ProcessingRepository(db)
     second_repository = ProcessingRepository(db)
@@ -586,6 +1166,10 @@ async def test_two_concurrent_workers_cannot_claim_the_same_document(
     }
     assert persisted["fencing_token"] == winner.fencing_token
     assert persisted["attempt_count"] == 5
+    assert persisted["processing_cycle_id"] == winner.processing_cycle_id
+    assert _normalize_datetime(
+        persisted["processing_cycle_started_at"]
+    ) == FIXED_NOW - timedelta(minutes=1)
     assert await collection.count_documents(
         {"_id": document["document_id"]}
     ) == 1
@@ -704,6 +1288,10 @@ async def test_renew_processing_lease_preserves_cycle_attempts_and_upload_fields
     after = await collection.find_one({"_id": document["document_id"]})
     assert renewed is True
     assert after["processing_cycle_id"] == cycle_id == before["processing_cycle_id"]
+    assert after["processing_cycle_started_at"] == before[
+        "processing_cycle_started_at"
+    ]
+    assert _normalize_datetime(after["processing_cycle_started_at"]) == now
     assert after["attempt_count"] == 9 == before["attempt_count"]
     for field in (
         "upload_owner_id",
@@ -1002,6 +1590,11 @@ async def test_recover_expired_processing_persists_new_owner_and_preserves_metad
     assert after["status"] == DocumentStatus.PROCESSING.value
     assert after["processing_cycle_id"] == before["processing_cycle_id"] == cycle_id
     assert recovered.processing_cycle_id == after["processing_cycle_id"]
+    assert after["processing_cycle_started_at"] == before[
+        "processing_cycle_started_at"
+    ]
+    assert _normalize_datetime(after["processing_cycle_started_at"]) == now
+    assert _normalize_datetime(recovered.processing_cycle_started_at) == now
     assert after["attempt_count"] == before["attempt_count"] == 8
     assert recovered.attempt_count == after["attempt_count"]
     assert after["next_retry_at"] == before["next_retry_at"]
@@ -1014,6 +1607,98 @@ async def test_recover_expired_processing_persists_new_owner_and_preserves_metad
         "upload_fencing_token",
     ):
         assert after[field] == before[field]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recover_expired_processing_accepts_coherent_exhausted_cycle(
+    testing_context, monkeypatch
+):
+    db, resources = testing_context
+    document, _, now, cycle_id, before = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id="expired-owner"
+    )
+    started_at = now - timedelta(minutes=11)
+    update = await db[settings.mongo_collection].update_one(
+        {"_id": document["document_id"]},
+        {
+            "$set": {
+                "attempt_count": 5,
+                "processing_cycle_started_at": started_at,
+                "last_attempt_at": now - timedelta(seconds=5),
+                "next_retry_at": now - timedelta(seconds=1),
+            }
+        },
+    )
+    assert update.matched_count == 1
+
+    recovered = await ProcessingRepository(db).recover_expired_processing(
+        "recovery-after-budget"
+    )
+
+    after = await db[settings.mongo_collection].find_one(
+        {"_id": document["document_id"]}
+    )
+    assert recovered is not None
+    assert recovered.processing_cycle_id == cycle_id
+    assert _normalize_datetime(recovered.processing_cycle_started_at) == started_at
+    assert recovered.attempt_count == 5
+    assert after["processing_cycle_id"] == before["processing_cycle_id"] == cycle_id
+    assert _normalize_datetime(after["processing_cycle_started_at"]) == started_at
+    assert after["attempt_count"] == 5
+    assert _normalize_datetime(after["last_attempt_at"]) == now - timedelta(seconds=5)
+    assert _normalize_datetime(after["next_retry_at"]) == now - timedelta(seconds=1)
+
+
+@pytest.mark.parametrize(
+    ("case", "set_fields", "unset_fields"),
+    [
+        ("both-absent", {}, ("processing_cycle_id", "processing_cycle_started_at")),
+        ("id-without-start", {"processing_cycle_id": "cycle-id"}, ("processing_cycle_started_at",)),
+        ("id-with-null-start", {"processing_cycle_started_at": None}, ()),
+        ("start-without-id", {"processing_cycle_started_at": FIXED_NOW}, ("processing_cycle_id",)),
+        ("start-with-null-id", {"processing_cycle_id": None}, ()),
+        ("empty-id", {"processing_cycle_id": ""}, ()),
+        ("array-id-containing-string", {"processing_cycle_id": ["cycle-id"]}, ()),
+        ("integer-id", {"processing_cycle_id": 7}, ()),
+        ("string-date", {"processing_cycle_started_at": "2026-11-25"}, ()),
+        ("array-date-containing-date", {"processing_cycle_started_at": [FIXED_NOW]}, ()),
+        (
+            "future-date",
+            {"processing_cycle_started_at": FIXED_NOW + timedelta(seconds=1)},
+            (),
+        ),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_recovery_rejects_inconsistent_cycles_without_mutation(
+    testing_context, monkeypatch, case, set_fields, unset_fields
+):
+    db, resources = testing_context
+    document, _, _, _, _ = await _prepare_expired_processing_document(
+        db, resources, monkeypatch, old_worker_id=f"expired-owner-{case}"
+    )
+    collection = db[settings.mongo_collection]
+    if set_fields:
+        result = await collection.update_one(
+            {"_id": document["document_id"]}, {"$set": set_fields}
+        )
+        assert result.matched_count == 1
+    await _unset_raw_fields(db, document["document_id"], *unset_fields)
+    before = await collection.find_one({"_id": document["document_id"]})
+
+    try:
+        recovered = await ProcessingRepository(db).recover_expired_processing(
+            f"recovery-inconsistent-{case}"
+        )
+    except Exception as error:
+        recovered = error
+
+    after = await collection.find_one({"_id": document["document_id"]})
+    assert (recovered is None, after == before) == (True, True), (
+        f"inconsistent cycle {case!r} must not be recovered or mutated"
+    )
 
 
 @pytest.mark.parametrize(
