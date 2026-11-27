@@ -284,6 +284,19 @@ def _completion_query(
                         ["missing", "null"],
                     ]
                 },
+                {
+                    "$in": [
+                        {"$type": "$original_cleanup_status"},
+                        ["missing", "null"],
+                    ]
+                },
+                {
+                    "$in": [
+                        {"$type": "$original_deleted_at"},
+                        ["missing", "null"],
+                    ]
+                },
+                {"$eq": [{"$type": "$file_id"}, "objectId"]},
             ]
         },
     }
@@ -1337,6 +1350,8 @@ async def test_complete_processing_builds_exact_atomic_update_and_returns_match(
                 "page_count": {"$literal": 3},
                 "status": {"$literal": "completed"},
                 "completed_at": {"$literal": normalized_now},
+                "original_cleanup_status": {"$literal": "pending"},
+                "original_deleted_at": {"$literal": None},
                 "updated_at": {
                     "$max": [
                         {
@@ -2282,6 +2297,54 @@ async def test_release_for_circuit_open_preserves_attempt_state_and_last_error(
     }
     assert repo.collection.update_one.call_args.kwargs == {"upsert": False}
     repo.collection.update_one.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "fail_processing",
+        "fail_exhausted_processing",
+        "schedule_transient_retry",
+        "release_for_circuit_open",
+    ],
+)
+@pytest.mark.asyncio
+async def test_noncompletion_operations_do_not_register_original_cleanup(
+    repo_with_mocks, fixed_clock, operation
+):
+    repo = repo_with_mocks
+    repo.collection.update_one.return_value.matched_count = 1
+    arguments = _terminal_arguments()
+
+    if operation == "fail_processing":
+        await repo.fail_processing(*arguments, 3, "ms2_invalid_input")
+    elif operation == "fail_exhausted_processing":
+        await repo.fail_exhausted_processing(*arguments)
+    elif operation == "schedule_transient_retry":
+        await repo.schedule_transient_retry(
+            *arguments,
+            3,
+            "ms2_http_503",
+            NOW + timedelta(seconds=8),
+        )
+    else:
+        await repo.release_for_circuit_open(
+            *arguments,
+            2,
+            NOW + timedelta(seconds=8),
+        )
+
+    update = repo.collection.update_one.call_args.args[1]
+    set_fields = set().union(*(stage.get("$set", {}) for stage in update))
+    unset_fields = {
+        field
+        for stage in update
+        for field in stage.get("$unset", [])
+    }
+    assert not {
+        "original_cleanup_status",
+        "original_deleted_at",
+    } & (set_fields | unset_fields)
 
 
 @pytest.mark.parametrize("expected_attempt_count", [-1, 6, True, 1.0, "2"])

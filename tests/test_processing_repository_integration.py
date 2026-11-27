@@ -3291,6 +3291,11 @@ async def test_complete_processing_persists_result_and_keeps_original_gridfs_pdf
         await _claim_and_record_processing_attempt(db, resources, monkeypatch)
     )
 
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": document["document_id"]})
+    chunks_before = await db["fs.chunks"].find(
+        {"files_id": document["file_id"]}
+    ).sort("n", 1).to_list(length=None)
     completed = await ProcessingRepository(db).complete_processing(
         claimed.id,
         claimed.worker_id,
@@ -3301,13 +3306,34 @@ async def test_complete_processing_persists_result_and_keeps_original_gridfs_pdf
         1,
     )
 
-    collection = db[settings.mongo_collection]
     persisted = await collection.find_one({"_id": document["document_id"]})
+    expected = dict(before)
+    expected.update(
+        {
+            "status": DocumentStatus.COMPLETED.value,
+            "content": "Texto extraído del PDF",
+            "page_count": 1,
+            "completed_at": before["last_attempt_at"],
+            "updated_at": before["last_attempt_at"],
+            "original_cleanup_status": "pending",
+            "original_deleted_at": None,
+        }
+    )
+    for field in (
+        "lease_until",
+        "next_retry_at",
+        "error_message",
+        "last_error",
+        "failed_at",
+    ):
+        expected.pop(field, None)
+    chunks_after = await db["fs.chunks"].find(
+        {"files_id": document["file_id"]}
+    ).sort("n", 1).to_list(length=None)
     gridfs_file = await GridFSRepository(db).stat(document["file_id"])
+
     assert completed is True
-    assert persisted["status"] == DocumentStatus.COMPLETED.value
-    assert persisted["content"] == "Texto extraído del PDF"
-    assert persisted["page_count"] == 1
+    assert persisted == expected
     assert _normalize_datetime(persisted["completed_at"]) == now
     assert _normalize_datetime(persisted["updated_at"]) == now
     assert persisted["attempt_count"] == attempt_number == 1
@@ -3323,8 +3349,104 @@ async def test_complete_processing_persists_result_and_keeps_original_gridfs_pdf
     assert persisted["fencing_token"] == claimed.fencing_token
     assert _normalize_datetime(persisted["heartbeat_at"]) == now
     assert persisted["file_id"] == document["file_id"]
+    assert persisted["original_cleanup_status"] == "pending"
+    assert persisted["original_deleted_at"] is None
     assert gridfs_file is not None
     assert await GridFSRepository(db).read(document["file_id"]) == document["pdf_bytes"]
+    assert chunks_after == chunks_before
+
+
+@pytest.mark.parametrize(
+    ("case", "fields", "unset_fields"),
+    [
+        ("cleanup-fields-missing", {}, ()),
+        (
+            "cleanup-fields-explicit-null",
+            {
+                "original_cleanup_status": None,
+                "original_deleted_at": None,
+            },
+            (),
+        ),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_complete_processing_accepts_missing_or_null_cleanup_fields(
+    testing_context, monkeypatch, case, fields, unset_fields
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_completion_document(
+        db,
+        resources,
+        fields=fields,
+        unset_fields=unset_fields,
+    )
+
+    result = await ProcessingRepository(db).complete_processing(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+        1,
+        "resultado",
+        1,
+    )
+    persisted = await db[settings.mongo_collection].find_one(
+        {"_id": fixture["document_id"]}
+    )
+
+    assert result is True, case
+    assert persisted["original_cleanup_status"] == "pending"
+    assert persisted["original_deleted_at"] is None
+
+
+@pytest.mark.parametrize(
+    ("case", "fields", "unset_fields"),
+    [
+        ("cleanup-pending", {"original_cleanup_status": "pending"}, ()),
+        ("cleanup-completed", {"original_cleanup_status": "completed"}, ()),
+        ("cleanup-status-number", {"original_cleanup_status": 7}, ()),
+        ("cleanup-status-array", {"original_cleanup_status": ["pending"]}, ()),
+        ("deleted-at-present", {"original_deleted_at": FIXED_NOW}, ()),
+        ("deleted-at-string", {"original_deleted_at": "not-a-date"}, ()),
+        ("deleted-at-array", {"original_deleted_at": [FIXED_NOW]}, ()),
+        ("file-id-missing", {}, ("file_id",)),
+        ("file-id-null", {"file_id": None}, ()),
+        ("file-id-string", {"file_id": "not-an-object-id"}, ()),
+        ("file-id-array", {"file_id": [ObjectId()]}, ()),
+    ],
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_complete_processing_rejects_existing_cleanup_state_or_invalid_file_id(
+    testing_context, monkeypatch, case, fields, unset_fields
+):
+    db, resources = testing_context
+    _freeze_claim_clock(monkeypatch)
+    fixture = await _insert_processing_completion_document(
+        db,
+        resources,
+        fields=fields,
+        unset_fields=unset_fields,
+    )
+    collection = db[settings.mongo_collection]
+    before = await collection.find_one({"_id": fixture["document_id"]})
+
+    result = await ProcessingRepository(db).complete_processing(
+        str(fixture["document_id"]),
+        fixture["worker_id"],
+        fixture["fencing_token"],
+        fixture["processing_cycle_id"],
+        1,
+        "resultado",
+        1,
+    )
+    after = await collection.find_one({"_id": fixture["document_id"]})
+
+    assert result is False, case
+    assert after == before
 
 
 @pytest.mark.parametrize(
@@ -3881,6 +4003,8 @@ async def test_complete_processing_unsets_exact_fields_and_preserves_the_rest(
         "page_count",
         "completed_at",
         "updated_at",
+        "original_cleanup_status",
+        "original_deleted_at",
     }
     assert result is True
     assert not (removed & after.keys())
@@ -3906,6 +4030,8 @@ async def test_complete_processing_unsets_exact_fields_and_preserves_the_rest(
         preserved["upload_lease_until"]
     )
     assert after["upload_fencing_token"] == preserved["upload_fencing_token"]
+    assert after["original_cleanup_status"] == "pending"
+    assert after["original_deleted_at"] is None
 
 
 @pytest.mark.integration
@@ -3946,6 +4072,10 @@ async def test_complete_processing_repeat_does_not_overwrite_confirmed_result(
 
     assert first is True
     assert second is False
+    assert before_repeat["original_cleanup_status"] == "pending"
+    assert before_repeat["original_deleted_at"] is None
+    assert after_repeat["original_cleanup_status"] == "pending"
+    assert after_repeat["original_deleted_at"] is None
     assert after_repeat == before_repeat
 
 

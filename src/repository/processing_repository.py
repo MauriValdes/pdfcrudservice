@@ -611,6 +611,7 @@ class ProcessingRepository:
         content: str,
         page_count: int,
     ) -> bool:
+        """Persist the result and atomically register original cleanup as pending."""
         if not isinstance(document_id, str) or not ObjectId.is_valid(document_id):
             raise ValueError("Identificador de documento inválido")
         if not isinstance(worker_id, str) or not worker_id:
@@ -678,6 +679,19 @@ class ProcessingRepository:
                             ["missing", "null"],
                         ]
                     },
+                    {
+                        "$in": [
+                            {"$type": "$original_cleanup_status"},
+                            ["missing", "null"],
+                        ]
+                    },
+                    {
+                        "$in": [
+                            {"$type": "$original_deleted_at"},
+                            ["missing", "null"],
+                        ]
+                    },
+                    {"$eq": [{"$type": "$file_id"}, "objectId"]},
                 ]
             },
         }
@@ -688,6 +702,8 @@ class ProcessingRepository:
                     "page_count": {"$literal": page_count},
                     "status": {"$literal": "completed"},
                     "completed_at": {"$literal": now},
+                    "original_cleanup_status": {"$literal": "pending"},
+                    "original_deleted_at": {"$literal": None},
                     "updated_at": {
                         "$max": [
                             {
