@@ -57,6 +57,38 @@ _TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
 _PERMANENT_INPUT_STATUSES = frozenset({400, 413, 422})
 
 
+def validate_ms2_base_url(base_url: str) -> str:
+    """Validate and normalize the base URL accepted by the MS2 client."""
+    if not isinstance(base_url, str):
+        raise TypeError("base_url must be a string")
+
+    try:
+        parsed_url = httpx.URL(base_url)
+        original_parts = urlsplit(base_url)
+    except httpx.InvalidURL as exc:
+        raise ValueError("base_url must be an absolute HTTP or HTTPS URL") from exc
+    except ValueError as exc:
+        raise ValueError("base_url must be a valid absolute URL") from exc
+
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.host
+        or parsed_url.username
+        or parsed_url.password
+        or "@" in original_parts.netloc
+        or parsed_url.query
+        or parsed_url.fragment
+        or "?" in base_url.split("#", maxsplit=1)[0]
+        or "#" in base_url
+    ):
+        raise ValueError(
+            "base_url must have an HTTP or HTTPS scheme and host, "
+            "without credentials, query parameters, or fragment"
+        )
+
+    return str(parsed_url).rstrip("/")
+
+
 class MS2Client:
     """Send PDFs to MS2 using a caller-owned, reusable HTTPX client."""
 
@@ -73,35 +105,9 @@ class MS2Client:
             raise TypeError("timeout_seconds must be a finite positive number")
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be a finite positive number")
-        if not isinstance(base_url, str):
-            raise TypeError("base_url must be a string")
-
-        try:
-            parsed_url = httpx.URL(base_url)
-            original_parts = urlsplit(base_url)
-        except httpx.InvalidURL as exc:
-            raise ValueError("base_url must be an absolute HTTP or HTTPS URL") from exc
-        except ValueError as exc:
-            raise ValueError("base_url must be a valid absolute URL") from exc
-
-        if (
-            parsed_url.scheme not in {"http", "https"}
-            or not parsed_url.host
-            or parsed_url.username
-            or parsed_url.password
-            or "@" in original_parts.netloc
-            or parsed_url.query
-            or parsed_url.fragment
-            or "?" in base_url.split("#", maxsplit=1)[0]
-            or "#" in base_url
-        ):
-            raise ValueError(
-                "base_url must have an HTTP or HTTPS scheme and host, "
-                "without credentials, query parameters, or fragment"
-            )
 
         self._client = client
-        self._base_url = str(parsed_url).rstrip("/")
+        self._base_url = validate_ms2_base_url(base_url)
         self._timeout_seconds = float(timeout_seconds)
 
     async def extract(
