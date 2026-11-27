@@ -1,15 +1,62 @@
+import asyncio
 import hashlib
-import httpx
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Literal, Mapping, Optional
+from uuid import uuid4
 
+from bson import ObjectId
+import httpx
 from pymongo.errors import DuplicateKeyError
-from typing import Literal, Mapping, Optional
 
 from src.config.config import settings
 from src.models.document import DocumentModel, DocumentStatus
 from src.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
 from src.repository.document_repository import DocumentRepository
-from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+
+def _upload_utc_now() -> datetime:
+    """Reloj de pared UTC aislado para la coordinación de cargas."""
+    return datetime.now(timezone.utc)
+
+
+def _upload_monotonic_now() -> float:
+    """Reloj monotónico usado para deadlines e intervalos del lease."""
+    return time.monotonic()
+
+
+async def _wait_for_upload_signal(
+    event: asyncio.Event,
+    timeout: float,
+) -> bool:
+    """Espera una señal hasta el timeout; False indica vencimiento."""
+    if event.is_set():
+        return True
+    if timeout <= 0:
+        return False
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+def _normalize_upload_utc(value: datetime) -> datetime:
+    """Normaliza una fecha a UTC sin perder su precisión."""
+    if not isinstance(value, datetime):
+        raise ValueError("La fecha del lease debe ser datetime.")
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _normalize_upload_expiry(value: datetime) -> datetime:
+    """Normaliza un vencimiento confirmado y trunca a precisión BSON."""
+    value = _normalize_upload_utc(value)
+    return value.replace(microsecond=(value.microsecond // 1000) * 1000)
 
 
 ReservationClassification = Literal[
@@ -17,6 +64,10 @@ ReservationClassification = Literal[
     "existing",
     "existing_uploading",
 ]
+
+
+class UploadLeaseLostError(Exception):
+    """La carga dejó de tener autorización para continuar."""
 
 
 class DocumentService:
@@ -75,7 +126,7 @@ class DocumentService:
                 "El documento debe tener id, propietario y token de carga."
             )
 
-        upload_lease_until = datetime.now(timezone.utc) + timedelta(
+        upload_lease_until = _upload_utc_now() + timedelta(
             seconds=settings.upload_lease_seconds
         )
         renewed = await self.repository.renew_upload_lease(
@@ -85,6 +136,286 @@ class DocumentService:
             upload_lease_until,
         )
         return upload_lease_until if renewed else None
+
+    async def save_original_pdf_with_lease(
+        self,
+        document: DocumentModel,
+        file_id: ObjectId,
+        filename: str,
+        data: bytes,
+        metadata: Optional[Mapping[str, Any]] = None,
+        *,
+        ownership_acquired: bool,
+    ) -> ObjectId:
+        """Guarda el PDF mientras coordina la renovación de su lease."""
+        if ownership_acquired is not True:
+            raise UploadLeaseLostError("La propiedad inicial no fue adquirida.")
+        if document.status != DocumentStatus.UPLOADING:
+            raise ValueError("El documento debe estar en estado uploading.")
+        if document.file_id is not None:
+            raise ValueError("El documento no debe tener un file_id asociado.")
+        if not ObjectId.is_valid(document.id):
+            raise ValueError("El id del documento debe ser un ObjectId válido.")
+        if not isinstance(document.upload_owner_id, str) or not document.upload_owner_id:
+            raise ValueError("El documento debe tener upload_owner_id.")
+        if (
+            not isinstance(document.upload_fencing_token, str)
+            or not document.upload_fencing_token
+        ):
+            raise ValueError("El documento debe tener upload_fencing_token.")
+        if not isinstance(document.upload_lease_until, datetime):
+            raise ValueError("El documento debe tener upload_lease_until válido.")
+        if not isinstance(file_id, ObjectId):
+            raise ValueError("file_id debe ser una instancia de ObjectId.")
+
+        confirmed_expiry = _normalize_upload_expiry(document.upload_lease_until)
+        deadline_anchor = _upload_monotonic_now()
+        utc_now = _normalize_upload_utc(_upload_utc_now())
+        if confirmed_expiry <= utc_now:
+            raise UploadLeaseLostError("El lease inicial ya venció.")
+
+        confirmed_deadline = deadline_anchor + (
+            confirmed_expiry - utc_now
+        ).total_seconds()
+        if confirmed_deadline <= _upload_monotonic_now():
+            raise UploadLeaseLostError("El lease inicial ya venció.")
+
+        renew_interval = float(settings.upload_lease_renew_interval_seconds)
+        if renew_interval <= 0:
+            raise ValueError("El intervalo de renovación debe ser positivo.")
+
+        terminal_error: BaseException | None = None
+        secondary_error_ids: set[int] = set()
+        writer_done = False
+        writer_observed = False
+        # También actúa como señal de parada para despertar al coordinador.
+        activity_event = asyncio.Event()
+        renewal_task: asyncio.Task | None = None
+        renewal_observed = False
+        next_renewal_at = _upload_monotonic_now() + renew_interval
+        if confirmed_deadline - _upload_monotonic_now() <= renew_interval:
+            next_renewal_at = _upload_monotonic_now()
+
+        def set_terminal(error: BaseException) -> None:
+            nonlocal terminal_error
+            if terminal_error is None:
+                terminal_error = error
+                activity_event.set()
+            elif error is not terminal_error and id(error) not in secondary_error_ids:
+                secondary_error_ids.add(id(error))
+                logger.warning(
+                    "Secondary upload coordination error ignored (%s)",
+                    type(error).__name__,
+                )
+
+        def should_continue() -> bool:
+            if terminal_error is not None:
+                return False
+            if _upload_monotonic_now() >= confirmed_deadline:
+                set_terminal(
+                    UploadLeaseLostError("El lease de carga venció.")
+                )
+                return False
+            return True
+
+        def observe_writer(task: asyncio.Task) -> None:
+            nonlocal writer_done, writer_observed
+            if writer_observed:
+                return
+            writer_observed = True
+            writer_done = True
+            try:
+                task.result()
+            except BaseException as error:
+                set_terminal(error)
+            activity_event.set()
+
+        def observe_renewal(task: asyncio.Task) -> None:
+            nonlocal confirmed_expiry, confirmed_deadline
+            nonlocal next_renewal_at, renewal_observed
+            if renewal_observed:
+                return
+            renewal_observed = True
+            try:
+                renewed_value = task.result()
+            except BaseException as error:
+                try:
+                    observed_monotonic = _upload_monotonic_now()
+                    if (
+                        terminal_error is None
+                        and observed_monotonic >= confirmed_deadline
+                    ):
+                        set_terminal(
+                            UploadLeaseLostError(
+                                "La renovación se observó después del vencimiento."
+                            )
+                        )
+                except BaseException as clock_error:
+                    set_terminal(clock_error)
+                set_terminal(error)
+                return
+
+            try:
+                if terminal_error is not None:
+                    return
+                observed_monotonic = _upload_monotonic_now()
+                if observed_monotonic >= confirmed_deadline:
+                    set_terminal(
+                        UploadLeaseLostError(
+                            "La renovación se observó después del vencimiento."
+                        )
+                    )
+                    return
+                if renewed_value is None:
+                    set_terminal(
+                        UploadLeaseLostError("Se rechazó la renovación del lease.")
+                    )
+                    return
+                renewed_expiry = _normalize_upload_expiry(renewed_value)
+                utc_now = _normalize_upload_utc(_upload_utc_now())
+                if renewed_expiry <= utc_now or renewed_expiry <= confirmed_expiry:
+                    raise ValueError("Renovación vencida o no extensiva.")
+                renewed_deadline = observed_monotonic + (
+                    renewed_expiry - utc_now
+                ).total_seconds()
+                if renewed_deadline <= _upload_monotonic_now():
+                    raise ValueError("El nuevo deadline ya venció.")
+            except (TypeError, ValueError, OverflowError):
+                set_terminal(
+                    UploadLeaseLostError(
+                        "La renovación devolvió un vencimiento inválido."
+                    )
+                )
+            except BaseException as error:
+                set_terminal(error)
+            else:
+                confirmed_expiry = renewed_expiry
+                confirmed_deadline = renewed_deadline
+                next_renewal_at = observed_monotonic + renew_interval
+            finally:
+                activity_event.set()
+
+        writer_task = asyncio.create_task(
+            self.save_original_pdf(
+                file_id=file_id,
+                filename=filename,
+                data=data,
+                metadata=metadata,
+                should_continue=should_continue,
+            )
+        )
+        writer_task.add_done_callback(observe_writer)
+
+        async def drain_task(task: asyncio.Task) -> None:
+            """Drena una operación sin propagarle cancelaciones del caller."""
+            nonlocal terminal_error
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as cancellation:
+                    current_task = asyncio.current_task()
+                    externally_cancelled = (
+                        current_task is not None and current_task.cancelling() > 0
+                    )
+                    if externally_cancelled or not (
+                        task.done() and task.cancelled()
+                    ):
+                        set_terminal(cancellation)
+                        if not writer_task.done():
+                            writer_task.cancel()
+                    if task.done():
+                        break
+                except BaseException:
+                    break
+
+            try:
+                task.result()
+            except BaseException as error:
+                set_terminal(error)
+
+        try:
+            while True:
+                if writer_task.done() and not writer_observed:
+                    observe_writer(writer_task)
+                if renewal_task is not None and renewal_task.done():
+                    if not renewal_observed:
+                        observe_renewal(renewal_task)
+                    renewal_task = None
+
+                if terminal_error is not None:
+                    if not writer_task.done():
+                        writer_task.cancel()
+                    break
+
+                now_monotonic = _upload_monotonic_now()
+                if now_monotonic >= confirmed_deadline:
+                    set_terminal(
+                        UploadLeaseLostError("El lease de carga venció.")
+                    )
+                    continue
+
+                if writer_done and renewal_task is None:
+                    if _upload_monotonic_now() >= confirmed_deadline:
+                        set_terminal(
+                            UploadLeaseLostError(
+                                "El lease venció antes de retornar."
+                            )
+                        )
+                        continue
+                    return file_id
+
+                if renewal_task is not None:
+                    timeout = confirmed_deadline - now_monotonic
+                    activity_event.clear()
+                    if renewal_task.done():
+                        continue
+                    signaled = await _wait_for_upload_signal(
+                        activity_event,
+                        timeout,
+                    )
+                    if (
+                        not signaled
+                        and _upload_monotonic_now() >= confirmed_deadline
+                    ):
+                        set_terminal(
+                            UploadLeaseLostError(
+                                "El lease venció con una renovación pendiente."
+                            )
+                        )
+                    continue
+
+                if now_monotonic >= next_renewal_at:
+                    renewal_observed = False
+                    renewal_task = asyncio.create_task(
+                        self.renew_upload_lease(document)
+                    )
+                    renewal_task.add_done_callback(observe_renewal)
+                    continue
+
+                timeout = min(
+                    next_renewal_at,
+                    confirmed_deadline,
+                ) - now_monotonic
+                activity_event.clear()
+                if writer_task.done():
+                    continue
+                await _wait_for_upload_signal(activity_event, timeout)
+        except asyncio.CancelledError as cancellation:
+            set_terminal(cancellation)
+            if not writer_task.done():
+                writer_task.cancel()
+        except BaseException as error:
+            set_terminal(error)
+            if not writer_task.done():
+                writer_task.cancel()
+
+        if renewal_task is not None:
+            # Nunca se cancela una renovación iniciada: puede ser una operación Motor.
+            await drain_task(renewal_task)
+        await drain_task(writer_task)
+
+        assert terminal_error is not None
+        raise terminal_error
 
     async def submit_pdf(self, file_bytes: bytes, filename: str) -> DocumentResponse:
         """Guarda los metadatos básicos del PDF en la base de datos.
@@ -348,6 +679,8 @@ class DocumentService:
         filename: str,
         data: bytes,
         metadata: Optional[Mapping[str, Any]] = None,
+        *,
+        should_continue: Callable[[], bool] | None = None,
     ) -> ObjectId:
         """Guarda un PDF original en GridFS usando un identificador preasignado.
 
@@ -380,9 +713,12 @@ class DocumentService:
             cierre se interrumpen.
         """
         gridfs_repo = self.repository._gridfs_repository()
-        return await gridfs_repo.save(
-            file_id=file_id,
-            filename=filename,
-            data=data,
-            metadata=metadata,
-        )
+        save_arguments = {
+            "file_id": file_id,
+            "filename": filename,
+            "data": data,
+            "metadata": metadata,
+        }
+        if should_continue is not None:
+            save_arguments["should_continue"] = should_continue
+        return await gridfs_repo.save(**save_arguments)
