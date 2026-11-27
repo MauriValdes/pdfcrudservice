@@ -1,14 +1,56 @@
 """Adaptador de acceso a GridFS para almacenar los PDF originales."""
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from bson import ObjectId
 from gridfs.errors import NoFile
 from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
 logger = logging.getLogger(__name__)
+
+
+class GridFSUploadInterruptedError(Exception):
+    """La señal del caller indica que no se debe continuar la carga."""
+
+
+async def _await_operation(
+    operation: Awaitable[Any],
+) -> tuple[Any, asyncio.CancelledError | None, bool]:
+    """Espera una operación Motor sin propagarle la cancelación del caller.
+
+    Retorna (resultado, cancelación externa, éxito confirmado). Si el future
+    se cancela o falla mientras se drena una cancelación externa, el tercer
+    valor es False y el resultado remoto se considera incierto.
+    """
+    future = asyncio.ensure_future(operation)
+    try:
+        return await asyncio.shield(future), None, True
+    except asyncio.CancelledError as cancellation:
+        if future.cancelled():
+            return None, cancellation, False
+
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                if future.cancelled():
+                    return None, cancellation, False
+                # Otra cancelación del caller: seguir drenando el mismo future.
+                continue
+            except BaseException:
+                # Recuperar el error al consultar future.result() abajo.
+                break
+
+        if future.cancelled():
+            return None, cancellation, False
+        try:
+            return future.result(), cancellation, True
+        except BaseException:
+            # Consumir el resultado incierto; la cancelación original prevalece.
+            return None, cancellation, False
 
 
 @dataclass(frozen=True)
@@ -39,16 +81,41 @@ class GridFSRepository:
         filename: str,
         data: bytes,
         metadata: Optional[Mapping[str, Any]] = None,
+        *,
+        should_continue: Callable[[], bool] | None = None,
     ) -> ObjectId:
         """Guarda un archivo con un identificador preasignado.
 
         El file_id debe ser un ObjectId nuevo y único para cada intento de
         carga. No se realizan consultas previas para comprobar su disponibilidad.
 
-        El archivo solo se considera guardado cuando ``close()`` finaliza
-        correctamente. Ante cualquier error o cancelación se intenta abortar
-        la carga y se propaga la excepción original.
+        Escribe en bloques GridFS y consulta opcionalmente la señal cooperativa
+        antes de abrir, escribir y cerrar. Un cierre fallido o cancelado se
+        conserva como resultado incierto y nunca se aborta automáticamente.
         """
+        def check_can_continue() -> None:
+            if should_continue is not None and not should_continue():
+                raise GridFSUploadInterruptedError(
+                    "La carga GridFS fue interrumpida por el caller."
+                )
+
+        async def abort_safely() -> None:
+            try:
+                _, abort_cancellation, abort_succeeded = await _await_operation(
+                    grid_in.abort()
+                )
+                if abort_cancellation is not None and not abort_succeeded:
+                    logger.error(
+                        "No se pudo confirmar el abort GridFS para file_id=%s",
+                        file_id,
+                    )
+            except BaseException:
+                logger.exception(
+                    "No se pudo abortar la carga GridFS para file_id=%s",
+                    file_id,
+                )
+
+        check_can_continue()
         bucket = self._bucket()
         grid_in = bucket.open_upload_stream_with_id(
             file_id,
@@ -56,37 +123,46 @@ class GridFSRepository:
             metadata=metadata,
         )
 
-        try:
-            await grid_in.write(data)
-        except BaseException:
-            # write() falló antes de close().
-            # No hay documento en fs.files aún (close no se ejecutó),
-            # abort() limpia chunks parciales (best-effort).
+        chunk_size = grid_in.chunk_size
+        for offset in range(0, len(data), chunk_size):
             try:
-                await grid_in.abort()
+                check_can_continue()
             except BaseException:
-                logger.exception(
-                    "No se pudo abortar la carga GridFS para file_id=%s",
-                    file_id,
-                )
+                await abort_safely()
+                raise
+
+            block = data[offset : offset + chunk_size]
+            # Los errores genéricos de write tienen resultado remoto incierto.
+            _, cancellation, write_succeeded = await _await_operation(
+                grid_in.write(block)
+            )
+
+            if cancellation is not None:
+                if write_succeeded:
+                    await abort_safely()
+                raise cancellation
+
+        try:
+            check_can_continue()
+        except BaseException:
+            await abort_safely()
             raise
 
-        # write() fue exitoso, ahora cerrar
-        try:
-            await grid_in.close()
-        except BaseException:
-            # close() lanzó excepción real.
-            # abort() como limpieza best-effort.
-            try:
-                await grid_in.abort()
-            except BaseException:
-                logger.exception(
-                    "No se pudo abortar la carga GridFS para file_id=%s",
-                    file_id,
-                )
-            raise
+        # close() puede haber persistido el archivo antes de un error.
+        _, cancellation, close_succeeded = await _await_operation(
+            grid_in.close()
+        )
 
-        # Ambos pasos completaron exitosamente
+        if cancellation is not None:
+            # Un cierre iniciado nunca se aborta, aunque termine correctamente.
+            raise cancellation
+        if not close_succeeded:
+            # El future fue cancelado independientemente: resultado incierto.
+            raise asyncio.CancelledError()
+
+        # Una interrupción durante close informa al caller, pero no borra el
+        # archivo completo que close() pudo confirmar.
+        check_can_continue()
         return file_id
 
     async def stat(self, file_id: ObjectId) -> Optional[GridFSFileInfo]:
