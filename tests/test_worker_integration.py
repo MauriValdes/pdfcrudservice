@@ -25,7 +25,7 @@ from src.worker.document_processor import (
     ProcessingResult,
     process_claimed_document,
 )
-from src.worker.circuit_breaker import CircuitBreaker
+from src.worker.circuit_breaker import CircuitBreaker, CircuitBreakerState
 from src.worker.ms2_client import MS2Client, MS2HTTPError
 from src.worker.worker_lifecycle import WorkerLifecycle
 from src.worker.worker_runner import ProcessingWorker
@@ -78,6 +78,22 @@ def _freeze_worker_clock(monkeypatch, now: datetime):
         deterministic_plan_retry,
     )
     return clock
+
+
+class _ControlledMonotonicClock:
+    """Mutable monotonic source injected through the public breaker API."""
+
+    def __init__(self, value: float = 0.0):
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _advance_worker_clocks(wall_clock, monotonic_clock, seconds: float) -> None:
+    """Advance the independent UTC and monotonic test clocks coherently."""
+    wall_clock.now += timedelta(seconds=seconds)
+    monotonic_clock.value += seconds
 
 
 def _build_valid_pdf(unique_text: str) -> bytes:
@@ -328,6 +344,84 @@ async def _create_pending_pdf(context, label: str, *, fields=None) -> dict:
         "filename": filename,
         "pdf_bytes": pdf_bytes,
     }
+
+
+async def _process_with_breaker(
+    context,
+    repository,
+    document,
+    client,
+    circuit_breaker,
+    *,
+    busy_retry_seconds=0.01,
+):
+    """Exercise the production processor with real repos, breaker and client."""
+    return await process_claimed_document(
+        document,
+        processing_repository=repository,
+        gridfs_repository=context.gridfs,
+        ms2_client=MS2Client(
+            client,
+            base_url=_MOCK_MS2_BASE_URL,
+            timeout_seconds=2.0,
+        ),
+        circuit_breaker=circuit_breaker,
+        circuit_breaker_busy_retry_seconds=busy_retry_seconds,
+    )
+
+
+async def _open_breaker_with_integrated_failures(
+    context,
+    repository,
+    client,
+    circuit_breaker,
+    requests,
+    label,
+):
+    """Open through five real, eligible MS2 failures on distinct documents."""
+    fixtures = []
+    for index in range(5):
+        fixture = await _create_pending_pdf(
+            context,
+            f"{label}-seed-{index}",
+        )
+        fixtures.append(fixture)
+        claimed = await repository.claim_pending(
+            f"worker-u452-{label}-seed-{index}"
+        )
+        assert claimed is not None
+        assert claimed.id == str(fixture["document_id"])
+        request_count_before = len(requests)
+
+        outcome = await _process_with_breaker(
+            context,
+            repository,
+            claimed,
+            client,
+            circuit_breaker,
+        )
+
+        assert outcome is ProcessingResult.RETRY_SCHEDULED
+        assert len(requests) == request_count_before + 1
+        persisted = await context.collection.find_one(
+            {"_id": fixture["document_id"]}
+        )
+        assert persisted["status"] == "pending"
+        assert persisted["attempt_count"] == 1
+        assert persisted["last_error"] == "ms2_http_503"
+        assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+        assert (
+            _bson_utc(persisted["processing_cycle_started_at"])
+            == _bson_utc(claimed.processing_cycle_started_at)
+        )
+        assert persisted.get("worker_id") is None
+        assert persisted.get("fencing_token") is None
+        assert persisted.get("lease_until") is None
+        assert persisted.get("heartbeat_at") is None
+        assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
+
+    assert circuit_breaker.state is CircuitBreakerState.OPEN
+    return fixtures
 
 
 async def _assert_no_foreign_eligible_work(context, owned_document_ids):
@@ -1478,3 +1572,484 @@ async def test_expired_owner_result_is_rejected_after_real_recovery(
         finally:
             controlled_repository._allow_later_renewals.set()
             await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_shared_breaker_open_releases_claims_and_worker_continues_to_next_job(
+    worker_integration_context,
+    monkeypatch,
+):
+    context = worker_integration_context
+    wall_clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    monotonic_clock = _ControlledMonotonicClock()
+    circuit_breaker = CircuitBreaker(monotonic_clock=monotonic_clock)
+    repository = ProcessingRepository(context.db)
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            503,
+            headers={"Retry-After": "600"},
+            json={"detail": "private open-breaker seed failure"},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    seed_fixtures = []
+    worker = None
+    worker_task = None
+    try:
+        seed_fixtures = await _open_breaker_with_integrated_failures(
+            context,
+            repository,
+            client,
+            circuit_breaker,
+            requests,
+            "open-shared",
+        )
+        assert len({item["document_id"] for item in seed_fixtures}) == 5
+        assert len(requests) == 5
+
+        deferred = [
+            await _create_pending_pdf(context, f"open-rejected-{index}")
+            for index in range(2)
+        ]
+        released = []
+        active_processors = 0
+        peak_processors = 0
+        two_released = asyncio.Event()
+
+        async def observe_processing(document, **dependencies):
+            nonlocal active_processors, peak_processors
+            active_processors += 1
+            peak_processors = max(peak_processors, active_processors)
+            try:
+                outcome = await process_claimed_document(
+                    document,
+                    **dependencies,
+                )
+                released.append((document.id, outcome))
+                if len(released) == len(deferred):
+                    two_released.set()
+                return outcome
+            finally:
+                active_processors -= 1
+
+        worker = ProcessingWorker(
+            repository,
+            context.gridfs,
+            MS2Client(
+                client,
+                base_url=_MOCK_MS2_BASE_URL,
+                timeout_seconds=2.0,
+            ),
+            circuit_breaker=circuit_breaker,
+            processor=observe_processing,
+            max_concurrency=1,
+            poll_initial_seconds=0.01,
+            poll_max_seconds=0.05,
+        )
+        worker_task = asyncio.create_task(worker.run())
+        await asyncio.wait_for(
+            two_released.wait(),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        worker.request_stop()
+        await _wait_for_tasks([worker_task])
+        worker_task.result()
+
+        assert circuit_breaker.state is CircuitBreakerState.OPEN
+        assert len(requests) == 5
+        assert peak_processors == 1
+        assert len(released) == 2
+        assert {document_id for document_id, _ in released} == {
+            str(item["document_id"]) for item in deferred
+        }
+        assert all(
+            outcome is ProcessingResult.CIRCUIT_BREAKER_RELEASED
+            for _, outcome in released
+        )
+
+        for fixture in deferred:
+            persisted = await context.collection.find_one(
+                {"_id": fixture["document_id"]}
+            )
+            assert persisted["status"] == "pending"
+            assert persisted["attempt_count"] == 0
+            assert isinstance(persisted["processing_cycle_id"], str)
+            assert persisted["processing_cycle_id"]
+            assert isinstance(persisted["processing_cycle_started_at"], datetime)
+            assert _bson_utc(persisted["next_retry_at"]) == (
+                wall_clock.now + timedelta(seconds=30)
+            )
+            for field in (
+                "worker_id",
+                "fencing_token",
+                "lease_until",
+                "heartbeat_at",
+            ):
+                assert persisted.get(field) is None
+            assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
+    finally:
+        if worker is not None:
+            worker.request_stop()
+        if worker_task is not None:
+            await _wait_for_tasks([worker_task])
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_half_open_probe_is_exclusive_busy_claim_releases_and_success_closes(
+    worker_integration_context,
+    monkeypatch,
+):
+    context = worker_integration_context
+    wall_clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    monotonic_clock = _ControlledMonotonicClock()
+    circuit_breaker = CircuitBreaker(monotonic_clock=monotonic_clock)
+    repository = ProcessingRepository(context.db)
+    requests = []
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+
+    async def transport_handler(request):
+        requests.append(request)
+        if len(requests) <= 5:
+            return httpx.Response(
+                503,
+                headers={"Retry-After": "600"},
+                json={"detail": "private breaker seed failure"},
+            )
+        if len(requests) == 6:
+            probe_started.set()
+            await release_probe.wait()
+        return httpx.Response(
+            200,
+            json={"content": "half-open probe succeeded", "page_count": 2},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    probe_task = None
+    try:
+        await _open_breaker_with_integrated_failures(
+            context,
+            repository,
+            client,
+            circuit_breaker,
+            requests,
+            "half-open-exclusive",
+        )
+        _advance_worker_clocks(wall_clock, monotonic_clock, 30.0)
+        assert monotonic_clock.value == 30.0
+
+        probe = await _create_pending_pdf(context, "half-open-probe")
+        busy = await _create_pending_pdf(context, "half-open-busy")
+        normal = await _create_pending_pdf(context, "half-open-after-close")
+        probe_claim = await repository.claim_pending("worker-u452-half-open-probe")
+        assert probe_claim is not None
+        assert probe_claim.id == str(probe["document_id"])
+        probe_task = asyncio.create_task(
+            _process_with_breaker(
+                context,
+                repository,
+                probe_claim,
+                client,
+                circuit_breaker,
+            )
+        )
+        await asyncio.wait_for(
+            probe_started.wait(),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        probe_processing = await context.collection.find_one(
+            {"_id": probe["document_id"]}
+        )
+        assert probe_processing["status"] == "processing"
+        assert probe_processing["attempt_count"] == 1
+        assert len(requests) == 6
+
+        busy_claim = await repository.claim_pending("worker-u452-half-open-busy")
+        assert busy_claim is not None
+        assert busy_claim.id == str(busy["document_id"])
+        busy_result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                repository,
+                busy_claim,
+                client,
+                circuit_breaker,
+                busy_retry_seconds=0.01,
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        assert busy_result is ProcessingResult.CIRCUIT_BREAKER_RELEASED
+        busy_persisted = await context.collection.find_one(
+            {"_id": busy["document_id"]}
+        )
+        assert busy_persisted["status"] == "pending"
+        assert busy_persisted["attempt_count"] == 0
+        assert _bson_utc(busy_persisted["next_retry_at"]) == (
+            wall_clock.now + timedelta(seconds=0.01)
+        )
+        for field in (
+            "worker_id",
+            "fencing_token",
+            "lease_until",
+            "heartbeat_at",
+        ):
+            assert busy_persisted.get(field) is None
+        assert len(requests) == 6
+        assert circuit_breaker.state is CircuitBreakerState.HALF_OPEN
+
+        release_probe.set()
+        probe_result = await asyncio.wait_for(
+            probe_task,
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        probe_task = None
+        assert probe_result is ProcessingResult.COMPLETED
+        assert circuit_breaker.state is CircuitBreakerState.CLOSED
+        probe_completed = await context.collection.find_one(
+            {"_id": probe["document_id"]}
+        )
+        assert probe_completed["status"] == "completed"
+        assert probe_completed["attempt_count"] == 1
+        assert probe_completed["content"] == "half-open probe succeeded"
+
+        normal_claim = await repository.claim_pending("worker-u452-after-half-open")
+        assert normal_claim is not None
+        assert normal_claim.id == str(normal["document_id"])
+        normal_result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                repository,
+                normal_claim,
+                client,
+                circuit_breaker,
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        assert normal_result is ProcessingResult.COMPLETED
+        assert circuit_breaker.state is CircuitBreakerState.CLOSED
+        assert len(requests) == 7
+        assert await context.gridfs.read(busy["file_id"]) == busy["pdf_bytes"]
+    finally:
+        release_probe.set()
+        if probe_task is not None:
+            await _wait_for_tasks([probe_task])
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_half_open_eligible_failure_reopens_and_open_rejects_until_probe_window(
+    worker_integration_context,
+    monkeypatch,
+):
+    context = worker_integration_context
+    wall_clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    monotonic_clock = _ControlledMonotonicClock()
+    circuit_breaker = CircuitBreaker(monotonic_clock=monotonic_clock)
+    repository = ProcessingRepository(context.db)
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        retry_after = "600"
+        status_code = 503
+        response_json = {"detail": "private transient failure"}
+        if len(requests) == 6:
+            retry_after = "600"
+        return httpx.Response(
+            status_code,
+            headers={"Retry-After": retry_after},
+            json=response_json,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    try:
+        await _open_breaker_with_integrated_failures(
+            context,
+            repository,
+            client,
+            circuit_breaker,
+            requests,
+            "half-open-reopen",
+        )
+        _advance_worker_clocks(wall_clock, monotonic_clock, 30.0)
+        probe = await _create_pending_pdf(context, "half-open-failure-probe")
+        probe_claim = await repository.claim_pending("worker-u452-half-open-failure")
+        assert probe_claim is not None
+        assert probe_claim.id == str(probe["document_id"])
+
+        failure_result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                repository,
+                probe_claim,
+                client,
+                circuit_breaker,
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        assert failure_result is ProcessingResult.RETRY_SCHEDULED
+        assert circuit_breaker.state is CircuitBreakerState.OPEN
+        assert len(requests) == 6
+        failed_probe = await context.collection.find_one(
+            {"_id": probe["document_id"]}
+        )
+        assert failed_probe["status"] == "pending"
+        assert failed_probe["attempt_count"] == 1
+        assert failed_probe["last_error"] == "ms2_http_503"
+        assert failed_probe["processing_cycle_id"] == probe_claim.processing_cycle_id
+        assert _bson_utc(failed_probe["processing_cycle_started_at"]) == (
+            _bson_utc(probe_claim.processing_cycle_started_at)
+        )
+        assert failed_probe.get("worker_id") is None
+        assert failed_probe.get("fencing_token") is None
+        assert failed_probe.get("lease_until") is None
+        assert failed_probe.get("heartbeat_at") is None
+        assert await context.gridfs.read(probe["file_id"]) == probe["pdf_bytes"]
+
+        _advance_worker_clocks(wall_clock, monotonic_clock, 29.999)
+        rejected = await _create_pending_pdf(context, "reopened-open-rejection")
+        rejected_claim = await repository.claim_pending("worker-u452-reopened-open")
+        assert rejected_claim is not None
+        assert rejected_claim.id == str(rejected["document_id"])
+        rejected_result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                repository,
+                rejected_claim,
+                client,
+                circuit_breaker,
+                busy_retry_seconds=0.01,
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        assert rejected_result is ProcessingResult.CIRCUIT_BREAKER_RELEASED
+        assert circuit_breaker.state is CircuitBreakerState.OPEN
+        assert len(requests) == 6
+        rejected_persisted = await context.collection.find_one(
+            {"_id": rejected["document_id"]}
+        )
+        assert rejected_persisted["status"] == "pending"
+        assert rejected_persisted["attempt_count"] == 0
+        assert _bson_utc(rejected_persisted["next_retry_at"]) == (
+            wall_clock.now + timedelta(seconds=0.01)
+        )
+        assert await context.gridfs.read(rejected["file_id"]) == rejected["pdf_bytes"]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cycle_window_exhausts_atomically_while_breaker_is_open(
+    worker_integration_context,
+    monkeypatch,
+):
+    context = worker_integration_context
+    wall_clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    monotonic_clock = _ControlledMonotonicClock()
+    circuit_breaker = CircuitBreaker(monotonic_clock=monotonic_clock)
+    repository = ProcessingRepository(context.db)
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            503,
+            headers={"Retry-After": "600"},
+            json={"detail": "private exhaustion seed failure"},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    target = await _create_pending_pdf(context, "open-cycle-window-exhaustion")
+    try:
+        target_claim = await repository.claim_pending(
+            "worker-u452-open-cycle-target"
+        )
+        assert target_claim is not None
+        assert target_claim.id == str(target["document_id"])
+        cycle_started_at = _bson_utc(target_claim.processing_cycle_started_at)
+
+        # Preserve the real lease through repository renewals while advancing
+        # UTC and monotonic time together. Open the breaker only 29.999s before
+        # this document's genuine ten-minute cycle deadline.
+        for _ in range(19):
+            assert await repository.renew_processing_lease(
+                target_claim.id,
+                target_claim.worker_id,
+                target_claim.fencing_token,
+            )
+            _advance_worker_clocks(wall_clock, monotonic_clock, 30.0)
+        assert await repository.renew_processing_lease(
+            target_claim.id,
+            target_claim.worker_id,
+            target_claim.fencing_token,
+        )
+        _advance_worker_clocks(wall_clock, monotonic_clock, 0.001)
+        assert wall_clock.now == cycle_started_at + timedelta(
+            seconds=570.001
+        )
+
+        await _open_breaker_with_integrated_failures(
+            context,
+            repository,
+            client,
+            circuit_breaker,
+            requests,
+            "cycle-window-open",
+        )
+        assert circuit_breaker.state is CircuitBreakerState.OPEN
+        assert len(requests) == 5
+
+        _advance_worker_clocks(wall_clock, monotonic_clock, 29.999)
+        assert wall_clock.now == cycle_started_at + timedelta(minutes=10)
+        assert monotonic_clock.value == 600.0
+
+        result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                repository,
+                target_claim,
+                client,
+                circuit_breaker,
+                busy_retry_seconds=0.01,
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        assert result is ProcessingResult.FAILED_EXHAUSTED
+        assert circuit_breaker.state is CircuitBreakerState.OPEN
+        assert len(requests) == 5
+
+        exhausted = await context.collection.find_one(
+            {"_id": target["document_id"]}
+        )
+        assert exhausted["status"] == "failed"
+        assert exhausted["attempt_count"] == 0
+        assert exhausted["processing_cycle_id"] == target_claim.processing_cycle_id
+        assert _bson_utc(exhausted["processing_cycle_started_at"]) == cycle_started_at
+        assert exhausted["last_error"] == "cycle_window_exhausted"
+        assert exhausted["error_message"] == (
+            "Se agotó el tiempo disponible para el procesamiento."
+        )
+        assert "next_retry_at" not in exhausted
+        assert exhausted["worker_id"] == target_claim.worker_id
+        assert exhausted["fencing_token"] == target_claim.fencing_token
+        assert exhausted.get("lease_until") is None
+        assert _bson_utc(exhausted["heartbeat_at"]) == wall_clock.now
+        assert await context.gridfs.read(target["file_id"]) == target["pdf_bytes"]
+    finally:
+        await client.aclose()
