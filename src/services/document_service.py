@@ -722,3 +722,36 @@ class DocumentService:
         if should_continue is not None:
             save_arguments["should_continue"] = should_continue
         return await gridfs_repo.save(**save_arguments)
+
+    async def save_and_finalize_upload(
+        self,
+        document: DocumentModel,
+        file_id: ObjectId,
+        filename: str,
+        data: bytes,
+        metadata: Mapping[str, Any] | None = None,
+        *,
+        ownership_acquired: bool,
+    ) -> bool:
+        """Guarda el PDF y solicita su asociación atómica a la reserva.
+
+        La adquisición de propiedad debe haberse confirmado previamente.
+        ``file_id`` debe ser un ObjectId nuevo y exclusivo de este intento.
+        La finalización vuelve a validar atómicamente la propiedad y vigencia
+        del lease en el repositorio; este método no compensa ni reconcilia
+        resultados rechazados o inciertos.
+        """
+        await self.save_original_pdf_with_lease(
+            document,
+            file_id,
+            filename,
+            data,
+            metadata,
+            ownership_acquired=ownership_acquired,
+        )
+        return await self.repository.finalize_upload(
+            document.id,
+            document.upload_owner_id,
+            document.upload_fencing_token,
+            file_id,
+        )
