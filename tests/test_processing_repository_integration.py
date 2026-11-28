@@ -1754,9 +1754,13 @@ def _retry_owner_arguments(claimed):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    "failure_code",
+    ["ms2_http_503", "ms2_invalid_response"],
+)
 @pytest.mark.asyncio
 async def test_transient_retry_releases_owner_and_preserves_cycle_and_original_pdf(
-    testing_context, monkeypatch
+    testing_context, monkeypatch, failure_code
 ):
     db, resources = testing_context
     document, claimed, now, cycle_id = await _claim_processing_document(
@@ -1797,7 +1801,7 @@ async def test_transient_retry_releases_owner_and_preserves_cycle_and_original_p
     released = await repository.schedule_transient_retry(
         *_retry_owner_arguments(claimed),
         attempt_number,
-        "ms2_http_503",
+        failure_code,
         proposed_retry,
     )
 
@@ -1810,7 +1814,7 @@ async def test_transient_retry_releases_owner_and_preserves_cycle_and_original_p
             "next_retry_at": proposed_retry.astimezone(timezone.utc).replace(
                 tzinfo=None
             ),
-            "last_error": "ms2_http_503",
+            "last_error": failure_code,
         }
     )
     removed_fields = (
@@ -4255,6 +4259,22 @@ _RED_FAILURE_MESSAGES = {
     "ms2_invalid_input": "El archivo PDF no es válido.",
     "pdf_too_large": "El archivo PDF supera el tamaño máximo permitido.",
     "pdf_unprocessable": "No se pudo procesar el archivo PDF.",
+    "ms2_http_401": (
+        "No se pudo completar el procesamiento debido a un problema técnico "
+        "del servicio."
+    ),
+    "ms2_http_403": (
+        "No se pudo completar el procesamiento debido a un problema técnico "
+        "del servicio."
+    ),
+    "ms2_http_404": (
+        "No se pudo completar el procesamiento debido a un problema técnico "
+        "del servicio."
+    ),
+    "ms2_http_unclassified": (
+        "No se pudo completar el procesamiento debido a un problema técnico "
+        "del servicio."
+    ),
 }
 _RED_EXHAUSTION_MESSAGES = {
     "attempts_exhausted": "Se agotaron los intentos de procesamiento.",
@@ -4288,6 +4308,26 @@ async def _invoke_terminal_operation(repository, operation, fixture, **kwargs):
             "pdf_unprocessable",
             "No se pudo procesar el archivo PDF.",
             0,
+        ),
+        (
+            "ms2_http_401",
+            "No se pudo completar el procesamiento debido a un problema técnico del servicio.",
+            0,
+        ),
+        (
+            "ms2_http_403",
+            "No se pudo completar el procesamiento debido a un problema técnico del servicio.",
+            0,
+        ),
+        (
+            "ms2_http_404",
+            "No se pudo completar el procesamiento debido a un problema técnico del servicio.",
+            4,
+        ),
+        (
+            "ms2_http_unclassified",
+            "No se pudo completar el procesamiento debido a un problema técnico del servicio.",
+            4,
         ),
     ],
 )

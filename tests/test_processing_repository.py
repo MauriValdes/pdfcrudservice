@@ -1598,6 +1598,22 @@ _RED_FAILURE_MESSAGES = {
     "ms2_invalid_input": "El archivo PDF no es válido.",
     "pdf_too_large": "El archivo PDF supera el tamaño máximo permitido.",
     "pdf_unprocessable": "No se pudo procesar el archivo PDF.",
+    "ms2_http_401": (
+        "No se pudo completar el procesamiento debido a un problema técnico "
+        "del servicio."
+    ),
+    "ms2_http_403": (
+        "No se pudo completar el procesamiento debido a un problema técnico "
+        "del servicio."
+    ),
+    "ms2_http_404": (
+        "No se pudo completar el procesamiento debido a un problema técnico "
+        "del servicio."
+    ),
+    "ms2_http_unclassified": (
+        "No se pudo completar el procesamiento debido a un problema técnico "
+        "del servicio."
+    ),
 }
 _RED_EXHAUSTION_MESSAGES = {
     "attempts_exhausted": "Se agotaron los intentos de procesamiento.",
@@ -1862,6 +1878,7 @@ async def test_fail_exhausted_processing_builds_atomic_priority_pipeline(
         (1.0, "ms2_invalid_input"),
         (1, "attempts_exhausted"),
         (1, "cycle_window_exhausted"),
+        (1, "ms2_invalid_response"),
         (1, "$where"),
         (1, ["ms2_invalid_input"]),
         (1, RuntimeError("do not persist exception text")),
@@ -2006,6 +2023,7 @@ _TRANSIENT_RETRY_CODES = (
     "ms2_timeout",
     "ms2_connection_error",
     "ms2_protocol_error",
+    "ms2_invalid_response",
 )
 
 
@@ -2143,6 +2161,10 @@ async def test_schedule_transient_retry_accepts_only_closed_transient_codes(
         (True, "ms2_http_503"),
         (3.0, "ms2_http_503"),
         (3, "ms2_invalid_input"),
+        (3, "ms2_http_401"),
+        (3, "ms2_http_403"),
+        (3, "ms2_http_404"),
+        (3, "ms2_http_unclassified"),
         (3, "attempts_exhausted"),
         (3, "cycle_window_exhausted"),
         (3, "$where"),

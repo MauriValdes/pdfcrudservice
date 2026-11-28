@@ -143,13 +143,23 @@ _TRANSIENT_RETRY_CODES = frozenset(
         "ms2_timeout",
         "ms2_connection_error",
         "ms2_protocol_error",
+        "ms2_invalid_response",
     }
+)
+
+_TECHNICAL_FAILURE_PUBLIC_MESSAGE = (
+    "No se pudo completar el procesamiento debido a un problema técnico "
+    "del servicio."
 )
 
 _FAILURE_PUBLIC_MESSAGES = {
     "ms2_invalid_input": "El archivo PDF no es válido.",
     "pdf_too_large": "El archivo PDF supera el tamaño máximo permitido.",
     "pdf_unprocessable": "No se pudo procesar el archivo PDF.",
+    "ms2_http_401": _TECHNICAL_FAILURE_PUBLIC_MESSAGE,
+    "ms2_http_403": _TECHNICAL_FAILURE_PUBLIC_MESSAGE,
+    "ms2_http_404": _TECHNICAL_FAILURE_PUBLIC_MESSAGE,
+    "ms2_http_unclassified": _TECHNICAL_FAILURE_PUBLIC_MESSAGE,
 }
 
 _EXHAUSTION_PUBLIC_MESSAGES = {
