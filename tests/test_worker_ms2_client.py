@@ -292,19 +292,22 @@ async def test_redirect_is_not_followed_even_if_injected_client_enables_redirect
 
 
 @pytest.mark.parametrize(
-    "error",
+    ("error", "transport_kind"),
     [
-        httpx.TimeoutException("read timed out"),
-        httpx.ConnectTimeout("connect timed out"),
-        httpx.ReadTimeout("read timed out"),
-        httpx.ConnectError("connection failed"),
-        httpx.ConnectError("DNS lookup failed"),
-        httpx.ReadError("transport failed"),
-        httpx.RemoteProtocolError("remote protocol failed"),
+        (httpx.TimeoutException("read timed out"), "timeout"),
+        (httpx.ConnectTimeout("connect timed out"), "timeout"),
+        (httpx.ReadTimeout("read timed out"), "timeout"),
+        (httpx.ConnectError("connection failed"), "connection"),
+        (httpx.ConnectError("DNS lookup failed"), "connection"),
+        (httpx.ReadError("transport failed"), "protocol"),
+        (httpx.WriteError("transport failed"), "protocol"),
+        (httpx.RemoteProtocolError("remote protocol failed"), "protocol"),
     ],
 )
 @pytest.mark.asyncio
-async def test_httpx_timeout_and_network_errors_are_transient_and_keep_cause(error):
+async def test_httpx_timeout_and_network_errors_are_structured_and_keep_cause(
+    error, transport_kind
+):
     def handler(request):
         raise error
 
@@ -314,6 +317,7 @@ async def test_httpx_timeout_and_network_errors_are_transient_and_keep_cause(err
         await ms2.extract(PDF_BYTES, "document.pdf")
 
     assert raised.value.classification == "transient"
+    assert raised.value.transport_kind.value == transport_kind
     assert raised.value.__cause__ is error
     await http_client.aclose()
 
@@ -364,6 +368,7 @@ async def test_total_deadline_cancels_in_flight_request_and_is_transient():
     assert request_started.is_set()
     assert handler_cancelled.is_set()
     assert raised.value.classification == "transient"
+    assert raised.value.transport_kind.value == "timeout"
     assert isinstance(raised.value.__cause__, TimeoutError)
     await http_client.aclose()
 

@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
+from enum import Enum
 import math
 from numbers import Real
 from typing import Literal
@@ -11,6 +12,14 @@ import httpx
 
 
 ErrorClassification = Literal["transient", "permanent_input", "unclassified"]
+
+
+class TransportKind(str, Enum):
+    """Structured kind of remote transport failure observed by the MS2 client."""
+
+    TIMEOUT = "timeout"
+    CONNECTION = "connection"
+    PROTOCOL = "protocol"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +54,17 @@ class MS2TransportError(MS2ClientError):
 
     classification: Literal["transient"] = "transient"
 
-    def __init__(self, message: str = "MS2 request failed") -> None:
+    def __init__(
+        self,
+        message: str = "MS2 request failed",
+        *,
+        transport_kind: TransportKind | None = None,
+    ) -> None:
+        if transport_kind is not None and not isinstance(
+            transport_kind, TransportKind
+        ):
+            raise TypeError("transport_kind must be a TransportKind or None")
+        self.transport_kind = transport_kind
         super().__init__(message)
 
 
@@ -138,16 +157,29 @@ class MS2Client:
             # transport or a custom handler as expiration of our deadline.
             if not deadline.expired():
                 raise
-            raise MS2TransportError("MS2 request exceeded its total deadline") from exc
+            raise MS2TransportError(
+                "MS2 request exceeded its total deadline",
+                transport_kind=TransportKind.TIMEOUT,
+            ) from exc
         except httpx.TimeoutException as exc:
-            raise MS2TransportError("MS2 request timed out") from exc
+            raise MS2TransportError(
+                "MS2 request timed out",
+                transport_kind=TransportKind.TIMEOUT,
+            ) from exc
+        except httpx.ConnectError as exc:
+            raise MS2TransportError(
+                "MS2 connection failed",
+                transport_kind=TransportKind.CONNECTION,
+            ) from exc
         except (
-            httpx.ConnectError,
             httpx.ReadError,
             httpx.WriteError,
             httpx.RemoteProtocolError,
         ) as exc:
-            raise MS2TransportError("MS2 network or remote protocol failure") from exc
+            raise MS2TransportError(
+                "MS2 remote transport or protocol failure",
+                transport_kind=TransportKind.PROTOCOL,
+            ) from exc
 
         if response.status_code != 200:
             if response.status_code in _TRANSIENT_STATUSES:
