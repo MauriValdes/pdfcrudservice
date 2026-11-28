@@ -34,6 +34,7 @@ configure_logging(SERVICE_NAME, level=settings.log_level)
 from fastapi import FastAPI  # noqa: E402
 
 from src.api.docs_api import router as docs_router  # noqa: E402
+from src.api.pdf_validation import PdfValidationExecutor  # noqa: E402
 from src.core.exceptions import register_exception_handlers  # noqa: E402
 from src.database.mongodb import db_connection, retry_connect  # noqa: E402
 
@@ -52,30 +53,44 @@ logger.info("Servicio MS3 (pdfcrudservice) iniciado")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    # Iniciar tarea de conexión y supervisión de MongoDB en background.
-    # Esto permite que FastAPI inicie aunque MongoDB no esté disponible.
-    # La tarea intentará conectarse con backoff exponencial y, tras éxito,
-    # iniciará supervisión continua con ping periódico.
-    logger.info("Iniciando conexión con MongoDB...")
-    connection_task = asyncio.create_task(retry_connect())
-    logger.info("Tarea de conexión MongoDB iniciada en background")
+    pdf_validation_executor = PdfValidationExecutor()
+    app.state.pdf_validation_executor = pdf_validation_executor
+    connection_task = None
 
     try:
+        # Iniciar tarea de conexión y supervisión de MongoDB en background.
+        # Esto permite que FastAPI inicie aunque MongoDB no esté disponible.
+        # La tarea intentará conectarse con backoff exponencial y, tras éxito,
+        # iniciará supervisión continua con ping periódico.
+        logger.info("Iniciando conexión con MongoDB...")
+        connection_task = asyncio.create_task(retry_connect())
+        logger.info("Tarea de conexión MongoDB iniciada en background")
         yield
     finally:
-        # Cancelar la tarea de conexión/supervisión
-        connection_task.cancel()
-        # Detener tarea de supervisión (si existe)
-        await db_connection.stop_supervision()
-        # Esperar a que la tarea de conexión se detenga (puede lanzar CancelledError)
+        # Rechazar nuevas validaciones antes de esperar a que termine la activa.
+        app.state.pdf_validation_executor = None
+        pdf_validation_executor.begin_shutdown()
         try:
-            await connection_task
-        except asyncio.CancelledError:
-            logger.info("Tarea de conexión MongoDB cancelada durante apagado")
-        # Cerrar conexión MongoDB gracefully
-        await db_connection.disconnect()
-        logger.info("Cerrando conexiones...")
+            await pdf_validation_executor.aclose()
+        finally:
+            # Mantener la limpieza MongoDB existente incluso si falla el cierre
+            # del executor PDF.
+            if connection_task is not None:
+                # Cancelar la tarea de conexión/supervisión
+                connection_task.cancel()
+            # Detener tarea de supervisión (si existe)
+            await db_connection.stop_supervision()
+            # Esperar a que la tarea de conexión se detenga
+            if connection_task is not None:
+                try:
+                    await connection_task
+                except asyncio.CancelledError:
+                    logger.info(
+                        "Tarea de conexión MongoDB cancelada durante apagado"
+                    )
+            # Cerrar conexión MongoDB gracefully
+            await db_connection.disconnect()
+            logger.info("Cerrando conexiones...")
 
 
 app = FastAPI(
