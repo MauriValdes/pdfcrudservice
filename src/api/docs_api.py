@@ -14,7 +14,7 @@ from fastapi import (
 )
 
 from src.api.pdf_validation import PdfValidationExecutor, validate_pdf_upload
-from src.schemas.document import DocumentReceipt, DocumentUpdate, DocumentResponse
+from src.schemas.document import DocumentReceipt, DocumentResponse
 from src.core.exceptions import AppError, DatabaseUnavailableError
 from src.database.mongodb import db_connection
 from src.repository.document_repository import DocumentRepository, InvalidObjectIdError
@@ -229,47 +229,6 @@ async def get_document_by_id(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error al obtener documento"
-        )
-
-
-# 4. UPDATE: Actualizar un documento (PATCH parcial)
-@router.patch(
-    "/{document_id}",
-    status_code=status.HTTP_200_OK,
-    response_model=DocumentResponse,
-)
-async def update_document(
-    document_id: str,
-    update_data: DocumentUpdate,
-    service: DocumentService = Depends(get_document_service),
-):
-    """Actualiza parcialmente un documento (status, content, page_count, error_message).
-
-    Solo los campos proporcionados serán actualizados en la base de datos.
-    """
-    try:
-        doc = await service.update_document(document_id, update_data)
-        if not doc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Documento no encontrado"
-            )
-        return doc
-    except InvalidObjectIdError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    except HTTPException:
-        raise
-    except AppError:
-        # Indisponibilidad de MongoDB (503): el manejador central la traduce.
-        raise
-    except Exception as e:
-        logger.error(f"Error al actualizar documento {document_id}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error al actualizar documento"
         )
 
 

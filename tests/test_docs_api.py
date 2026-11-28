@@ -157,37 +157,6 @@ def test_get_document_by_id_returns_404(client, mock_service):
     assert response.status_code == 404
 
 
-def test_update_document_partial(client, mock_service):
-    now = datetime.datetime.now()
-    retrieved_doc = DocumentResponse(
-        id="1",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=512,
-        status="completed",
-        content="Texto extraído",
-        page_count=3,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.update_document.return_value = retrieved_doc
-    update_data = {
-        "status": "completed",
-        "content": "Texto extraído",
-        "page_count": 3,
-    }
-    response = client.patch("/documents/test-id", json=update_data)
-    assert response.status_code == 200
-
-
-def test_update_document_not_found(client, mock_service):
-    mock_service.update_document.return_value = None
-    update_data = {"status": "processing"}
-    response = client.patch("/documents/nonexistent-id", json=update_data)
-    assert response.status_code == 404
-
-
 def test_delete_document_returns_204(client, mock_service):
     mock_service.delete_document.return_value = True
     response = client.delete("/documents/test-id")
@@ -207,16 +176,6 @@ def test_get_document_by_id_invalid_objectid_returns_400(client, mock_service):
     assert response.json()["detail"] == "Identificador de documento inválido"
 
 
-def test_update_document_invalid_objectid_returns_400(client, mock_service):
-    """ObjectId inválido en PATCH /documents/{id} debe devolver 400."""
-    mock_service.update_document.side_effect = InvalidObjectIdError(
-        "Identificador de documento inválido"
-    )
-    response = client.patch("/documents/id-invalido", json={"status": "completed"})
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Identificador de documento inválido"
-
-
 def test_delete_document_invalid_objectid_returns_400(client, mock_service):
     """ObjectId inválido en DELETE /documents/{id} debe devolver 400."""
     mock_service.delete_document.side_effect = InvalidObjectIdError(
@@ -225,14 +184,6 @@ def test_delete_document_invalid_objectid_returns_400(client, mock_service):
     response = client.delete("/documents/id-invalido")
     assert response.status_code == 400
     assert response.json()["detail"] == "Identificador de documento inválido"
-
-
-def test_update_document_valid_objectid_not_found_returns_404(client, mock_service):
-    """ObjectId válido inexistente en PATCH devuelve 404."""
-    valid_id = str(ObjectId())
-    mock_service.update_document.return_value = None
-    response = client.patch(f"/documents/{valid_id}", json={"status": "processing"})
-    assert response.status_code == 404
 
 
 def test_delete_document_valid_objectid_not_found_returns_404(client, mock_service):
@@ -271,21 +222,6 @@ def test_get_document_by_id_unexpected_error_returns_500_generic(
     body = response.json()
     assert body["detail"] == "Error al obtener documento"
     assert "Detalle técnico interno de MongoDB" not in body["detail"]
-
-
-def test_update_document_unexpected_error_returns_500_generic(
-    client, mock_service
-):
-    """PATCH /documents/{id} ante error inesperado devuelve 500 sin detalles internos."""
-    valid_id = str(ObjectId())
-    mock_service.update_document.side_effect = Exception(
-        "Error interno al actualizar en processed_pdfs"
-    )
-    response = client.patch(f"/documents/{valid_id}", json={"status": "completed"})
-    assert response.status_code == 500
-    body = response.json()
-    assert body["detail"] == "Error al actualizar documento"
-    assert "Error interno al actualizar en processed_pdfs" not in body["detail"]
 
 
 def test_delete_document_unexpected_error_returns_500_generic(
@@ -435,8 +371,7 @@ def _mock_collection_raising(operation: str, error: Exception):
 
 
 def test_endpoints_return_503_when_db_is_none(client, monkeypatch):
-    """Si db_connection.db es None (conexión nunca establecida), los cinco
-    endpoints CRUD responden 503 y no 500 con TypeError."""
+    """Con MongoDB caído, PATCH se rechaza por routing sin resolver dependencias."""
     _patch_db_connection(monkeypatch, None, connected=False)
     valid_id = str(ObjectId())
     files = {"file": ("test.pdf", PDF_BYTES, "application/pdf")}
@@ -449,7 +384,7 @@ def test_endpoints_return_503_when_db_is_none(client, monkeypatch):
     assert client.get(f"/documents/{valid_id}").status_code == 503
     assert client.patch(
         f"/documents/{valid_id}", json={"status": "completed"}
-    ).status_code == 503
+    ).status_code == 405
     assert client.delete(f"/documents/{valid_id}").status_code == 503
 
 
@@ -501,20 +436,6 @@ def test_upload_pdf_returns_503_when_mongodb_fails_mid_flow(client, monkeypatch)
     response = client.post("/documents/", files=files)
     assert response.status_code == 503
     assert "El documento ya existe" not in response.json()["detail"]
-
-
-def test_patch_returns_503_on_connectivity_error(client, monkeypatch):
-    """PATCH /documents/{id} con update_one fallando por conectividad -> 503."""
-    mock_db = _mock_db_with_collection(
-        _mock_collection_raising("update_one", AutoReconnect("simulado"))
-    )
-    _patch_db_connection(monkeypatch, mock_db, connected=True)
-
-    response = client.patch(
-        f"/documents/{str(ObjectId())}", json={"status": "completed"}
-    )
-    assert response.status_code == 503
-    assert "base de datos" in response.json()["detail"]
 
 
 def test_delete_returns_503_on_connectivity_error(client, monkeypatch):
