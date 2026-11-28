@@ -4,6 +4,7 @@ import asyncio
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
+import logging
 from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlsplit
 from uuid import uuid4
@@ -34,6 +35,48 @@ _MOCK_MS2_BASE_URL = "http://ms2.test"
 _SUCCESS_CONTENT = "integral worker extraction"
 _SUCCESS_PAGE_COUNT = 3
 _FIXTURE_TIMEOUT_SECONDS = 8
+
+
+def _bson_utc(value: datetime) -> datetime:
+    """Normalize MongoDB's timezone-naive UTC dates for assertions."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _current_bson_utc() -> datetime:
+    """Capture one UTC instant at MongoDB's persisted millisecond precision."""
+    now = datetime.now(timezone.utc)
+    return now.replace(microsecond=(now.microsecond // 1000) * 1000)
+
+
+def _freeze_worker_clock(monkeypatch, now: datetime):
+    """Freeze repository and processor time while retaining the real retry policy."""
+    from src.repository import processing_repository as repository_module
+    from src.worker import document_processor as processor_module
+
+    clock = SimpleNamespace(now=now)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is timezone.utc
+            return clock.now
+
+    monkeypatch.setattr(repository_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(processor_module, "_utc_now", lambda: clock.now)
+    real_plan_retry = processor_module.plan_retry
+
+    def deterministic_plan_retry(*args, **kwargs):
+        kwargs.setdefault("uniform", lambda lower, _upper: lower)
+        return real_plan_retry(*args, **kwargs)
+
+    monkeypatch.setattr(
+        processor_module,
+        "plan_retry",
+        deterministic_plan_retry,
+    )
+    return clock
 
 
 def _build_valid_pdf(unique_text: str) -> bytes:
@@ -820,6 +863,458 @@ async def test_processor_persists_only_authorized_failure_outcomes(
                 "error_message",
             ):
                 assert persisted.get(field) is None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("first_response", "expected_failure_code"),
+    [
+        ("http-503", "ms2_http_503"),
+        ("invalid-success", "ms2_invalid_response"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_automatic_retry_preserves_cycle_and_worker_processes_other_job(
+    worker_integration_context,
+    monkeypatch,
+    first_response,
+    expected_failure_code,
+):
+    context = worker_integration_context
+    retry_fixture = await _create_pending_pdf(context, "automatic-retry")
+    clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    repository = ProcessingRepository(context.db)
+    requests = []
+    retry_requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        if retry_fixture["filename"].encode() in request.content:
+            retry_requests.append(request)
+            if len(retry_requests) == 1:
+                if first_response == "http-503":
+                    return httpx.Response(
+                        503,
+                        headers={"Retry-After": "0"},
+                        json={"detail": "private upstream response"},
+                    )
+                return httpx.Response(
+                    200,
+                    json={"content": "malformed result", "page_count": True},
+                )
+            return httpx.Response(
+                200,
+                json={"content": "retried extraction", "page_count": 2},
+            )
+        return httpx.Response(
+            200,
+            json={"content": "other job extraction", "page_count": 1},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    worker = None
+    worker_task = None
+    try:
+        first_claim = await repository.claim_pending("worker-u86-first")
+        assert first_claim is not None
+        assert first_claim.id == str(retry_fixture["document_id"])
+        first_cycle_id = first_claim.processing_cycle_id
+        first_cycle_started_at = _bson_utc(
+            first_claim.processing_cycle_started_at
+        )
+        first_fencing_token = first_claim.fencing_token
+
+        first_result = await process_claimed_document(
+            first_claim,
+            processing_repository=repository,
+            gridfs_repository=context.gridfs,
+            ms2_client=MS2Client(
+                client,
+                base_url=_MOCK_MS2_BASE_URL,
+                timeout_seconds=2.0,
+            ),
+        )
+        assert first_result is ProcessingResult.RETRY_SCHEDULED
+        assert len(retry_requests) == 1
+        retry_pending = await context.collection.find_one(
+            {"_id": retry_fixture["document_id"]}
+        )
+        assert retry_pending["status"] == "pending"
+        assert retry_pending["attempt_count"] == 1
+        assert retry_pending["last_error"] == expected_failure_code
+        for field in ("content", "page_count", "completed_at"):
+            assert retry_pending.get(field) is None
+        next_retry_at = _bson_utc(retry_pending["next_retry_at"])
+        assert next_retry_at > clock.now
+        assert next_retry_at <= first_cycle_started_at + timedelta(minutes=10)
+        assert retry_pending["processing_cycle_id"] == first_cycle_id
+        assert _bson_utc(
+            retry_pending["processing_cycle_started_at"]
+        ) == first_cycle_started_at
+        for field in (
+            "worker_id",
+            "fencing_token",
+            "lease_until",
+            "heartbeat_at",
+        ):
+            assert retry_pending.get(field) is None
+        assert retry_pending["file_id"] == retry_fixture["file_id"]
+        assert (
+            await context.gridfs.read(retry_fixture["file_id"])
+            == retry_fixture["pdf_bytes"]
+        )
+
+        other_fixture = await _create_pending_pdf(
+            context, "available-during-backoff"
+        )
+        owned_ids = {
+            retry_fixture["document_id"],
+            other_fixture["document_id"],
+        }
+        await _assert_no_foreign_eligible_work(context, owned_ids)
+        other_completed = asyncio.Event()
+        other_results = []
+
+        async def observe_processing(document, **dependencies):
+            result = await process_claimed_document(document, **dependencies)
+            if document.id == str(other_fixture["document_id"]):
+                other_results.append(result)
+                other_completed.set()
+            return result
+
+        worker = ProcessingWorker(
+            repository,
+            context.gridfs,
+            MS2Client(
+                client,
+                base_url=_MOCK_MS2_BASE_URL,
+                timeout_seconds=2.0,
+            ),
+            processor=observe_processing,
+            max_concurrency=1,
+            poll_initial_seconds=0.01,
+            poll_max_seconds=0.05,
+        )
+        worker_task = asyncio.create_task(worker.run())
+        await asyncio.wait_for(
+            other_completed.wait(),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+        worker.request_stop()
+        await _wait_for_tasks([worker_task])
+        worker_task.result()
+
+        assert other_results == [ProcessingResult.COMPLETED]
+        assert len(requests) == 2
+        other_persisted = await context.collection.find_one(
+            {"_id": other_fixture["document_id"]}
+        )
+        assert other_persisted["status"] == "completed"
+        assert retry_pending["status"] == "pending"
+        assert len(retry_requests) == 1
+
+        assert await repository.claim_pending("worker-u86-too-early") is None
+        clock.now = next_retry_at
+        second_claim = await repository.claim_pending("worker-u86-retry")
+        assert second_claim is not None
+        assert second_claim.id == first_claim.id
+        assert second_claim.processing_cycle_id == first_cycle_id
+        assert _bson_utc(
+            second_claim.processing_cycle_started_at
+        ) == first_cycle_started_at
+        assert second_claim.fencing_token != first_fencing_token
+        assert second_claim.attempt_count == 1
+
+        second_result = await process_claimed_document(
+            second_claim,
+            processing_repository=repository,
+            gridfs_repository=context.gridfs,
+            ms2_client=MS2Client(
+                client,
+                base_url=_MOCK_MS2_BASE_URL,
+                timeout_seconds=2.0,
+            ),
+        )
+        assert second_result is ProcessingResult.COMPLETED
+        assert len(requests) == 3
+        assert len(retry_requests) == 2
+        completed = await context.collection.find_one(
+            {"_id": retry_fixture["document_id"]}
+        )
+        assert completed["status"] == "completed"
+        assert completed["content"] == "retried extraction"
+        assert completed["page_count"] == 2
+        assert completed["attempt_count"] == 2
+        assert completed["processing_cycle_id"] == first_cycle_id
+        assert _bson_utc(
+            completed["processing_cycle_started_at"]
+        ) == first_cycle_started_at
+        assert completed["original_cleanup_status"] == "pending"
+        assert completed["file_id"] == retry_fixture["file_id"]
+        assert "next_retry_at" not in completed
+        assert (
+            await context.gridfs.read(retry_fixture["file_id"])
+            == retry_fixture["pdf_bytes"]
+        )
+    finally:
+        if worker is not None:
+            worker.request_stop()
+        if worker_task is not None:
+            await _wait_for_tasks([worker_task])
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_transient_retries_exhaust_five_attempts_without_sixth_call(
+    worker_integration_context,
+    monkeypatch,
+):
+    context = worker_integration_context
+    fixture = await _create_pending_pdf(context, "attempts-exhausted")
+    clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    repository = ProcessingRepository(context.db)
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            503,
+            json={"detail": "private transient failure"},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    cycle_id = None
+    cycle_started_at = None
+    previous_fencing_token = None
+    try:
+        for attempt_number in range(1, 6):
+            if attempt_number > 1:
+                clock.now = next_retry_at
+            claimed = await repository.claim_pending(
+                f"worker-u86-attempt-{attempt_number}"
+            )
+            assert claimed is not None
+            if attempt_number == 1:
+                cycle_id = claimed.processing_cycle_id
+                cycle_started_at = _bson_utc(
+                    claimed.processing_cycle_started_at
+                )
+            else:
+                assert claimed.processing_cycle_id == cycle_id
+                assert _bson_utc(
+                    claimed.processing_cycle_started_at
+                ) == cycle_started_at
+                assert claimed.fencing_token != previous_fencing_token
+            assert claimed.attempt_count == attempt_number - 1
+            previous_fencing_token = claimed.fencing_token
+
+            result = await process_claimed_document(
+                claimed,
+                processing_repository=repository,
+                gridfs_repository=context.gridfs,
+                ms2_client=MS2Client(
+                    client,
+                    base_url=_MOCK_MS2_BASE_URL,
+                    timeout_seconds=2.0,
+                ),
+            )
+            persisted = await context.collection.find_one(
+                {"_id": fixture["document_id"]}
+            )
+            assert persisted["attempt_count"] == attempt_number
+            assert persisted["processing_cycle_id"] == cycle_id
+            assert _bson_utc(
+                persisted["processing_cycle_started_at"]
+            ) == cycle_started_at
+
+            if attempt_number < 5:
+                assert result is ProcessingResult.RETRY_SCHEDULED
+                assert persisted["status"] == "pending"
+                assert persisted["last_error"] == "ms2_http_503"
+                next_retry_at = _bson_utc(persisted["next_retry_at"])
+                assert next_retry_at > clock.now
+                assert next_retry_at <= cycle_started_at + timedelta(minutes=10)
+            else:
+                assert result is ProcessingResult.FAILED_EXHAUSTED
+                assert persisted["status"] == "failed"
+                assert persisted["last_error"] == "attempts_exhausted"
+                assert persisted["error_message"] == (
+                    "Se agotaron los intentos de procesamiento."
+                )
+                assert "next_retry_at" not in persisted
+
+        assert len(requests) == 5
+        assert await repository.claim_pending("worker-u86-no-sixth-attempt") is None
+        assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_at_cycle_deadline_is_claimed_then_exhausted_without_http(
+    worker_integration_context,
+    monkeypatch,
+):
+    context = worker_integration_context
+    fixture = await _create_pending_pdf(context, "cycle-window-exhausted")
+    clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    repository = ProcessingRepository(context.db)
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            503,
+            headers={"Retry-After": "600"},
+            json={"detail": "private retry-after response"},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    try:
+        first_claim = await repository.claim_pending("worker-u86-window-first")
+        assert first_claim is not None
+        cycle_started_at = _bson_utc(
+            first_claim.processing_cycle_started_at
+        )
+        deadline = cycle_started_at + timedelta(minutes=10)
+        result = await process_claimed_document(
+            first_claim,
+            processing_repository=repository,
+            gridfs_repository=context.gridfs,
+            ms2_client=MS2Client(
+                client,
+                base_url=_MOCK_MS2_BASE_URL,
+                timeout_seconds=2.0,
+            ),
+        )
+        assert result is ProcessingResult.RETRY_SCHEDULED
+        assert len(requests) == 1
+        pending = await context.collection.find_one(
+            {"_id": fixture["document_id"]}
+        )
+        assert pending["status"] == "pending"
+        assert pending["attempt_count"] == 1
+        assert _bson_utc(pending["next_retry_at"]) == deadline
+
+        clock.now = deadline - timedelta(milliseconds=1)
+        assert await repository.claim_pending("worker-u86-before-deadline") is None
+        clock.now = deadline
+        at_deadline = await repository.claim_pending("worker-u86-at-deadline")
+        assert at_deadline is not None
+        assert at_deadline.id == first_claim.id
+        assert at_deadline.processing_cycle_id == first_claim.processing_cycle_id
+        assert _bson_utc(
+            at_deadline.processing_cycle_started_at
+        ) == cycle_started_at
+
+        exhausted = await process_claimed_document(
+            at_deadline,
+            processing_repository=repository,
+            gridfs_repository=context.gridfs,
+            ms2_client=MS2Client(
+                client,
+                base_url=_MOCK_MS2_BASE_URL,
+                timeout_seconds=2.0,
+            ),
+        )
+        assert exhausted is ProcessingResult.FAILED_EXHAUSTED
+        assert len(requests) == 1
+        failed = await context.collection.find_one(
+            {"_id": fixture["document_id"]}
+        )
+        assert failed["status"] == "failed"
+        assert failed["attempt_count"] == 1
+        assert failed["last_error"] == "cycle_window_exhausted"
+        assert failed["error_message"] == (
+            "Se agotó el tiempo disponible para el procesamiento."
+        )
+        assert "next_retry_at" not in failed
+        assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_technical_ms2_failure_is_persisted_and_alerted_safely(
+    worker_integration_context,
+    monkeypatch,
+    caplog,
+):
+    context = worker_integration_context
+    fixture = await _create_pending_pdf(context, "technical-failure")
+    _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    repository = ProcessingRepository(context.db)
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            401,
+            json={"detail": "sensitive internal upstream detail"},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    from src.worker import document_processor as processor_module
+
+    try:
+        claimed = await repository.claim_pending("worker-u86-technical")
+        assert claimed is not None
+        with caplog.at_level(logging.ERROR, logger=processor_module.__name__):
+            result = await process_claimed_document(
+                claimed,
+                processing_repository=repository,
+                gridfs_repository=context.gridfs,
+                ms2_client=MS2Client(
+                    client,
+                    base_url=_MOCK_MS2_BASE_URL,
+                    timeout_seconds=2.0,
+                ),
+            )
+
+        assert result is ProcessingResult.FAILED_TECHNICAL
+        assert len(requests) == 1
+        failed = await context.collection.find_one(
+            {"_id": fixture["document_id"]}
+        )
+        assert failed["status"] == "failed"
+        assert failed["attempt_count"] == 1
+        assert failed["last_error"] == "ms2_http_401"
+        assert failed["error_message"] == (
+            "No se pudo completar el procesamiento debido a un problema técnico "
+            "del servicio."
+        )
+        assert "next_retry_at" not in failed
+        assert failed["file_id"] == fixture["file_id"]
+        assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
+
+        alert_records = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.ERROR
+            and "event_id=worker.ms2.technical_failure" in record.getMessage()
+        ]
+        assert len(alert_records) == 1
+        alert = alert_records[0].getMessage()
+        assert f"document_id={fixture['document_id']}" in alert
+        assert "error_code=ms2_http_401" in alert
+        assert "http_status=401" in alert
+        assert "sensitive internal upstream detail" not in alert
+        assert fixture["filename"] not in alert
+        assert "Authorization" not in alert
+        assert "secret" not in alert
     finally:
         await client.aclose()
 
