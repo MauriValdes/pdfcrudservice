@@ -673,10 +673,25 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
         assert str(stored_document["_id"]) == accepted_ticket["document_id"]
         assert str(stored_document["_id"]) == duplicate_ticket["document_id"]
         assert stored_document["file_id"] is not None
+        assert isinstance(stored_document["file_id"], ObjectId)
+        gridfs_files = await testing_db.db["fs.files"].find(
+            {
+                "metadata.checksum": checksum,
+                "metadata.document_id": str(stored_document["_id"]),
+            }
+        ).to_list(length=None)
+        assert len(gridfs_files) == 1
+        assert gridfs_files[0]["_id"] == stored_document["file_id"]
         stored_pdf = await GridFSRepository(testing_db.db).read(
             stored_document["file_id"]
         )
+        gridfs_info = await GridFSRepository(testing_db.db).stat(
+            stored_document["file_id"]
+        )
+        assert gridfs_info is not None
+        assert gridfs_info.length == len(pdf_bytes)
         assert stored_pdf == pdf_bytes
+        assert hashlib.sha256(stored_pdf).hexdigest() == checksum
         extraction_mock.assert_not_awaited()
 
         indexes = await testing_db.db[settings.mongo_collection].list_indexes().to_list(
