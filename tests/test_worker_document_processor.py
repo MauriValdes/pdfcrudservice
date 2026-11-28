@@ -10,6 +10,15 @@ from uuid import uuid4
 import pytest
 from bson import ObjectId
 from gridfs.errors import NoFile
+from pymongo.errors import (
+    AutoReconnect,
+    ConnectionFailure,
+    NetworkTimeout,
+    OperationFailure,
+    ServerSelectionTimeoutError,
+    WTimeoutError,
+    WriteConcernError,
+)
 
 from src.core.exceptions import DatabaseUnavailableError
 from src.models.document import DocumentModel, DocumentStatus
@@ -134,6 +143,7 @@ def _dependencies(*, pdf_bytes=b"%PDF-test", extraction=None):
         fail_exhausted_processing=AsyncMock(),
         schedule_transient_retry=AsyncMock(),
         release_for_circuit_open=AsyncMock(return_value=True),
+        observe_transition_state=AsyncMock(return_value=None),
     )
     gridfs = SimpleNamespace(read=AsyncMock(return_value=pdf_bytes))
     ms2 = SimpleNamespace(
@@ -143,6 +153,28 @@ def _dependencies(*, pdf_bytes=b"%PDF-test", extraction=None):
         )
     )
     return repository, gridfs, ms2
+
+
+def _ambiguous_database_error(message="write acknowledgement unavailable"):
+    error = DatabaseUnavailableError(message)
+    error.__cause__ = NetworkTimeout("simulated transport timeout")
+    return error
+
+
+def _assert_resolution_log(caplog, resolution, transition, document, error):
+    records = [
+        record
+        for record in caplog.records
+        if hasattr(record, "transition_resolution")
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.transition_resolution == resolution
+    assert record.transition_operation == transition
+    assert record.document_id == document.id
+    assert record.exception_type == type(error).__name__
+    assert str(error) not in caplog.text
+    assert "extracted text" not in caplog.text
 
 
 def _run_inline(monkeypatch, processor_module):
@@ -542,6 +574,8 @@ async def test_authorization_exception_propagates_without_retry_or_http(monkeypa
     _run_inline(monkeypatch, processor)
     document = _document()
     repository, gridfs, ms2 = _dependencies()
+    breaker_events = []
+    breaker = _RecordingCircuitBreaker(breaker_events)
     error = DatabaseUnavailableError("authorization outcome uncertain")
     repository.record_ms2_attempt.side_effect = error
 
@@ -552,13 +586,16 @@ async def test_authorization_exception_propagates_without_retry_or_http(monkeypa
             processing_repository=repository,
             gridfs_repository=gridfs,
             ms2_client=ms2,
+            circuit_breaker=breaker,
         )
 
     assert raised.value is error
     repository.record_ms2_attempt.assert_awaited_once()
+    repository.observe_transition_state.assert_not_awaited()
     repository.fail_exhausted_processing.assert_not_awaited()
     ms2.extract.assert_not_awaited()
     repository.complete_processing.assert_not_awaited()
+    assert breaker_events == [("admit",), ("release",)]
 
 
 @pytest.mark.asyncio
@@ -1379,6 +1416,410 @@ async def test_persistence_exception_propagates_without_repeating_write_or_extra
     assert raised.value is error
     ms2.extract.assert_awaited_once()
     repository.complete_processing.assert_awaited_once()
+
+
+async def _run_ambiguous_transition_case(
+    monkeypatch,
+    transition,
+    write_error,
+    observation="matching",
+    capture=None,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    attempt_count = 4 if transition == "exhausted" else 0
+    cycle_age = (
+        timedelta(minutes=9, seconds=50)
+        if transition == "breaker"
+        else timedelta(minutes=1)
+    )
+    document = _document(
+        attempt_count=attempt_count,
+        processing_cycle_started_at=now - cycle_age,
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = attempt_count + 1
+    breaker_events = []
+    observed_states = []
+    breaker = _RecordingCircuitBreaker(breaker_events)
+
+    if transition == "complete":
+        repository.complete_processing.side_effect = write_error
+    elif transition == "fail":
+        ms2.extract.side_effect = MS2HTTPError(400, "permanent_input", None)
+        repository.fail_processing.side_effect = write_error
+    elif transition == "exhausted":
+        ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+        repository.fail_exhausted_processing.side_effect = write_error
+    elif transition == "retry":
+        ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+        repository.schedule_transient_retry.side_effect = write_error
+    elif transition == "breaker":
+        breaker = _open_breaker(_FakeMonotonicClock())
+        repository.release_for_circuit_open.side_effect = write_error
+    else:
+        raise AssertionError(f"unsupported transition: {transition}")
+
+    async def observe(_document_id, *, timeout_seconds):
+        assert timeout_seconds == 0.25
+        if observation == "negative":
+            return None
+        if observation == "timeout":
+            raise TimeoutError("observation timed out")
+        if observation == "unavailable":
+            raise _ambiguous_database_error("observation unavailable")
+        if observation == "cancel":
+            raise asyncio.CancelledError()
+
+        state = {
+            "_id": ObjectId(document.id),
+            "status": "completed",
+            "processing_cycle_id": document.processing_cycle_id,
+            "worker_id": document.worker_id,
+            "fencing_token": document.fencing_token,
+            "attempt_count": attempt_count + 1,
+            "content": "extracted text",
+            "page_count": 2,
+        }
+        if transition == "fail":
+            state.update(
+                status="failed",
+                last_error="ms2_invalid_input",
+            )
+            state.pop("content")
+            state.pop("page_count")
+        elif transition == "exhausted":
+            state.update(
+                status="failed",
+                last_error="attempts_exhausted",
+            )
+            state.pop("content")
+            state.pop("page_count")
+        elif transition == "retry":
+            requested_retry_at = (
+                repository.schedule_transient_retry.await_args.args[6]
+            )
+            cycle_deadline = (
+                document.processing_cycle_started_at + timedelta(minutes=10)
+            )
+            assert requested_retry_at < cycle_deadline
+            state.update(
+                status="pending",
+                last_error="ms2_http_503",
+                next_retry_at=min(requested_retry_at, cycle_deadline),
+            )
+            state.pop("content")
+            state.pop("page_count")
+            state.pop("worker_id")
+            state.pop("fencing_token")
+        elif transition == "breaker":
+            requested_retry_at = (
+                repository.release_for_circuit_open.await_args.args[5]
+            )
+            cycle_deadline = (
+                document.processing_cycle_started_at + timedelta(minutes=10)
+            )
+            assert requested_retry_at > cycle_deadline
+            state.update(
+                status="pending",
+                attempt_count=attempt_count,
+                next_retry_at=min(requested_retry_at, cycle_deadline),
+            )
+            assert state["next_retry_at"] == cycle_deadline
+            state.pop("content")
+            state.pop("page_count")
+            state.pop("worker_id")
+            state.pop("fencing_token")
+        if observation == "different-id":
+            state["_id"] = ObjectId()
+        elif observation == "different-owner":
+            state["worker_id"] = "successor-worker"
+        elif observation == "different-cycle":
+            state["processing_cycle_id"] = "successor-cycle"
+        elif observation == "different-fence":
+            state["fencing_token"] = "successor-fence"
+        elif observation == "different-state":
+            state["status"] = "processing"
+        observed_states.append(state)
+        return state
+
+    repository.observe_transition_state.side_effect = observe
+    if capture is not None:
+        capture.update(
+            processor=processor,
+            repository=repository,
+            gridfs=gridfs,
+            ms2=ms2,
+            document=document,
+            breaker=breaker,
+            breaker_events=breaker_events,
+            observed_states=observed_states,
+        )
+    outcome = await _process(
+        processor,
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+        circuit_breaker=breaker,
+    )
+    return outcome, processor, repository, gridfs, ms2, document
+
+
+@pytest.mark.parametrize(
+    "transition",
+    ["complete", "fail", "exhausted", "retry", "breaker"],
+)
+@pytest.mark.asyncio
+async def test_ambiguous_transition_observation_never_confirms_or_repeats(
+    monkeypatch,
+    transition,
+    caplog,
+):
+    error = _ambiguous_database_error()
+    dependencies = {}
+
+    outcome, processor, repository, _gridfs, ms2, _document = (
+        await _run_ambiguous_transition_case(
+            monkeypatch,
+            transition,
+            error,
+            capture=dependencies,
+        )
+    )
+
+    assert outcome is processor.ProcessingResult.RESULT_NOT_CONFIRMED
+    expected_operation = {
+        "complete": "complete_processing",
+        "fail": "fail_processing",
+        "exhausted": "fail_exhausted_processing",
+        "retry": "schedule_transient_retry",
+        "breaker": "release_for_circuit_open",
+    }[transition]
+    _assert_resolution_log(
+        caplog,
+        "OBSERVED_UNCONFIRMED",
+        expected_operation,
+        _document,
+        error,
+    )
+    repository.observe_transition_state.assert_awaited_once()
+    assert repository.observe_transition_state.await_args.args == (_document.id,)
+    observed = dependencies["observed_states"][0]
+    assert observed["_id"] == ObjectId(_document.id)
+    assert observed["processing_cycle_id"] == _document.processing_cycle_id
+    if transition in {"retry", "breaker"}:
+        observation = dependencies["observed_states"][0]
+        assert "worker_id" not in observation
+        assert "fencing_token" not in observation
+        assert observed["status"] == "pending"
+        assert observed["attempt_count"] == (
+            _document.attempt_count + 1
+            if transition == "retry"
+            else _document.attempt_count
+        )
+        assert observed["next_retry_at"] <= (
+            _document.processing_cycle_started_at + timedelta(minutes=10)
+        )
+        if transition == "retry":
+            assert observed["last_error"] == "ms2_http_503"
+    else:
+        assert observed["worker_id"] == _document.worker_id
+        assert observed["fencing_token"] == _document.fencing_token
+        assert observed["attempt_count"] == _document.attempt_count + 1
+        if transition == "complete":
+            assert observed["status"] == "completed"
+            assert observed["content"] == "extracted text"
+            assert observed["page_count"] == 2
+        else:
+            assert observed["status"] == "failed"
+            assert observed["last_error"] == (
+                "ms2_invalid_input"
+                if transition == "fail"
+                else "attempts_exhausted"
+            )
+    assert repository.observe_transition_state.await_args.kwargs == {
+        "timeout_seconds": 0.25
+    }
+    transition_methods = {
+        "complete": "complete_processing",
+        "fail": "fail_processing",
+        "exhausted": "fail_exhausted_processing",
+        "retry": "schedule_transient_retry",
+        "breaker": "release_for_circuit_open",
+    }
+    for method_name in transition_methods.values():
+        method = getattr(repository, method_name)
+        if method_name == transition_methods[transition]:
+            method.assert_awaited_once()
+        else:
+            method.assert_not_awaited()
+    if transition == "breaker":
+        repository.record_ms2_attempt.assert_not_awaited()
+    else:
+        repository.record_ms2_attempt.assert_awaited_once()
+    assert ms2.extract.await_count == (0 if transition == "breaker" else 1)
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda: _ambiguous_database_error("db unavailable"),
+        lambda: AutoReconnect("reconnect"),
+        lambda: ConnectionFailure("connection failed"),
+        lambda: NetworkTimeout("network timeout"),
+        lambda: ServerSelectionTimeoutError("selection timeout"),
+        lambda: WriteConcernError("write concern not met"),
+        lambda: WTimeoutError("write timed out"),
+    ],
+    ids=[
+        "database-unavailable",
+        "auto-reconnect",
+        "connection-failure",
+        "network-timeout",
+        "server-selection-timeout",
+        "write-concern-error",
+        "write-timeout",
+    ],
+)
+@pytest.mark.asyncio
+async def test_ambiguous_persistence_errors_use_bounded_observation(
+    monkeypatch,
+    error_factory,
+):
+    error = error_factory()
+    if isinstance(error, DatabaseUnavailableError):
+        error.__cause__ = NetworkTimeout("underlying timeout")
+
+    outcome, processor, repository, _gridfs, _ms2, _document = (
+        await _run_ambiguous_transition_case(
+            monkeypatch,
+            "complete",
+            error,
+        )
+    )
+
+    assert outcome is processor.ProcessingResult.RESULT_NOT_CONFIRMED
+    repository.complete_processing.assert_awaited_once()
+    repository.observe_transition_state.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        "different-id",
+        "different-owner",
+        "different-cycle",
+        "different-fence",
+        "different-state",
+        "negative",
+        "unavailable",
+        "timeout",
+    ],
+)
+@pytest.mark.asyncio
+async def test_unmatched_or_unavailable_observation_preserves_uncertainty(
+    monkeypatch,
+    observation,
+    caplog,
+):
+    error = _ambiguous_database_error()
+
+    outcome, processor, repository, _gridfs, _ms2, _document = (
+        await _run_ambiguous_transition_case(
+            monkeypatch,
+            "complete",
+            error,
+            observation=observation,
+        )
+    )
+
+    assert outcome is processor.ProcessingResult.RESULT_NOT_CONFIRMED
+    repository.complete_processing.assert_awaited_once()
+    repository.observe_transition_state.assert_awaited_once()
+    _assert_resolution_log(
+        caplog,
+        "UNKNOWN",
+        "complete_processing",
+        _document,
+        error,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_observation_propagates_without_compensation(monkeypatch):
+    error = _ambiguous_database_error()
+    dependencies = {}
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_ambiguous_transition_case(
+            monkeypatch,
+            "complete",
+            error,
+            observation="cancel",
+            capture=dependencies,
+        )
+
+    repository = dependencies["repository"]
+    ms2 = dependencies["ms2"]
+    breaker = dependencies["breaker"]
+    assert repository.complete_processing.await_count == 1
+    assert repository.observe_transition_state.await_count == 1
+    repository.fail_processing.assert_not_awaited()
+    repository.fail_exhausted_processing.assert_not_awaited()
+    repository.schedule_transient_retry.assert_not_awaited()
+    repository.release_for_circuit_open.assert_not_awaited()
+    ms2.extract.assert_awaited_once()
+    assert breaker.state is CircuitBreakerState.CLOSED
+    assert dependencies["breaker_events"] == [
+        ("admit",),
+        ("record_success",),
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("invalid local value"),
+        RuntimeError("programming error"),
+        OperationFailure("unrelated command failure", 2),
+        DatabaseUnavailableError("missing underlying cause"),
+        asyncio.CancelledError(),
+    ],
+    ids=[
+        "validation",
+        "programming",
+        "unrelated-command",
+        "unclassified-database-unavailable",
+        "cancelled-write",
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_ambiguous_errors_and_write_cancellation_are_not_observed(
+    monkeypatch,
+    error,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    repository.complete_processing.side_effect = error
+
+    with pytest.raises(type(error)) as raised:
+        await _process(
+            processor,
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert raised.value is error
+    repository.complete_processing.assert_awaited_once()
+    repository.observe_transition_state.assert_not_awaited()
+    ms2.extract.assert_awaited_once()
 
 
 @pytest.mark.asyncio

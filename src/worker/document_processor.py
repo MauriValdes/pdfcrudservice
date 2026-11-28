@@ -1,5 +1,6 @@
 """Basic orchestration for processing one already-claimed document."""
 
+import asyncio
 import logging
 import math
 from datetime import datetime, timedelta, timezone
@@ -7,7 +8,16 @@ from enum import Enum
 from numbers import Real
 
 from bson import ObjectId
+from pymongo.errors import (
+    AutoReconnect,
+    ConnectionFailure,
+    NetworkTimeout,
+    ServerSelectionTimeoutError,
+    WTimeoutError,
+    WriteConcernError,
+)
 
+from src.core.exceptions import DatabaseUnavailableError
 from src.models.document import DocumentModel
 from src.repository.gridfs_repository import GridFSRepository
 from src.repository.processing_repository import (
@@ -34,6 +44,50 @@ from src.worker.retry_policy import RetryExhausted, RetryScheduled, plan_retry
 
 _logger = logging.getLogger(__name__)
 _MS2_ERRORS = (MS2HTTPError, MS2TransportError, MS2InvalidResponseError)
+_AMBIGUOUS_DRIVER_ERRORS = (
+    AutoReconnect,
+    ConnectionFailure,
+    NetworkTimeout,
+    ServerSelectionTimeoutError,
+    WriteConcernError,
+    WTimeoutError,
+)
+
+
+class _TransitionResolution(Enum):
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    GUARD_REJECTED = "GUARD_REJECTED"
+    OBSERVED_UNCONFIRMED = "OBSERVED_UNCONFIRMED"
+    UNKNOWN = "UNKNOWN"
+
+
+def _is_ambiguous_transition_error(error: Exception) -> bool:
+    """Classify only persistence failures that can hide an applied write."""
+    if isinstance(error, _AMBIGUOUS_DRIVER_ERRORS):
+        return True
+    if not isinstance(error, DatabaseUnavailableError):
+        return False
+
+    cause = error.__cause__
+    seen = set()
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, _AMBIGUOUS_DRIVER_ERRORS):
+            return True
+        seen.add(id(cause))
+        cause = cause.__cause__
+    return False
+
+
+def _bson_utc_milliseconds(value: datetime) -> datetime:
+    """Normalize a datetime as it is represented by a BSON date."""
+    if not isinstance(value, datetime):
+        raise ValueError("expected datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.replace(tzinfo=timezone.utc)
+    normalized = value.astimezone(timezone.utc)
+    return normalized.replace(
+        microsecond=(normalized.microsecond // 1000) * 1000
+    )
 
 
 def _utc_now() -> datetime:
@@ -117,6 +171,161 @@ async def process_claimed_document(
     if not filename:
         raise ValueError("document.filename must not be empty")
 
+    def matches_identity(observed: dict[str, object], status: str) -> bool:
+        return (
+            observed.get("_id") == ObjectId(document_id)
+            and observed.get("status") == status
+            and observed.get("processing_cycle_id") == processing_cycle_id
+        )
+
+    def matches_attempt_count(
+        observed: dict[str, object],
+        expected_attempt_count: int,
+    ) -> bool:
+        actual = observed.get("attempt_count", 0)
+        return (
+            isinstance(actual, int)
+            and not isinstance(actual, bool)
+            and actual == expected_attempt_count
+        )
+
+    def matches_terminal(
+        observed: dict[str, object] | None,
+        *,
+        status: str,
+        attempt_count: int,
+        failure_code: str | None = None,
+        content: str | None = None,
+        page_count: int | None = None,
+    ) -> bool:
+        if not isinstance(observed, dict):
+            return False
+        if (
+            not matches_identity(observed, status)
+            or observed.get("worker_id") != worker_id
+            or observed.get("fencing_token") != fencing_token
+            or not matches_attempt_count(observed, attempt_count)
+            or "next_retry_at" in observed
+        ):
+            return False
+        if failure_code is not None:
+            return (
+                observed.get("last_error") == failure_code
+                and "content" not in observed
+                and "page_count" not in observed
+            )
+        return (
+            observed.get("content") == content
+            and observed.get("page_count") == page_count
+            and "last_error" not in observed
+        )
+
+    def matches_exhaustion(
+        observed: dict[str, object] | None,
+        expected_attempt_count: int,
+    ) -> bool:
+        failure_code = (
+            "attempts_exhausted"
+            if expected_attempt_count == 5
+            else "cycle_window_exhausted"
+        )
+        return matches_terminal(
+            observed,
+            status="failed",
+            attempt_count=expected_attempt_count,
+            failure_code=failure_code,
+        )
+
+    def matches_pending_release(
+        observed: dict[str, object] | None,
+        *,
+        expected_attempt_count: int,
+        requested_retry_at: datetime,
+        failure_code: str | None,
+    ) -> bool:
+        if not isinstance(observed, dict):
+            return False
+        cycle_started_at = snapshot.processing_cycle_started_at
+        if not isinstance(cycle_started_at, datetime):
+            return False
+        try:
+            cycle_deadline = _bson_utc_milliseconds(
+                cycle_started_at + timedelta(minutes=10)
+            )
+            effective_retry_at = min(
+                _bson_utc_milliseconds(requested_retry_at),
+                cycle_deadline,
+            )
+            observed_retry_at = _bson_utc_milliseconds(
+                observed["next_retry_at"]
+            )
+        except (KeyError, OverflowError, TypeError, ValueError):
+            return False
+
+        return (
+            matches_identity(observed, "pending")
+            and matches_attempt_count(observed, expected_attempt_count)
+            and "worker_id" not in observed
+            and "fencing_token" not in observed
+            and "content" not in observed
+            and "page_count" not in observed
+            and observed_retry_at == effective_retry_at
+            and (
+                failure_code is None
+                or observed.get("last_error") == failure_code
+            )
+        )
+
+    async def resolve_transition(
+        transition_operation: str,
+        write,
+        expected_state,
+    ) -> _TransitionResolution:
+        try:
+            acknowledged = await write()
+        except Exception as primary_error:
+            if not _is_ambiguous_transition_error(primary_error):
+                raise
+
+            resolution = _TransitionResolution.UNKNOWN
+            try:
+                observed = await processing_repository.observe_transition_state(
+                    document_id,
+                    timeout_seconds=0.25,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as observation_error:
+                if not (
+                    isinstance(
+                        observation_error,
+                        (TimeoutError, DatabaseUnavailableError),
+                    )
+                    or isinstance(observation_error, _AMBIGUOUS_DRIVER_ERRORS)
+                ):
+                    raise
+                observed = None
+
+            if observed is not None and expected_state(observed):
+                resolution = _TransitionResolution.OBSERVED_UNCONFIRMED
+
+            _logger.warning(
+                "Ambiguous processing transition resolved",
+                extra={
+                    "transition_resolution": resolution.value,
+                    "transition_operation": transition_operation,
+                    "document_id": document_id,
+                    "exception_type": type(primary_error).__name__,
+                },
+            )
+            return resolution
+
+        return (
+            _TransitionResolution.ACKNOWLEDGED
+            if acknowledged
+            else _TransitionResolution.GUARD_REJECTED
+        )
+
     async def operation() -> ProcessingResult:
         permit = None
         permit_pending = False
@@ -145,28 +354,51 @@ async def process_claimed_document(
                     retry_at += timedelta(microseconds=1000 - remainder)
                 retry_at = retry_at.replace(tzinfo=timezone.utc)
                 try:
-                    released = await processing_repository.release_for_circuit_open(
+                    resolution = await resolve_transition(
+                        "release_for_circuit_open",
+                        lambda: processing_repository.release_for_circuit_open(
+                            document_id,
+                            worker_id,
+                            fencing_token,
+                            processing_cycle_id,
+                            snapshot.attempt_count,
+                            retry_at,
+                        ),
+                        lambda observed: matches_pending_release(
+                            observed,
+                            expected_attempt_count=snapshot.attempt_count,
+                            requested_retry_at=retry_at,
+                            failure_code=None,
+                        ),
+                    )
+                except RetryTimestampExpiredError:
+                    resolution = _TransitionResolution.GUARD_REJECTED
+
+                if resolution is _TransitionResolution.ACKNOWLEDGED:
+                    return ProcessingResult.CIRCUIT_BREAKER_RELEASED
+                if resolution in (
+                    _TransitionResolution.OBSERVED_UNCONFIRMED,
+                    _TransitionResolution.UNKNOWN,
+                ):
+                    return ProcessingResult.RESULT_NOT_CONFIRMED
+
+                exhaustion_resolution = await resolve_transition(
+                    "fail_exhausted_processing",
+                    lambda: processing_repository.fail_exhausted_processing(
                         document_id,
                         worker_id,
                         fencing_token,
                         processing_cycle_id,
+                    ),
+                    lambda observed: matches_exhaustion(
+                        observed,
                         snapshot.attempt_count,
-                        retry_at,
-                    )
-                except RetryTimestampExpiredError:
-                    released = False
-
-                if released:
-                    return ProcessingResult.CIRCUIT_BREAKER_RELEASED
-                confirmed = await processing_repository.fail_exhausted_processing(
-                    document_id,
-                    worker_id,
-                    fencing_token,
-                    processing_cycle_id,
+                    ),
                 )
                 return (
                     ProcessingResult.FAILED_EXHAUSTED
-                    if confirmed
+                    if exhaustion_resolution
+                    is _TransitionResolution.ACKNOWLEDGED
                     else ProcessingResult.RESULT_NOT_CONFIRMED
                 )
 
@@ -190,17 +422,30 @@ async def process_claimed_document(
             if attempt_number is None:
                 circuit_breaker.release(permit)
                 permit_pending = False
-                confirmed = await processing_repository.fail_exhausted_processing(
-                    document_id,
-                    worker_id,
-                    fencing_token,
-                    processing_cycle_id,
+                exhaustion_resolution = await resolve_transition(
+                    "fail_exhausted_processing",
+                    lambda: processing_repository.fail_exhausted_processing(
+                        document_id,
+                        worker_id,
+                        fencing_token,
+                        processing_cycle_id,
+                    ),
+                    lambda observed: matches_exhaustion(
+                        observed,
+                        snapshot.attempt_count,
+                    ),
                 )
-                return (
-                    ProcessingResult.FAILED_EXHAUSTED
-                    if confirmed
-                    else ProcessingResult.ATTEMPT_NOT_AUTHORIZED
-                )
+                if (
+                    exhaustion_resolution
+                    is _TransitionResolution.ACKNOWLEDGED
+                ):
+                    return ProcessingResult.FAILED_EXHAUSTED
+                if (
+                    exhaustion_resolution
+                    is _TransitionResolution.GUARD_REJECTED
+                ):
+                    return ProcessingResult.ATTEMPT_NOT_AUTHORIZED
+                return ProcessingResult.RESULT_NOT_CONFIRMED
 
             try:
                 result = await ms2_client.extract(pdf_bytes, filename)
@@ -219,16 +464,26 @@ async def process_claimed_document(
                 circuit_breaker.record_success(permit)
                 permit_pending = False
 
-            confirmed = await processing_repository.complete_processing(
-                document_id,
-                worker_id,
-                fencing_token,
-                processing_cycle_id,
-                attempt_number,
-                result.content,
-                result.page_count,
+            resolution = await resolve_transition(
+                "complete_processing",
+                lambda: processing_repository.complete_processing(
+                    document_id,
+                    worker_id,
+                    fencing_token,
+                    processing_cycle_id,
+                    attempt_number,
+                    result.content,
+                    result.page_count,
+                ),
+                lambda observed: matches_terminal(
+                    observed,
+                    status="completed",
+                    attempt_count=attempt_number,
+                    content=result.content,
+                    page_count=result.page_count,
+                ),
             )
-            if confirmed:
+            if resolution is _TransitionResolution.ACKNOWLEDGED:
                 return ProcessingResult.COMPLETED
             return ProcessingResult.RESULT_NOT_CONFIRMED
         except BaseException:
@@ -260,15 +515,24 @@ async def process_claimed_document(
             DocumentAction.FAIL_INPUT,
             DocumentAction.FAIL_TECHNICAL,
         ):
-            confirmed = await processing_repository.fail_processing(
-                document_id,
-                worker_id,
-                fencing_token,
-                processing_cycle_id,
-                attempt_number,
-                category.code,
+            resolution = await resolve_transition(
+                "fail_processing",
+                lambda: processing_repository.fail_processing(
+                    document_id,
+                    worker_id,
+                    fencing_token,
+                    processing_cycle_id,
+                    attempt_number,
+                    category.code,
+                ),
+                lambda observed: matches_terminal(
+                    observed,
+                    status="failed",
+                    attempt_count=attempt_number,
+                    failure_code=category.code,
+                ),
             )
-            if not confirmed:
+            if resolution is not _TransitionResolution.ACKNOWLEDGED:
                 return ProcessingResult.RESULT_NOT_CONFIRMED
             if category.document_action is DocumentAction.FAIL_INPUT:
                 return ProcessingResult.FAILED_PERMANENT
@@ -285,43 +549,73 @@ async def process_claimed_document(
                 ),
             )
             if isinstance(retry_plan, RetryExhausted):
-                confirmed = await processing_repository.fail_exhausted_processing(
-                    document_id,
-                    worker_id,
-                    fencing_token,
-                    processing_cycle_id,
+                resolution = await resolve_transition(
+                    "fail_exhausted_processing",
+                    lambda: processing_repository.fail_exhausted_processing(
+                        document_id,
+                        worker_id,
+                        fencing_token,
+                        processing_cycle_id,
+                    ),
+                    lambda observed: matches_exhaustion(
+                        observed,
+                        attempt_number,
+                    ),
                 )
                 return (
                     ProcessingResult.FAILED_EXHAUSTED
-                    if confirmed
+                    if resolution is _TransitionResolution.ACKNOWLEDGED
                     else ProcessingResult.RESULT_NOT_CONFIRMED
                 )
 
             if isinstance(retry_plan, RetryScheduled):
                 try:
-                    scheduled = await processing_repository.schedule_transient_retry(
+                    resolution = await resolve_transition(
+                        "schedule_transient_retry",
+                        lambda: processing_repository.schedule_transient_retry(
+                            document_id,
+                            worker_id,
+                            fencing_token,
+                            processing_cycle_id,
+                            attempt_number,
+                            category.code,
+                            retry_plan.next_retry_at,
+                        ),
+                        lambda observed: matches_pending_release(
+                            observed,
+                            expected_attempt_count=attempt_number,
+                            requested_retry_at=retry_plan.next_retry_at,
+                            failure_code=category.code,
+                        ),
+                    )
+                except RetryTimestampExpiredError:
+                    resolution = _TransitionResolution.GUARD_REJECTED
+
+                if resolution is _TransitionResolution.ACKNOWLEDGED:
+                    return ProcessingResult.RETRY_SCHEDULED
+                if resolution in (
+                    _TransitionResolution.OBSERVED_UNCONFIRMED,
+                    _TransitionResolution.UNKNOWN,
+                ):
+                    return ProcessingResult.RESULT_NOT_CONFIRMED
+
+                exhaustion_resolution = await resolve_transition(
+                    "fail_exhausted_processing",
+                    lambda: processing_repository.fail_exhausted_processing(
                         document_id,
                         worker_id,
                         fencing_token,
                         processing_cycle_id,
+                    ),
+                    lambda observed: matches_exhaustion(
+                        observed,
                         attempt_number,
-                        category.code,
-                        retry_plan.next_retry_at,
-                    )
-                except RetryTimestampExpiredError:
-                    scheduled = False
-
-                if scheduled:
-                    return ProcessingResult.RETRY_SCHEDULED
-                confirmed = await processing_repository.fail_exhausted_processing(
-                    document_id,
-                    worker_id,
-                    fencing_token,
-                    processing_cycle_id,
+                    ),
                 )
                 return (
                     ProcessingResult.FAILED_EXHAUSTED
-                    if confirmed
+                    if exhaustion_resolution
+                    is _TransitionResolution.ACKNOWLEDGED
                     else ProcessingResult.RESULT_NOT_CONFIRMED
                 )
 

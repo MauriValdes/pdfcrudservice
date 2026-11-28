@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from bson import ObjectId
 from pymongo import MongoClient
+from pymongo.errors import AutoReconnect
 
 from src.config.config import MONGO_TEST_DATABASE, settings
 from src.database.mongodb import MongoDB
@@ -178,6 +179,7 @@ async def worker_integration_context():
     resources: list[tuple[ObjectId, str, ObjectId]] = []
     connected = False
     initial_gridfs_counts = None
+    initial_document_count = None
     try:
         await manager.connect()
         connected = True
@@ -188,6 +190,7 @@ async def worker_integration_context():
         assert manager.db.write_concern.document == {"w": 1, "j": True}
 
         collection = manager.db[settings.mongo_collection]
+        initial_document_count = await collection.count_documents({})
         now = datetime.now(timezone.utc)
         assert await collection.count_documents({"status": "pending"}) == 0
         assert (
@@ -218,6 +221,7 @@ async def worker_integration_context():
             gridfs=gridfs,
             resources=resources,
             initial_gridfs_counts=initial_gridfs_counts,
+            initial_document_count=initial_document_count,
         )
         yield context
     finally:
@@ -264,6 +268,16 @@ async def worker_integration_context():
                     name: await manager.db[name].count_documents({})
                     for name in ("fs.files", "fs.chunks")
                 }
+                final_document_count = await collection.count_documents({})
+                if (
+                    initial_document_count is not None
+                    and final_document_count != initial_document_count
+                ):
+                    cleanup_errors.append(
+                        AssertionError(
+                            "Worker integration fixture document count changed"
+                        )
+                    )
                 if (
                     initial_gridfs_counts is not None
                     and final_gridfs_counts != initial_gridfs_counts
@@ -446,6 +460,91 @@ async def _assert_no_foreign_eligible_work(context, owned_document_ids):
     )
 
 
+class _AmbiguousTransitionRepository:
+    """Wrap a real repository and lose one selected write acknowledgement."""
+
+    def __init__(
+        self,
+        repository,
+        *,
+        operation,
+        apply_before_raise,
+        before_write=None,
+    ):
+        self._repository = repository
+        self._operation = operation
+        self._apply_before_raise = apply_before_raise
+        self._before_write = before_write
+        self.write_attempts = 0
+        self.real_write_results = []
+        self.write_arguments = None
+        self.observation_reads = 0
+        self.exhaustion_writes = 0
+
+    def __getattr__(self, name):
+        return getattr(self._repository, name)
+
+    async def _write_with_lost_acknowledgement(self, operation, *args):
+        if operation != self._operation:
+            return await getattr(self._repository, operation)(*args)
+
+        self.write_attempts += 1
+        self.write_arguments = args
+        if self._before_write is not None:
+            await self._before_write()
+        if self._apply_before_raise:
+            result = await getattr(self._repository, operation)(*args)
+            self.real_write_results.append(result)
+        raise AutoReconnect("controlled acknowledgement loss")
+
+    async def complete_processing(self, *args):
+        return await self._write_with_lost_acknowledgement(
+            "complete_processing",
+            *args,
+        )
+
+    async def schedule_transient_retry(self, *args):
+        return await self._write_with_lost_acknowledgement(
+            "schedule_transient_retry",
+            *args,
+        )
+
+    async def observe_transition_state(self, *args, **kwargs):
+        self.observation_reads += 1
+        return await self._repository.observe_transition_state(
+            *args,
+            **kwargs,
+        )
+
+    async def fail_exhausted_processing(self, *args, **kwargs):
+        self.exhaustion_writes += 1
+        return await self._repository.fail_exhausted_processing(
+            *args,
+            **kwargs,
+        )
+
+
+def _assert_ambiguous_transition_diagnostic(
+    caplog,
+    *,
+    resolution,
+    operation,
+    document_id,
+):
+    records = [
+        record
+        for record in caplog.records
+        if hasattr(record, "transition_resolution")
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.transition_resolution == resolution
+    assert record.transition_operation == operation
+    assert record.document_id == str(document_id)
+    assert record.exception_type == "AutoReconnect"
+    assert "controlled acknowledgement loss" not in caplog.text
+
+
 async def _wait_for_tasks(tasks, timeout=_FIXTURE_TIMEOUT_SECONDS):
     """Wait without implicit cancellation; explicitly cancel and collect on timeout."""
     if not tasks:
@@ -460,6 +559,356 @@ async def _wait_for_tasks(tasks, timeout=_FIXTURE_TIMEOUT_SECONDS):
         raise TimeoutError(
             f"{len(pending)} task(s) exceeded the {timeout}s safety timeout"
         )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ambiguous_completion_after_real_write_is_observed_unconfirmed(
+    worker_integration_context,
+    monkeypatch,
+    caplog,
+):
+    context = worker_integration_context
+    _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    fixture = await _create_pending_pdf(context, "ambiguous-complete-applied")
+    repository = ProcessingRepository(context.db)
+    claimed = await repository.claim_pending(
+        f"worker-u461-complete-{uuid4()}"
+    )
+    assert claimed is not None
+    assert claimed.id == str(fixture["document_id"])
+    await _assert_no_foreign_eligible_work(
+        context,
+        {fixture["document_id"]},
+    )
+
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "content": _SUCCESS_CONTENT,
+                "page_count": _SUCCESS_PAGE_COUNT,
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    controlled_repository = _AmbiguousTransitionRepository(
+        repository,
+        operation="complete_processing",
+        apply_before_raise=True,
+    )
+    try:
+        result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                controlled_repository,
+                claimed,
+                client,
+                CircuitBreaker(),
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+    finally:
+        await client.aclose()
+
+    persisted = await context.collection.find_one(
+        {"_id": fixture["document_id"]}
+    )
+    assert result is ProcessingResult.RESULT_NOT_CONFIRMED
+    assert persisted["status"] == "completed"
+    assert persisted["content"] == _SUCCESS_CONTENT
+    assert persisted["page_count"] == _SUCCESS_PAGE_COUNT
+    assert persisted["attempt_count"] == 1
+    assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert persisted["worker_id"] == claimed.worker_id
+    assert persisted["fencing_token"] == claimed.fencing_token
+    assert persisted["original_cleanup_status"] == "pending"
+    assert controlled_repository.write_attempts == 1
+    assert controlled_repository.real_write_results == [True]
+    assert controlled_repository.observation_reads == 1
+    assert controlled_repository.exhaustion_writes == 0
+    assert len(requests) == 1
+    _assert_ambiguous_transition_diagnostic(
+        caplog,
+        resolution="OBSERVED_UNCONFIRMED",
+        operation="complete_processing",
+        document_id=fixture["document_id"],
+    )
+    assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ambiguous_completion_not_applied_remains_recoverable(
+    worker_integration_context,
+    monkeypatch,
+    caplog,
+):
+    context = worker_integration_context
+    clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    fixture = await _create_pending_pdf(context, "ambiguous-complete-not-applied")
+    repository = ProcessingRepository(context.db)
+    claimed = await repository.claim_pending(
+        f"worker-u461-complete-uncertain-{uuid4()}"
+    )
+    assert claimed is not None
+    assert claimed.id == str(fixture["document_id"])
+
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"content": _SUCCESS_CONTENT, "page_count": _SUCCESS_PAGE_COUNT},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    controlled_repository = _AmbiguousTransitionRepository(
+        repository,
+        operation="complete_processing",
+        apply_before_raise=False,
+    )
+    try:
+        result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                controlled_repository,
+                claimed,
+                client,
+                CircuitBreaker(),
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+    finally:
+        await client.aclose()
+
+    persisted = await context.collection.find_one(
+        {"_id": fixture["document_id"]}
+    )
+    assert result is ProcessingResult.RESULT_NOT_CONFIRMED
+    assert persisted["status"] == "processing"
+    assert persisted["attempt_count"] == 1
+    assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert persisted["worker_id"] == claimed.worker_id
+    assert persisted["fencing_token"] == claimed.fencing_token
+    assert persisted.get("content") is None
+    assert persisted.get("page_count") is None
+    assert controlled_repository.write_attempts == 1
+    assert controlled_repository.real_write_results == []
+    assert controlled_repository.observation_reads == 1
+    assert controlled_repository.exhaustion_writes == 0
+    assert len(requests) == 1
+    _assert_ambiguous_transition_diagnostic(
+        caplog,
+        resolution="UNKNOWN",
+        operation="complete_processing",
+        document_id=fixture["document_id"],
+    )
+    assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
+
+    clock.now += timedelta(seconds=61)
+    successor_worker_id = f"worker-u461-recovered-{uuid4()}"
+    recovered = await repository.recover_expired_processing(
+        successor_worker_id
+    )
+    assert recovered is not None
+    assert recovered.id == claimed.id
+    assert recovered.worker_id == successor_worker_id
+    assert recovered.fencing_token != claimed.fencing_token
+    assert recovered.processing_cycle_id == claimed.processing_cycle_id
+    assert recovered.attempt_count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ambiguous_retry_after_real_write_is_observed_unconfirmed(
+    worker_integration_context,
+    monkeypatch,
+    caplog,
+):
+    context = worker_integration_context
+    clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    fixture = await _create_pending_pdf(context, "ambiguous-retry-applied")
+    repository = ProcessingRepository(context.db)
+    claimed = await repository.claim_pending(
+        f"worker-u461-retry-{uuid4()}"
+    )
+    assert claimed is not None
+    assert claimed.id == str(fixture["document_id"])
+
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            503,
+            headers={"Retry-After": "0"},
+            json={"detail": "private simulated upstream failure"},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    controlled_repository = _AmbiguousTransitionRepository(
+        repository,
+        operation="schedule_transient_retry",
+        apply_before_raise=True,
+    )
+    try:
+        result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                controlled_repository,
+                claimed,
+                client,
+                CircuitBreaker(),
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+    finally:
+        await client.aclose()
+
+    persisted = await context.collection.find_one(
+        {"_id": fixture["document_id"]}
+    )
+    requested_retry_at = controlled_repository.write_arguments[-1]
+    cycle_deadline = _bson_utc(
+        claimed.processing_cycle_started_at
+    ) + timedelta(minutes=10)
+    bson_requested = _bson_utc(requested_retry_at)
+    bson_requested = bson_requested.replace(
+        microsecond=(bson_requested.microsecond // 1000) * 1000
+    )
+    cycle_deadline = cycle_deadline.replace(
+        microsecond=(cycle_deadline.microsecond // 1000) * 1000
+    )
+    effective_retry_at = min(bson_requested, cycle_deadline)
+
+    assert result is ProcessingResult.RESULT_NOT_CONFIRMED
+    assert persisted["status"] == "pending"
+    assert persisted["attempt_count"] == 1
+    assert persisted["last_error"] == "ms2_http_503"
+    assert _bson_utc(persisted["next_retry_at"]) == effective_retry_at
+    assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert _bson_utc(persisted["processing_cycle_started_at"]) == _bson_utc(
+        claimed.processing_cycle_started_at
+    )
+    assert persisted.get("worker_id") is None
+    assert persisted.get("fencing_token") is None
+    assert controlled_repository.write_attempts == 1
+    assert controlled_repository.real_write_results == [True]
+    assert controlled_repository.observation_reads == 1
+    assert controlled_repository.exhaustion_writes == 0
+    assert len(requests) == 1
+    _assert_ambiguous_transition_diagnostic(
+        caplog,
+        resolution="OBSERVED_UNCONFIRMED",
+        operation="schedule_transient_retry",
+        document_id=fixture["document_id"],
+    )
+    assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
+    assert clock.now < _bson_utc(persisted["next_retry_at"])
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ambiguous_completion_observes_successor_after_real_recovery(
+    worker_integration_context,
+    monkeypatch,
+    caplog,
+):
+    context = worker_integration_context
+    clock = _freeze_worker_clock(monkeypatch, _current_bson_utc())
+    fixture = await _create_pending_pdf(context, "ambiguous-successor-owner")
+    repository = ProcessingRepository(context.db)
+    claimed = await repository.claim_pending(
+        f"worker-u461-original-{uuid4()}"
+    )
+    assert claimed is not None
+    assert claimed.id == str(fixture["document_id"])
+    successor_worker_id = f"worker-u461-successor-{uuid4()}"
+    recovered_claims = []
+
+    async def recover_expired_claim():
+        clock.now += timedelta(seconds=61)
+        successor = await repository.recover_expired_processing(
+            successor_worker_id
+        )
+        assert successor is not None
+        recovered_claims.append(successor)
+
+    requests = []
+
+    async def transport_handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"content": _SUCCESS_CONTENT, "page_count": _SUCCESS_PAGE_COUNT},
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(transport_handler)
+    )
+    controlled_repository = _AmbiguousTransitionRepository(
+        repository,
+        operation="complete_processing",
+        apply_before_raise=True,
+        before_write=recover_expired_claim,
+    )
+    try:
+        result = await asyncio.wait_for(
+            _process_with_breaker(
+                context,
+                controlled_repository,
+                claimed,
+                client,
+                CircuitBreaker(),
+            ),
+            timeout=_FIXTURE_TIMEOUT_SECONDS,
+        )
+    finally:
+        await client.aclose()
+
+    assert len(recovered_claims) == 1
+    recovered = recovered_claims[0]
+    assert recovered.id == claimed.id
+    assert recovered.worker_id == successor_worker_id
+    assert recovered.fencing_token != claimed.fencing_token
+    assert recovered.processing_cycle_id == claimed.processing_cycle_id
+    assert recovered.attempt_count == 1
+
+    persisted = await context.collection.find_one(
+        {"_id": fixture["document_id"]}
+    )
+    assert result is ProcessingResult.RESULT_NOT_CONFIRMED
+    assert persisted["status"] == "processing"
+    assert persisted["worker_id"] == successor_worker_id
+    assert persisted["fencing_token"] == recovered.fencing_token
+    assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+    assert persisted["attempt_count"] == 1
+    assert persisted.get("content") is None
+    assert persisted.get("page_count") is None
+    assert _bson_utc(persisted["lease_until"]) > clock.now
+    assert controlled_repository.write_attempts == 1
+    assert controlled_repository.real_write_results == [False]
+    assert controlled_repository.observation_reads == 1
+    assert controlled_repository.exhaustion_writes == 0
+    assert len(requests) == 1
+    _assert_ambiguous_transition_diagnostic(
+        caplog,
+        resolution="UNKNOWN",
+        operation="complete_processing",
+        document_id=fixture["document_id"],
+    )
+    assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
 
 
 @pytest.mark.integration

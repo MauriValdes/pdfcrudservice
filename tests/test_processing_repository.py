@@ -1308,6 +1308,113 @@ async def test_record_ms2_attempt_propagates_cancellation_without_retry(
 
 
 @pytest.mark.asyncio
+async def test_observe_transition_state_uses_one_bounded_projected_read(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    document_id = str(ObjectId())
+    observed = {
+        "_id": ObjectId(document_id),
+        "status": "completed",
+        "processing_cycle_id": "cycle-a",
+        "worker_id": "worker-a",
+        "fencing_token": "fence-a",
+        "attempt_count": 1,
+        "content": "private extracted text",
+        "page_count": 2,
+    }
+    repo.collection.find_one.return_value = observed
+
+    result = await repo.observe_transition_state(
+        document_id,
+        timeout_seconds=0.25,
+    )
+
+    assert result == observed
+    repo.collection.find_one.assert_awaited_once()
+    query, projection = repo.collection.find_one.await_args.args
+    assert query == {"_id": ObjectId(document_id)}
+    assert projection == {
+        "_id": 1,
+        "status": 1,
+        "processing_cycle_id": 1,
+        "worker_id": 1,
+        "fencing_token": 1,
+        "attempt_count": 1,
+        "content": 1,
+        "page_count": 1,
+        "last_error": 1,
+        "next_retry_at": 1,
+    }
+    assert repo.collection.find_one.await_args.kwargs["max_time_ms"] == 250
+    repo.collection.update_one.assert_not_awaited()
+    repo.collection.find_one_and_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_observe_transition_state_enforces_total_client_timeout_without_residue(
+    repo_with_mocks,
+):
+    repo = repo_with_mocks
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked_find_one(*_args, **_kwargs):
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    repo.collection.find_one.side_effect = blocked_find_one
+    observation = asyncio.create_task(
+        repo.observe_transition_state(
+            str(ObjectId()),
+            timeout_seconds=0.02,
+        )
+    )
+    started_waiter = asyncio.create_task(started.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {observation, started_waiter},
+            timeout=1.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert started.is_set()
+
+        if observation not in done:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(observation),
+                    timeout=0.5,
+                )
+            except TimeoutError:
+                if not observation.done():
+                    pytest.fail("external timeout safeguard expired")
+            else:
+                pytest.fail("observation completed without its client timeout")
+
+        with pytest.raises(TimeoutError):
+            await observation
+
+        assert observation.done()
+        assert cancelled.is_set()
+        repo.collection.find_one.assert_awaited_once()
+        repo.collection.update_one.assert_not_awaited()
+        repo.collection.find_one_and_update.assert_not_awaited()
+    finally:
+        for task in (observation, started_waiter):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            observation,
+            started_waiter,
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_complete_processing_builds_exact_atomic_update_and_returns_match(
     monkeypatch, repo_with_mocks
 ):

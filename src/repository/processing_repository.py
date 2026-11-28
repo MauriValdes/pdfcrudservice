@@ -1,5 +1,8 @@
+import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from numbers import Real
 from uuid import uuid4
 
 from bson import ObjectId
@@ -24,6 +27,19 @@ _UNAVAILABLE_ERRORS = (
 )
 
 _DATETIME_TYPE = datetime
+_TRANSITION_OBSERVATION_FIELDS = (
+    "_id",
+    "status",
+    "processing_cycle_id",
+    "worker_id",
+    "fencing_token",
+    "attempt_count",
+    "content",
+    "page_count",
+    "last_error",
+    "next_retry_at",
+)
+_MAX_BSON_INT64 = 2**63 - 1
 
 
 class RetryTimestampExpiredError(ValueError):
@@ -725,6 +741,49 @@ class ProcessingRepository:
             return None
 
         return int(document_data["attempt_count"])
+
+    async def observe_transition_state(
+        self,
+        document_id: str,
+        *,
+        timeout_seconds: float = 0.25,
+    ) -> dict[str, object] | None:
+        """Read only the state needed to resolve one ambiguous transition.
+
+        A timeout or a missing document does not establish that the original
+        write was absent; callers must preserve uncertainty in either case.
+        """
+        if not isinstance(document_id, str) or not ObjectId.is_valid(document_id):
+            raise ValueError("Identificador de documento inválido")
+        if isinstance(timeout_seconds, bool) or not isinstance(
+            timeout_seconds, Real
+        ):
+            raise TypeError("timeout_seconds must be a finite positive number")
+        try:
+            timeout = float(timeout_seconds)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(
+                "timeout_seconds must be a finite positive number"
+            ) from error
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout_seconds must be a finite positive number")
+
+        timeout_ms = (
+            _MAX_BSON_INT64
+            if timeout >= _MAX_BSON_INT64 / 1000
+            else max(1, math.ceil(timeout * 1000))
+        )
+        projection = {field: 1 for field in _TRANSITION_OBSERVATION_FIELDS}
+
+        try:
+            async with asyncio.timeout(timeout):
+                return await self.collection.find_one(
+                    {"_id": ObjectId(document_id)},
+                    projection,
+                    max_time_ms=timeout_ms,
+                )
+        except _UNAVAILABLE_ERRORS as error:
+            raise DatabaseUnavailableError() from error
 
     async def complete_processing(
         self,
