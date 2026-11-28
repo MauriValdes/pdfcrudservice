@@ -12,6 +12,7 @@ import httpx
 from src.database.mongodb import MongoDB
 from src.repository.gridfs_repository import GridFSRepository
 from src.repository.processing_repository import ProcessingRepository
+from src.worker.circuit_breaker import CircuitBreaker
 from src.worker.ms2_client import MS2Client
 from src.worker.worker_runner import ProcessingWorker
 
@@ -38,6 +39,7 @@ class WorkerLifecycle:
         mongo_factory: Callable[[], MongoDB],
         http_client_factory: Callable[[], httpx.AsyncClient],
         worker_factory: Callable[..., ProcessingWorker],
+        circuit_breaker_factory: Callable[[], CircuitBreaker] = CircuitBreaker,
         ms2_base_url: str,
         ms2_timeout_seconds: float = 40.0,
         worker_kwargs: dict | None = None,
@@ -61,6 +63,7 @@ class WorkerLifecycle:
         self._mongo_factory = mongo_factory
         self._http_client_factory = http_client_factory
         self._worker_factory = worker_factory
+        self._circuit_breaker_factory = circuit_breaker_factory
         self._ms2_base_url = ms2_base_url
         self._ms2_timeout_seconds = ms2_timeout_seconds
         self._worker_kwargs = dict(worker_kwargs or {})
@@ -170,10 +173,12 @@ class WorkerLifecycle:
                 base_url=self._ms2_base_url,
                 timeout_seconds=self._ms2_timeout_seconds,
             )
+            circuit_breaker = self._circuit_breaker_factory()
             worker = self._worker_factory(
                 processing_repository,
                 gridfs_repository,
                 ms2_client,
+                circuit_breaker=circuit_breaker,
                 **self._worker_kwargs,
             )
 

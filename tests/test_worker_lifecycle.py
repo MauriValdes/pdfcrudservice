@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from src.worker.circuit_breaker import CircuitBreaker
+
 
 def _lifecycle_api():
     """Import lazily so this RED suite fails while the lifecycle is absent."""
@@ -70,6 +72,7 @@ def _make_lifecycle(
     mongo_factory = Mock(return_value=mongo)
     http_factory = Mock(return_value=http)
     worker_factory = Mock(return_value=worker)
+    circuit_breaker_factory = Mock(return_value=CircuitBreaker())
     processing_repository = object()
     gridfs_repository = object()
     ms2_client = object()
@@ -86,6 +89,7 @@ def _make_lifecycle(
         mongo_factory=mongo_factory,
         http_client_factory=http_factory,
         worker_factory=worker_factory,
+        circuit_breaker_factory=circuit_breaker_factory,
         ms2_base_url="http://ms2.test",
         ms2_timeout_seconds=40.0,
         worker_kwargs={
@@ -107,6 +111,7 @@ def _make_lifecycle(
         processing_repository,
         gridfs_repository,
         ms2_client,
+        circuit_breaker_factory,
     )
 
 
@@ -131,6 +136,7 @@ def test_initialization_order_and_owned_dependencies(monkeypatch):
         processing_repository,
         gridfs_repository,
         ms2_client,
+        circuit_breaker_factory,
     ) = _make_lifecycle(
         monkeypatch, mongo=mongo, http=http, worker=worker, events=events
     )
@@ -153,13 +159,33 @@ def test_initialization_order_and_owned_dependencies(monkeypatch):
         processing_repository,
         gridfs_repository,
         ms2_client,
+        circuit_breaker=circuit_breaker_factory.return_value,
         max_concurrency=2,
         poll_initial_seconds=1.0,
         poll_max_seconds=5.0,
     )
+    circuit_breaker_factory.assert_called_once_with()
     assert events.index("mongo.connect") < events.index("worker.run")
     assert events.index("worker.run") < events.index("http.close")
     assert events.index("http.close") < events.index("mongo.close")
+
+
+def test_separate_lifecycle_runs_receive_independent_breaker_instances(monkeypatch):
+    first_lifecycle, *_first_dependencies, first_factory = _make_lifecycle(
+        monkeypatch
+    )
+    asyncio.run(first_lifecycle.run(asyncio.Event()))
+    first_breaker = first_factory.return_value
+
+    second_lifecycle, *_second_dependencies, second_factory = _make_lifecycle(
+        monkeypatch
+    )
+    asyncio.run(second_lifecycle.run(asyncio.Event()))
+    second_breaker = second_factory.return_value
+
+    first_factory.assert_called_once_with()
+    second_factory.assert_called_once_with()
+    assert first_breaker is not second_breaker
 
 
 @pytest.mark.parametrize(

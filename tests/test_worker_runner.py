@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from src.worker.circuit_breaker import CircuitBreaker
+
 
 def _load_runner():
     return importlib.import_module("src.worker.worker_runner")
@@ -53,6 +55,7 @@ async def _wait(event):
 
 
 def _make_worker(module, repository, processor, **kwargs):
+    kwargs.setdefault("circuit_breaker", CircuitBreaker())
     return module.ProcessingWorker(
         repository,
         object(),
@@ -753,6 +756,7 @@ async def test_processor_receives_all_injected_dependencies():
     repository = _Repository(recovered=[_document("injected")])
     gridfs_repository = object()
     ms2_client = object()
+    circuit_breaker = CircuitBreaker()
     called = asyncio.Event()
 
     async def process(*_args, **_kwargs):
@@ -764,6 +768,7 @@ async def test_processor_receives_all_injected_dependencies():
         gridfs_repository,
         ms2_client,
         processor=processor,
+        circuit_breaker=circuit_breaker,
     )
     run_task = asyncio.create_task(worker.run())
     try:
@@ -775,11 +780,100 @@ async def test_processor_receives_all_injected_dependencies():
             processing_repository=repository,
             gridfs_repository=gridfs_repository,
             ms2_client=ms2_client,
+            circuit_breaker=circuit_breaker,
+            circuit_breaker_busy_retry_seconds=1.0,
         )
     finally:
         worker.request_stop()
         if not run_task.done():
             await asyncio.wait_for(run_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_processor_tasks_share_breaker_and_receive_poll_interval():
+    module = _load_runner()
+    repository = _Repository(
+        recovered=[_document("first"), _document("second")]
+    )
+    circuit_breaker = CircuitBreaker()
+    poll_interval = 2.75
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+    received = []
+
+    async def processor(document, **dependencies):
+        received.append(
+            (
+                document.id,
+                dependencies["circuit_breaker"],
+                dependencies["circuit_breaker_busy_retry_seconds"],
+            )
+        )
+        if len(received) == 2:
+            all_started.set()
+        await release.wait()
+
+    worker = _make_worker(
+        module,
+        repository,
+        processor,
+        circuit_breaker=circuit_breaker,
+        max_concurrency=2,
+        poll_initial_seconds=poll_interval,
+    )
+    run_task = asyncio.create_task(worker.run())
+    try:
+        await _wait(all_started)
+        assert {entry[0] for entry in received} == {"first", "second"}
+        assert all(entry[1] is circuit_breaker for entry in received)
+        assert all(entry[2] == poll_interval for entry in received)
+        worker.request_stop()
+        release.set()
+        await asyncio.wait_for(run_task, timeout=1)
+    finally:
+        worker.request_stop()
+        release.set()
+        if not run_task.done():
+            await asyncio.wait_for(run_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_release_outcome_is_logged_as_non_success(caplog):
+    module = _load_runner()
+    processor_module = importlib.import_module("src.worker.document_processor")
+    outcome = processor_module.ProcessingResult.CIRCUIT_BREAKER_RELEASED
+    repository = _Repository(recovered=[_document("released")])
+    processor_called = asyncio.Event()
+
+    async def processor(_document, **_dependencies):
+        processor_called.set()
+        return outcome
+
+    worker = _make_worker(module, repository, processor)
+    run_task = asyncio.create_task(worker.run())
+    try:
+        await _wait(processor_called)
+        worker.request_stop()
+        await asyncio.wait_for(run_task, timeout=1)
+    finally:
+        worker.request_stop()
+        if not run_task.done():
+            await asyncio.wait_for(run_task, timeout=1)
+
+    assert f": {outcome.value}" in caplog.text
+    matching = [
+        record for record in caplog.records
+        if record.getMessage().endswith(f": {outcome.value}")
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.WARNING
+
+
+def test_processing_worker_requires_an_explicit_circuit_breaker():
+    module = _load_runner()
+
+    with pytest.raises(TypeError):
+        module.ProcessingWorker(_Repository(), object(), object())
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from src.repository.gridfs_repository import GridFSRepository
 from src.repository.processing_repository import ProcessingRepository
+from src.worker.circuit_breaker import CircuitBreaker
 from src.worker.document_processor import (
     ProcessingResult,
     process_claimed_document,
@@ -53,6 +54,7 @@ class ProcessingWorker:
         gridfs_repository: GridFSRepository,
         ms2_client: MS2Client,
         *,
+        circuit_breaker: CircuitBreaker,
         processor: Callable = process_claimed_document,
         max_concurrency: int = 2,
         poll_initial_seconds: float = 1.0,
@@ -82,6 +84,7 @@ class ProcessingWorker:
         self._processing_repository = processing_repository
         self._gridfs_repository = gridfs_repository
         self._ms2_client = ms2_client
+        self._circuit_breaker = circuit_breaker
         self._processor = processor
         self._max_concurrency = max_concurrency
         self._poll_initial_seconds = initial_interval
@@ -255,6 +258,8 @@ class ProcessingWorker:
                 processing_repository=self._processing_repository,
                 gridfs_repository=self._gridfs_repository,
                 ms2_client=self._ms2_client,
+                circuit_breaker=self._circuit_breaker,
+                circuit_breaker_busy_retry_seconds=self._poll_initial_seconds,
             )
         except asyncio.CancelledError:
             raise

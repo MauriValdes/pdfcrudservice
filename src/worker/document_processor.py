@@ -1,8 +1,10 @@
 """Basic orchestration for processing one already-claimed document."""
 
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from numbers import Real
 
 from bson import ObjectId
 
@@ -11,6 +13,12 @@ from src.repository.gridfs_repository import GridFSRepository
 from src.repository.processing_repository import (
     ProcessingRepository,
     RetryTimestampExpiredError,
+)
+from src.worker.circuit_breaker import (
+    Admitted,
+    CircuitBreaker,
+    Rejected,
+    RejectionReason,
 )
 from src.worker.error_classifier import DocumentAction, classify_ms2_error
 from src.worker.heartbeat import run_with_heartbeat
@@ -43,6 +51,7 @@ class ProcessingResult(Enum):
     FAILED_EXHAUSTED = "failed_exhausted"
     RETRY_SCHEDULED = "retry_scheduled"
     FAILED_TECHNICAL = "failed_technical"
+    CIRCUIT_BREAKER_RELEASED = "circuit_breaker_released"
 
 
 async def process_claimed_document(
@@ -51,6 +60,8 @@ async def process_claimed_document(
     processing_repository: ProcessingRepository,
     gridfs_repository: GridFSRepository,
     ms2_client: MS2Client,
+    circuit_breaker: CircuitBreaker,
+    circuit_breaker_busy_retry_seconds: float,
 ) -> ProcessingResult:
     """Process one claimed document with at most one authorized MS2 extraction.
 
@@ -59,6 +70,21 @@ async def process_claimed_document(
     acceptable authorized result may be pending for this acquisition.
     Cancellation cannot establish whether remote effects occurred.
     """
+    if isinstance(circuit_breaker_busy_retry_seconds, bool) or not isinstance(
+        circuit_breaker_busy_retry_seconds, Real
+    ):
+        raise TypeError("circuit_breaker_busy_retry_seconds must be a real number")
+    try:
+        busy_interval = float(circuit_breaker_busy_retry_seconds)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            "circuit_breaker_busy_retry_seconds must be finite and positive"
+        ) from error
+    if not math.isfinite(busy_interval) or busy_interval <= 0:
+        raise ValueError(
+            "circuit_breaker_busy_retry_seconds must be finite and positive"
+        )
+
     snapshot = document.model_copy(deep=True)
 
     document_id = snapshot.id
@@ -92,141 +118,216 @@ async def process_claimed_document(
         raise ValueError("document.filename must not be empty")
 
     async def operation() -> ProcessingResult:
-        pdf_bytes = await read_claimed_pdf(
-            snapshot,
-            processing_repository=processing_repository,
-            gridfs_repository=gridfs_repository,
-        )
+        permit = None
+        permit_pending = False
+        primary_error = False
+        try:
+            admission = circuit_breaker.admit()
+            if isinstance(admission, Rejected):
+                if admission.reason is RejectionReason.OPEN:
+                    delay = max(
+                        admission.retry_after_seconds or 0.0,
+                        busy_interval,
+                    )
+                elif admission.reason is RejectionReason.HALF_OPEN_BUSY:
+                    delay = busy_interval
+                else:
+                    raise TypeError("Circuit Breaker returned an unsupported rejection")
 
-        attempt_number = await processing_repository.record_ms2_attempt(
-            document_id,
-            worker_id,
-            fencing_token,
-            processing_cycle_id,
-        )
-        if attempt_number is None:
-            confirmed = await processing_repository.fail_exhausted_processing(
+                now = _utc_now()
+                if now.tzinfo is None or now.utcoffset() is None:
+                    raise ValueError("_utc_now must return a timezone-aware datetime")
+                retry_at = now.astimezone(timezone.utc) + timedelta(seconds=delay)
+                # MongoDB stores BSON dates at millisecond precision. Ceil rather
+                # than truncate so the persisted timestamp remains in the future.
+                remainder = retry_at.microsecond % 1000
+                if remainder:
+                    retry_at += timedelta(microseconds=1000 - remainder)
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+                try:
+                    released = await processing_repository.release_for_circuit_open(
+                        document_id,
+                        worker_id,
+                        fencing_token,
+                        processing_cycle_id,
+                        snapshot.attempt_count,
+                        retry_at,
+                    )
+                except RetryTimestampExpiredError:
+                    released = False
+
+                if released:
+                    return ProcessingResult.CIRCUIT_BREAKER_RELEASED
+                confirmed = await processing_repository.fail_exhausted_processing(
+                    document_id,
+                    worker_id,
+                    fencing_token,
+                    processing_cycle_id,
+                )
+                return (
+                    ProcessingResult.FAILED_EXHAUSTED
+                    if confirmed
+                    else ProcessingResult.RESULT_NOT_CONFIRMED
+                )
+
+            if not isinstance(admission, Admitted):
+                raise TypeError("Circuit Breaker returned an unsupported admission")
+            permit = admission.permit
+            permit_pending = True
+
+            pdf_bytes = await read_claimed_pdf(
+                snapshot,
+                processing_repository=processing_repository,
+                gridfs_repository=gridfs_repository,
+            )
+
+            attempt_number = await processing_repository.record_ms2_attempt(
                 document_id,
                 worker_id,
                 fencing_token,
                 processing_cycle_id,
             )
-
-            if confirmed:
-                return ProcessingResult.FAILED_EXHAUSTED
-
-            return ProcessingResult.ATTEMPT_NOT_AUTHORIZED
-
-        try:
-            result = await ms2_client.extract(
-                pdf_bytes,
-                filename,
-            )
-        except _MS2_ERRORS as error:
-            category = classify_ms2_error(error)
-            if category is None:
-                raise
-
-            if category.alert_required:
-                fields = (
-                    f"event_id=worker.ms2.technical_failure "
-                    f"document_id={document_id} error_code={category.code}"
-                )
-                if category.http_status is not None:
-                    fields += f" http_status={category.http_status}"
-                _logger.error(fields)
-
-            if category.document_action in (
-                DocumentAction.FAIL_INPUT,
-                DocumentAction.FAIL_TECHNICAL,
-            ):
-                confirmed = await processing_repository.fail_processing(
+            if attempt_number is None:
+                circuit_breaker.release(permit)
+                permit_pending = False
+                confirmed = await processing_repository.fail_exhausted_processing(
                     document_id,
                     worker_id,
                     fencing_token,
                     processing_cycle_id,
+                )
+                return (
+                    ProcessingResult.FAILED_EXHAUSTED
+                    if confirmed
+                    else ProcessingResult.ATTEMPT_NOT_AUTHORIZED
+                )
+
+            try:
+                result = await ms2_client.extract(pdf_bytes, filename)
+            except _MS2_ERRORS as error:
+                category = classify_ms2_error(error)
+                if category is None:
+                    raise
+                circuit_breaker.record_error(permit, category)
+                permit_pending = False
+                return await persist_classified_error(
+                    error,
+                    category,
                     attempt_number,
-                    category.code,
                 )
-                if not confirmed:
-                    return ProcessingResult.RESULT_NOT_CONFIRMED
-                if category.document_action is DocumentAction.FAIL_INPUT:
-                    return ProcessingResult.FAILED_PERMANENT
-                return ProcessingResult.FAILED_TECHNICAL
+            else:
+                circuit_breaker.record_success(permit)
+                permit_pending = False
 
-            if category.document_action is DocumentAction.RETRY:
-                now = _utc_now()
-                retry_plan = plan_retry(
-                    attempt_count=attempt_number,
-                    cycle_started_at=snapshot.processing_cycle_started_at,
-                    now=now,
-                    retry_after=(
-                        error.retry_after
-                        if isinstance(error, MS2HTTPError)
-                        else None
-                    ),
+            confirmed = await processing_repository.complete_processing(
+                document_id,
+                worker_id,
+                fencing_token,
+                processing_cycle_id,
+                attempt_number,
+                result.content,
+                result.page_count,
+            )
+            if confirmed:
+                return ProcessingResult.COMPLETED
+            return ProcessingResult.RESULT_NOT_CONFIRMED
+        except BaseException:
+            primary_error = True
+            raise
+        finally:
+            if permit_pending:
+                try:
+                    circuit_breaker.release(permit)
+                except BaseException:
+                    if not primary_error:
+                        raise
+
+    async def persist_classified_error(
+        error: Exception,
+        category,
+        attempt_number: int,
+    ) -> ProcessingResult:
+        if category.alert_required:
+            fields = (
+                f"event_id=worker.ms2.technical_failure "
+                f"document_id={document_id} error_code={category.code}"
+            )
+            if category.http_status is not None:
+                fields += f" http_status={category.http_status}"
+            _logger.error(fields)
+
+        if category.document_action in (
+            DocumentAction.FAIL_INPUT,
+            DocumentAction.FAIL_TECHNICAL,
+        ):
+            confirmed = await processing_repository.fail_processing(
+                document_id,
+                worker_id,
+                fencing_token,
+                processing_cycle_id,
+                attempt_number,
+                category.code,
+            )
+            if not confirmed:
+                return ProcessingResult.RESULT_NOT_CONFIRMED
+            if category.document_action is DocumentAction.FAIL_INPUT:
+                return ProcessingResult.FAILED_PERMANENT
+            return ProcessingResult.FAILED_TECHNICAL
+
+        if category.document_action is DocumentAction.RETRY:
+            now = _utc_now()
+            retry_plan = plan_retry(
+                attempt_count=attempt_number,
+                cycle_started_at=snapshot.processing_cycle_started_at,
+                now=now,
+                retry_after=(
+                    error.retry_after if isinstance(error, MS2HTTPError) else None
+                ),
+            )
+            if isinstance(retry_plan, RetryExhausted):
+                confirmed = await processing_repository.fail_exhausted_processing(
+                    document_id,
+                    worker_id,
+                    fencing_token,
+                    processing_cycle_id,
                 )
-                if isinstance(retry_plan, RetryExhausted):
-                    confirmed = await processing_repository.fail_exhausted_processing(
+                return (
+                    ProcessingResult.FAILED_EXHAUSTED
+                    if confirmed
+                    else ProcessingResult.RESULT_NOT_CONFIRMED
+                )
+
+            if isinstance(retry_plan, RetryScheduled):
+                try:
+                    scheduled = await processing_repository.schedule_transient_retry(
                         document_id,
                         worker_id,
                         fencing_token,
                         processing_cycle_id,
+                        attempt_number,
+                        category.code,
+                        retry_plan.next_retry_at,
                     )
-                    return (
-                        ProcessingResult.FAILED_EXHAUSTED
-                        if confirmed
-                        else ProcessingResult.RESULT_NOT_CONFIRMED
-                    )
+                except RetryTimestampExpiredError:
+                    scheduled = False
 
-                if isinstance(retry_plan, RetryScheduled):
-                    try:
-                        scheduled = (
-                            await processing_repository.schedule_transient_retry(
-                                document_id,
-                                worker_id,
-                                fencing_token,
-                                processing_cycle_id,
-                                attempt_number,
-                                category.code,
-                                retry_plan.next_retry_at,
-                            )
-                        )
-                    except RetryTimestampExpiredError:
-                        scheduled = False
+                if scheduled:
+                    return ProcessingResult.RETRY_SCHEDULED
+                confirmed = await processing_repository.fail_exhausted_processing(
+                    document_id,
+                    worker_id,
+                    fencing_token,
+                    processing_cycle_id,
+                )
+                return (
+                    ProcessingResult.FAILED_EXHAUSTED
+                    if confirmed
+                    else ProcessingResult.RESULT_NOT_CONFIRMED
+                )
 
-                    if scheduled:
-                        return ProcessingResult.RETRY_SCHEDULED
+            raise TypeError("plan_retry returned an unsupported result")
 
-                    confirmed = await processing_repository.fail_exhausted_processing(
-                        document_id,
-                        worker_id,
-                        fencing_token,
-                        processing_cycle_id,
-                    )
-                    return (
-                        ProcessingResult.FAILED_EXHAUSTED
-                        if confirmed
-                        else ProcessingResult.RESULT_NOT_CONFIRMED
-                    )
-
-                raise TypeError("plan_retry returned an unsupported result")
-
-            raise TypeError("MS2 classifier returned an unsupported action")
-
-        confirmed = await processing_repository.complete_processing(
-            document_id,
-            worker_id,
-            fencing_token,
-            processing_cycle_id,
-            attempt_number,
-            result.content,
-            result.page_count,
-        )
-        if confirmed:
-            return ProcessingResult.COMPLETED
-
-        return ProcessingResult.RESULT_NOT_CONFIRMED
+        raise TypeError("MS2 classifier returned an unsupported action")
 
     return await run_with_heartbeat(
         snapshot,

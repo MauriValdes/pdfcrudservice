@@ -14,6 +14,12 @@ from gridfs.errors import NoFile
 from src.core.exceptions import DatabaseUnavailableError
 from src.models.document import DocumentModel, DocumentStatus
 from src.worker.exceptions import ProcessingLeaseLostError
+from src.worker.circuit_breaker import (
+    Admitted,
+    CircuitBreaker,
+    CircuitBreakerState,
+)
+from src.worker.error_classifier import classify_ms2_error
 from src.worker.ms2_client import (
     MS2HTTPError,
     MS2InvalidResponseError,
@@ -47,6 +53,78 @@ def _load_processor():
     return document_processor
 
 
+def _process(processor, document, **dependencies):
+    """Call through the strict processor contract with explicit breaker inputs."""
+    if "circuit_breaker" not in dependencies:
+        dependencies["circuit_breaker"] = CircuitBreaker()
+    if "circuit_breaker_busy_retry_seconds" not in dependencies:
+        dependencies["circuit_breaker_busy_retry_seconds"] = 1.0
+    return processor.process_claimed_document(document, **dependencies)
+
+
+class _RecordingCircuitBreaker(CircuitBreaker):
+    def __init__(self, events, *, monotonic_clock=lambda: 0.0):
+        self.events = events
+        super().__init__(monotonic_clock=monotonic_clock)
+
+    def admit(self):
+        self.events.append(("admit",))
+        return super().admit()
+
+    def record_success(self, permit):
+        self.events.append(("record_success",))
+        return super().record_success(permit)
+
+    def record_error(self, permit, category):
+        self.events.append(("record_error", category.code))
+        return super().record_error(permit, category)
+
+    def release(self, permit):
+        self.events.append(("release",))
+        return super().release(permit)
+
+
+class _FakeMonotonicClock:
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
+def _classified_error(error):
+    category = classify_ms2_error(error)
+    assert category is not None
+    return category
+
+
+def _open_breaker(clock):
+    breaker = CircuitBreaker(monotonic_clock=clock)
+    category = _classified_error(MS2HTTPError(503, "transient", None))
+    for _ in range(5):
+        admission = breaker.admit()
+        assert isinstance(admission, Admitted)
+        assert breaker.record_error(admission.permit, category)
+    assert breaker.state is CircuitBreakerState.OPEN
+    return breaker
+
+
+@pytest.mark.asyncio
+async def test_processor_requires_explicit_breaker_dependencies(monkeypatch):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+
+    with pytest.raises(TypeError):
+        await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+
 def _dependencies(*, pdf_bytes=b"%PDF-test", extraction=None):
     repository = SimpleNamespace(
         renew_processing_lease=AsyncMock(return_value=True),
@@ -55,7 +133,7 @@ def _dependencies(*, pdf_bytes=b"%PDF-test", extraction=None):
         fail_processing=AsyncMock(),
         fail_exhausted_processing=AsyncMock(),
         schedule_transient_retry=AsyncMock(),
-        release_for_circuit_open=AsyncMock(),
+        release_for_circuit_open=AsyncMock(return_value=True),
     )
     gridfs = SimpleNamespace(read=AsyncMock(return_value=pdf_bytes))
     ms2 = SimpleNamespace(
@@ -164,22 +242,28 @@ async def test_real_heartbeat_reader_and_fakes_complete_empty_extraction_in_orde
             return extraction
 
     repository = ProcessingRepository()
-    outcome = await processor.process_claimed_document(
+    breaker = _RecordingCircuitBreaker(events)
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=GridFS(),
         ms2_client=MS2(),
+        circuit_breaker=breaker,
+        circuit_breaker_busy_retry_seconds=1.0,
     )
 
     identity = (document.id, document.worker_id, document.fencing_token)
     assert outcome is processor.ProcessingResult.COMPLETED
     assert events == [
         ("renew", *identity),  # supervisor's initial ownership check
+        ("admit",),
         ("renew", *identity),  # reader checks ownership before GridFS
         ("gridfs_read", document.file_id),
         ("renew", *identity),  # reader checks ownership after GridFS
         ("authorize", *identity, document.processing_cycle_id),
         ("extract", b"%PDF-real-reader", document.filename),
+        ("record_success",),
         (
             "complete",
             *identity,
@@ -209,7 +293,8 @@ async def test_terminal_write_result_is_returned_without_repeating_operations(
     repository.record_ms2_attempt.return_value = 4
     repository.complete_processing.return_value = confirmed
 
-    outcome = await processor.process_claimed_document(
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=gridfs,
@@ -248,7 +333,8 @@ async def test_initial_ownership_rejection_prevents_read_authorization_and_http(
     repository.renew_processing_lease.return_value = False
 
     with pytest.raises(ProcessingLeaseLostError):
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -270,7 +356,8 @@ async def test_lease_loss_during_real_safe_read_prevents_authorization():
     repository.renew_processing_lease.side_effect = [True, True, False]
 
     with pytest.raises(ProcessingLeaseLostError):
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -313,7 +400,8 @@ async def test_private_snapshot_survives_mutation_of_original_during_read(
     monkeypatch.setattr(processor, "run_with_heartbeat", inline_heartbeat)
     monkeypatch.setattr(processor, "read_claimed_pdf", blocked_read)
     task = asyncio.create_task(
-        processor.process_claimed_document(
+        _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -400,7 +488,8 @@ async def test_invalid_claim_arguments_are_rejected_before_dependencies(updates)
     repository, gridfs, ms2 = _dependencies()
 
     with pytest.raises((TypeError, ValueError)):
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -425,7 +514,8 @@ async def test_atomic_authorization_none_stops_before_http_and_persistence(
     repository.record_ms2_attempt.return_value = None
     repository.fail_exhausted_processing.return_value = False
 
-    outcome = await processor.process_claimed_document(
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=gridfs,
@@ -456,7 +546,8 @@ async def test_authorization_exception_propagates_without_retry_or_http(monkeypa
     repository.record_ms2_attempt.side_effect = error
 
     with pytest.raises(DatabaseUnavailableError) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -480,7 +571,8 @@ async def test_snapshot_attempt_count_never_replaces_atomic_authorization(
     repository, gridfs, ms2 = _dependencies()
     repository.record_ms2_attempt.return_value = 2
 
-    outcome = await processor.process_claimed_document(
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=gridfs,
@@ -503,7 +595,8 @@ async def test_unclassified_ms2_error_propagates_unchanged(monkeypatch):
     ms2.extract.side_effect = error
 
     with pytest.raises(type(error)) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -565,7 +658,8 @@ async def test_classified_transient_errors_schedule_once_with_authorized_attempt
     ms2.extract.side_effect = error
 
     with caplog.at_level(logging.ERROR, logger=processor.__name__):
-        outcome = await processor.process_claimed_document(
+        outcome = await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -615,7 +709,8 @@ async def test_rejected_retry_confirms_exhaustion_once(
     repository.fail_exhausted_processing.return_value = exhaustion_confirmed
     ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
 
-    outcome = await processor.process_claimed_document(
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=gridfs,
@@ -664,7 +759,8 @@ async def test_expired_retry_timestamp_confirms_exhaustion_once(
     repository.fail_exhausted_processing.return_value = exhaustion_confirmed
     ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
 
-    outcome = await processor.process_claimed_document(
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=gridfs,
@@ -710,7 +806,8 @@ async def test_retry_policy_exhaustion_requires_confirmed_terminal_write(
     repository.fail_exhausted_processing.return_value = exhaustion_confirmed
     ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
 
-    outcome = await processor.process_claimed_document(
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=gridfs,
@@ -748,7 +845,8 @@ async def test_exhaustion_confirmation_exception_propagates_without_retry(
     ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
 
     with pytest.raises(DatabaseUnavailableError) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -786,7 +884,8 @@ async def test_retry_write_error_propagates_without_exhaustion_or_repetition(
     ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
 
     with pytest.raises(type(error)) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -810,7 +909,8 @@ async def test_unknown_ms2_exception_propagates_without_policy_writes(monkeypatc
     ms2.extract.side_effect = error
 
     with pytest.raises(RuntimeError) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -841,7 +941,8 @@ async def test_technical_alert_is_emitted_even_when_failure_write_is_rejected(
     )
 
     with caplog.at_level(logging.ERROR, logger=processor.__name__):
-        outcome = await processor.process_claimed_document(
+        outcome = await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -892,7 +993,8 @@ async def test_known_permanent_http_errors_persist_once_with_exact_failure_code(
     error = MS2HTTPError(status_code, "permanent_input", None)
     ms2.extract.side_effect = error
 
-    outcome = await processor.process_claimed_document(
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=gridfs,
@@ -935,7 +1037,8 @@ async def test_permanent_failure_write_exception_propagates_without_repeating(
     ms2.extract.side_effect = MS2HTTPError(413, "permanent_input", None)
 
     with pytest.raises(DatabaseUnavailableError) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -960,7 +1063,8 @@ async def test_none_authorization_confirms_exhaustion_when_conditional_write_mat
     repository.record_ms2_attempt.return_value = None
     repository.fail_exhausted_processing.return_value = True
 
-    outcome = await processor.process_claimed_document(
+    outcome = await _process(
+        processor,
         document,
         processing_repository=repository,
         gridfs_repository=gridfs,
@@ -998,7 +1102,8 @@ async def test_exhaustion_write_exception_propagates_without_http(monkeypatch):
     repository.fail_exhausted_processing.side_effect = error
 
     with pytest.raises(DatabaseUnavailableError) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -1083,7 +1188,8 @@ async def test_http_errors_follow_real_classifier_action(
     ms2.extract.side_effect = error
 
     with caplog.at_level(logging.ERROR, logger=processor.__name__):
-        outcome = await processor.process_claimed_document(
+        outcome = await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -1142,7 +1248,8 @@ async def test_ms2_http_error_outside_extract_is_not_treated_as_permanent(
     repository.record_ms2_attempt.side_effect = error
 
     with pytest.raises(MS2HTTPError) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -1208,7 +1315,8 @@ async def test_confirmed_permanent_failure_wins_concurrent_heartbeat_completion(
     )
 
     outcome = await asyncio.wait_for(
-        processor.process_claimed_document(
+        _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -1234,7 +1342,8 @@ async def test_gridfs_read_error_propagates_without_consuming_attempt(monkeypatc
     processor.read_claimed_pdf.side_effect = error
 
     with pytest.raises(NoFile) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -1259,7 +1368,8 @@ async def test_persistence_exception_propagates_without_repeating_write_or_extra
     repository.complete_processing.side_effect = error
 
     with pytest.raises(DatabaseUnavailableError) as raised:
-        await processor.process_claimed_document(
+        await _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
@@ -1326,7 +1436,8 @@ async def test_lease_loss_during_http_cancels_operation_without_persisting(
 
     with pytest.raises(ProcessingLeaseLostError):
         await asyncio.wait_for(
-            processor.process_claimed_document(
+            _process(
+                processor,
                 document,
                 processing_repository=repository,
                 gridfs_repository=gridfs,
@@ -1339,6 +1450,626 @@ async def test_lease_loss_during_http_cancels_operation_without_persisting(
     assert http_cancelled.is_set()
     repository.record_ms2_attempt.assert_awaited_once()
     repository.complete_processing.assert_not_awaited()
+
+
+def _ceil_bson_utc(value):
+    remainder = value.microsecond % 1000
+    if remainder:
+        value += timedelta(microseconds=1000 - remainder)
+    return value
+
+
+@pytest.mark.parametrize(
+    ("rejection", "clock_value", "poll_interval", "delay"),
+    [
+        ("open", 24.0, 2.5, 6.0),
+        ("open", 29.75, 2.5, 2.5),
+        ("open", 29.9996, 0.0004, 0.0004),
+        ("half-open-busy", 30.0, 2.5, 2.5),
+    ],
+)
+@pytest.mark.asyncio
+async def test_circuit_rejection_releases_without_read_authorization_or_http(
+    monkeypatch,
+    rejection,
+    clock_value,
+    poll_interval,
+    delay,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(processor, "_utc_now", lambda: now, raising=False)
+    document = _document(attempt_count=3)
+    repository, gridfs, ms2 = _dependencies()
+    clock = _FakeMonotonicClock()
+    breaker = _open_breaker(clock)
+    clock.value = clock_value
+    if rejection == "half-open-busy":
+        probe = breaker.admit()
+        assert isinstance(probe, Admitted)
+
+    outcome = await _process(
+        processor,
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+        circuit_breaker=breaker,
+        circuit_breaker_busy_retry_seconds=poll_interval,
+    )
+
+    assert outcome is processor.ProcessingResult.CIRCUIT_BREAKER_RELEASED
+    gridfs.read.assert_not_awaited()
+    processor.read_claimed_pdf.assert_not_awaited()
+    repository.record_ms2_attempt.assert_not_awaited()
+    ms2.extract.assert_not_awaited()
+    repository.release_for_circuit_open.assert_awaited_once()
+    args = repository.release_for_circuit_open.await_args.args
+    assert args[:5] == (
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+        document.attempt_count,
+    )
+    assert args[5] == _ceil_bson_utc(now + timedelta(seconds=delay))
+    repository.fail_exhausted_processing.assert_not_awaited()
+    if rejection == "half-open-busy":
+        assert breaker.state is CircuitBreakerState.HALF_OPEN
+    else:
+        assert breaker.state is CircuitBreakerState.OPEN
+
+
+@pytest.mark.parametrize(
+    (
+        "release_outcome",
+        "exhausted_confirmed",
+        "expected",
+        "attempt_count",
+        "cycle_age",
+    ),
+    [
+        ("false", False, "RESULT_NOT_CONFIRMED", 0, timedelta(minutes=1)),
+        ("false", True, "FAILED_EXHAUSTED", 5, timedelta(minutes=1)),
+        ("false", True, "FAILED_EXHAUSTED", 1, timedelta(minutes=11)),
+        ("expired", False, "RESULT_NOT_CONFIRMED", 0, timedelta(minutes=1)),
+        ("expired", True, "FAILED_EXHAUSTED", 5, timedelta(minutes=1)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_circuit_release_rejection_or_expired_timestamp_checks_exhaustion_once(
+    monkeypatch,
+    release_outcome,
+    exhausted_confirmed,
+    expected,
+    attempt_count,
+    cycle_age,
+):
+    from src.repository.processing_repository import RetryTimestampExpiredError
+
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(processor, "_utc_now", lambda: now, raising=False)
+    document = _document(
+        attempt_count=attempt_count,
+        processing_cycle_started_at=now - cycle_age,
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.fail_exhausted_processing.return_value = exhausted_confirmed
+    if release_outcome == "false":
+        repository.release_for_circuit_open.return_value = False
+    else:
+        repository.release_for_circuit_open.side_effect = (
+            RetryTimestampExpiredError("stale test timestamp")
+        )
+    breaker = _open_breaker(_FakeMonotonicClock())
+
+    outcome = await _process(
+        processor,
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+        circuit_breaker=breaker,
+        circuit_breaker_busy_retry_seconds=1.0,
+    )
+
+    assert outcome is getattr(processor.ProcessingResult, expected)
+    repository.release_for_circuit_open.assert_awaited_once()
+    assert repository.release_for_circuit_open.await_args.args[4] == attempt_count
+    repository.fail_exhausted_processing.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+    )
+    gridfs.read.assert_not_awaited()
+    repository.record_ms2_attempt.assert_not_awaited()
+    ms2.extract.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("ordinary programming error"),
+        DatabaseUnavailableError("ambiguous circuit release"),
+    ],
+    ids=["value-error", "ambiguous-mongo-error"],
+)
+@pytest.mark.asyncio
+async def test_circuit_release_persistence_errors_propagate_without_compensation(
+    monkeypatch, error
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    repository.release_for_circuit_open.side_effect = error
+    breaker = _open_breaker(_FakeMonotonicClock())
+
+    with pytest.raises(type(error)) as raised:
+        await _process(
+            processor,
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+            circuit_breaker=breaker,
+            circuit_breaker_busy_retry_seconds=1.0,
+        )
+
+    assert raised.value is error
+    repository.release_for_circuit_open.assert_awaited_once()
+    repository.fail_exhausted_processing.assert_not_awaited()
+    repository.record_ms2_attempt.assert_not_awaited()
+    ms2.extract.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("outcome_kind", "expected_state"),
+    [
+        ("success", CircuitBreakerState.CLOSED),
+        ("eligible-failure", CircuitBreakerState.OPEN),
+        ("neutral-failure", CircuitBreakerState.HALF_OPEN),
+    ],
+)
+@pytest.mark.asyncio
+async def test_half_open_ms2_outcome_resolves_breaker_before_document_write(
+    monkeypatch, outcome_kind, expected_state
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        processing_cycle_started_at=now - timedelta(minutes=1)
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.schedule_transient_retry.return_value = True
+    clock = _FakeMonotonicClock()
+    breaker = _open_breaker(clock)
+    clock.value = 30.0
+    if outcome_kind == "eligible-failure":
+        ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+    elif outcome_kind == "neutral-failure":
+        ms2.extract.side_effect = MS2HTTPError(400, "permanent_input", None)
+
+    outcome = await _process(
+        processor,
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+        circuit_breaker=breaker,
+        circuit_breaker_busy_retry_seconds=1.0,
+    )
+
+    assert breaker.state is expected_state
+    ms2.extract.assert_awaited_once()
+    if outcome_kind == "success":
+        assert outcome is processor.ProcessingResult.COMPLETED
+        repository.complete_processing.assert_awaited_once()
+    elif outcome_kind == "eligible-failure":
+        assert outcome is processor.ProcessingResult.RETRY_SCHEDULED
+        repository.schedule_transient_retry.assert_awaited_once()
+    else:
+        assert outcome is processor.ProcessingResult.FAILED_PERMANENT
+        repository.fail_processing.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_classified_ms2_failure_is_recorded_before_retry_persistence(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        processing_cycle_started_at=now - timedelta(minutes=1)
+    )
+    repository, gridfs, ms2 = _dependencies()
+    events = []
+    clock = _FakeMonotonicClock()
+
+    class OrderedCircuitBreaker(CircuitBreaker):
+        def __init__(self, **kwargs):
+            self.record_events = False
+            super().__init__(**kwargs)
+
+        def admit(self):
+            if self.record_events:
+                events.append("admit")
+            return super().admit()
+
+        def record_error(self, permit, category):
+            if self.record_events:
+                events.append("record_error")
+            return super().record_error(permit, category)
+
+    breaker = OrderedCircuitBreaker(monotonic_clock=clock)
+    # Put this real breaker into HALF-OPEN using the same five-failure contract.
+    for _ in range(5):
+        admission = breaker.admit()
+        assert isinstance(admission, Admitted)
+        assert breaker.record_error(
+            admission.permit,
+            _classified_error(MS2HTTPError(503, "transient", None)),
+        )
+    clock.value = 30.0
+    events.clear()
+    breaker.record_events = True
+
+    async def read_pdf(*_args, **_kwargs):
+        events.append("read")
+        return b"%PDF-test"
+
+    async def authorize(*_args):
+        events.append("authorize")
+        return 1
+
+    async def extract(*_args):
+        events.append("http")
+        raise MS2HTTPError(503, "transient", None)
+
+    async def schedule(*_args):
+        events.append("retry_persist")
+        return True
+
+    monkeypatch.setattr(processor, "read_claimed_pdf", read_pdf)
+    repository.record_ms2_attempt.side_effect = authorize
+    repository.schedule_transient_retry.side_effect = schedule
+    ms2.extract.side_effect = extract
+
+    outcome = await _process(
+        processor,
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+        circuit_breaker=breaker,
+        circuit_breaker_busy_retry_seconds=1.0,
+    )
+
+    assert outcome is processor.ProcessingResult.RETRY_SCHEDULED
+    assert events == [
+        "admit",
+        "read",
+        "authorize",
+        "http",
+        "record_error",
+        "retry_persist",
+    ]
+    assert breaker.state is CircuitBreakerState.OPEN
+
+
+@pytest.mark.parametrize("cancel_during", ["authorization", "http"])
+@pytest.mark.asyncio
+async def test_cancellation_releases_half_open_permit_neutrally(
+    monkeypatch, cancel_during
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    clock = _FakeMonotonicClock()
+    breaker = _open_breaker(clock)
+    clock.value = 30.0
+    entered = asyncio.Event()
+
+    async def blocked(*_args):
+        entered.set()
+        await asyncio.Future()
+
+    if cancel_during == "authorization":
+        repository.record_ms2_attempt.side_effect = blocked
+    else:
+        ms2.extract.side_effect = blocked
+
+    task = asyncio.create_task(
+        _process(
+            processor,
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+            circuit_breaker=breaker,
+            circuit_breaker_busy_retry_seconds=1.0,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert breaker.state is CircuitBreakerState.HALF_OPEN
+    assert isinstance(breaker.admit(), Admitted)
+
+
+@pytest.mark.asyncio
+async def test_ownership_loss_during_pdf_read_releases_half_open_permit(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    processor.read_claimed_pdf.side_effect = ProcessingLeaseLostError(
+        "lease lost during PDF read"
+    )
+    clock = _FakeMonotonicClock()
+    breaker = _open_breaker(clock)
+    clock.value = 30.0
+
+    with pytest.raises(ProcessingLeaseLostError):
+        await _process(
+            processor,
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+            circuit_breaker=breaker,
+            circuit_breaker_busy_retry_seconds=1.0,
+        )
+
+    repository.record_ms2_attempt.assert_not_awaited()
+    ms2.extract.assert_not_awaited()
+    assert breaker.state is CircuitBreakerState.HALF_OPEN
+    assert isinstance(breaker.admit(), Admitted)
+
+
+@pytest.mark.asyncio
+async def test_generation_change_during_attempt_authorization_does_not_readmit_or_discard_result(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    authorization_started = asyncio.Event()
+    finish_authorization = asyncio.Event()
+    clock = _FakeMonotonicClock()
+    category = _classified_error(MS2HTTPError(503, "transient", None))
+
+    class TrackingCircuitBreaker(CircuitBreaker):
+        def __init__(self):
+            super().__init__(monotonic_clock=clock)
+            self.admissions = 0
+            self.resolutions = []
+
+        def admit(self):
+            self.admissions += 1
+            return super().admit()
+
+        def record_success(self, permit):
+            result = super().record_success(permit)
+            self.resolutions.append(result)
+            return result
+
+    breaker = TrackingCircuitBreaker()
+
+    async def blocked_authorization(*_args):
+        authorization_started.set()
+        await finish_authorization.wait()
+        return 1
+
+    repository.record_ms2_attempt.side_effect = blocked_authorization
+    task = asyncio.create_task(
+        _process(
+            processor,
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+            circuit_breaker=breaker,
+            circuit_breaker_busy_retry_seconds=1.0,
+        )
+    )
+    try:
+        await asyncio.wait_for(authorization_started.wait(), timeout=1.0)
+        old_generation_permits = [breaker.admit().permit for _ in range(5)]
+        for permit in old_generation_permits:
+            assert breaker.record_error(permit, category)
+        assert breaker.state is CircuitBreakerState.OPEN
+
+        finish_authorization.set()
+        outcome = await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        finish_authorization.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert outcome is processor.ProcessingResult.COMPLETED
+    assert breaker.admissions == 6  # one processor admission plus five test calls
+    assert breaker.resolutions == [False]
+    ms2.extract.assert_awaited_once()
+    repository.complete_processing.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unknown_ms2_exception_releases_half_open_permit_neutrally(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    error = RuntimeError("unclassified upstream failure")
+    ms2.extract.side_effect = error
+    clock = _FakeMonotonicClock()
+    breaker = _open_breaker(clock)
+    clock.value = 30.0
+
+    with pytest.raises(RuntimeError) as raised:
+        await _process(
+            processor,
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+            circuit_breaker=breaker,
+            circuit_breaker_busy_retry_seconds=1.0,
+        )
+
+    assert raised.value is error
+    assert breaker.state is CircuitBreakerState.HALF_OPEN
+    assert isinstance(breaker.admit(), Admitted)
+    repository.complete_processing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_attempt_not_authorized_releases_permit_before_exhaustion_write(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = None
+    repository.fail_exhausted_processing.return_value = True
+    events = []
+
+    class OrderedCircuitBreaker(_RecordingCircuitBreaker):
+        pass
+
+    class OrderedRepository:
+        def __getattr__(self, name):
+            return getattr(repository, name)
+
+        async def record_ms2_attempt(self, *args):
+            events.append(("authorize",))
+            return None
+
+        async def fail_exhausted_processing(self, *args):
+            events.append(("exhausted",))
+            return True
+
+    breaker = OrderedCircuitBreaker(events)
+    outcome = await _process(
+        processor,
+        document,
+        processing_repository=OrderedRepository(),
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+        circuit_breaker=breaker,
+        circuit_breaker_busy_retry_seconds=1.0,
+    )
+
+    assert outcome is processor.ProcessingResult.FAILED_EXHAUSTED
+    assert events == [("admit",), ("authorize",), ("release",), ("exhausted",)]
+    ms2.extract.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("ms2_outcome", "expected_state", "write_method"),
+    [
+        ("success", CircuitBreakerState.CLOSED, "complete_processing"),
+        ("eligible-failure", CircuitBreakerState.OPEN, "schedule_transient_retry"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_document_persistence_failure_does_not_rewrite_ms2_breaker_outcome(
+    monkeypatch, ms2_outcome, expected_state, write_method
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        processing_cycle_started_at=now - timedelta(minutes=1)
+    )
+    repository, gridfs, ms2 = _dependencies()
+    error = DatabaseUnavailableError("ambiguous result write")
+    getattr(repository, write_method).side_effect = error
+    if ms2_outcome == "eligible-failure":
+        ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+
+    clock = _FakeMonotonicClock()
+    breaker = _open_breaker(clock)
+    clock.value = 30.0
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await _process(
+            processor,
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+            circuit_breaker=breaker,
+            circuit_breaker_busy_retry_seconds=1.0,
+        )
+
+    assert raised.value is error
+    assert breaker.state is expected_state
+    getattr(repository, write_method).assert_awaited_once()
+    repository.release_for_circuit_open.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_primary_authorization_exception_is_not_replaced_by_release_exception(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    primary_error = DatabaseUnavailableError("attempt authorization uncertain")
+    cleanup_error = RuntimeError("unexpected local cleanup failure")
+    release_called = False
+    repository.record_ms2_attempt.side_effect = primary_error
+    clock = _FakeMonotonicClock()
+    breaker = _open_breaker(clock)
+    clock.value = 30.0
+
+    def failing_release(permit):
+        nonlocal release_called
+        release_called = True
+        CircuitBreaker.release(breaker, permit)
+        raise cleanup_error
+
+    breaker.release = failing_release
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await _process(
+            processor,
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+            circuit_breaker=breaker,
+            circuit_breaker_busy_retry_seconds=1.0,
+        )
+
+    assert raised.value is primary_error
+    assert release_called
+    ms2.extract.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1383,7 +2114,8 @@ async def test_external_cancellation_during_http_propagates_and_skips_persistenc
         AsyncMock(return_value=b"%PDF-test"),
     )
     task = asyncio.create_task(
-        processor.process_claimed_document(
+        _process(
+            processor,
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,

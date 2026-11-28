@@ -25,6 +25,7 @@ from src.worker.document_processor import (
     ProcessingResult,
     process_claimed_document,
 )
+from src.worker.circuit_breaker import CircuitBreaker
 from src.worker.ms2_client import MS2Client, MS2HTTPError
 from src.worker.worker_lifecycle import WorkerLifecycle
 from src.worker.worker_runner import ProcessingWorker
@@ -636,6 +637,7 @@ async def test_two_real_workers_observe_per_worker_capacity_and_unique_claims(
                 base_url=_MOCK_MS2_BASE_URL,
                 timeout_seconds=2.0,
             ),
+            circuit_breaker=CircuitBreaker(),
             processor=make_observer(worker_index),
             max_concurrency=2,
             poll_initial_seconds=0.01,
@@ -769,6 +771,8 @@ async def test_processor_persists_only_authorized_failure_outcomes(
                 base_url=_MOCK_MS2_BASE_URL,
                 timeout_seconds=2.0,
             ),
+            circuit_breaker=CircuitBreaker(),
+            circuit_breaker_busy_retry_seconds=0.01,
         )
 
         if outcome == "transient":
@@ -927,6 +931,7 @@ async def test_automatic_retry_preserves_cycle_and_worker_processes_other_job(
             first_claim.processing_cycle_started_at
         )
         first_fencing_token = first_claim.fencing_token
+        circuit_breaker = CircuitBreaker()
 
         first_result = await process_claimed_document(
             first_claim,
@@ -937,6 +942,8 @@ async def test_automatic_retry_preserves_cycle_and_worker_processes_other_job(
                 base_url=_MOCK_MS2_BASE_URL,
                 timeout_seconds=2.0,
             ),
+            circuit_breaker=circuit_breaker,
+            circuit_breaker_busy_retry_seconds=0.01,
         )
         assert first_result is ProcessingResult.RETRY_SCHEDULED
         assert len(retry_requests) == 1
@@ -994,6 +1001,7 @@ async def test_automatic_retry_preserves_cycle_and_worker_processes_other_job(
                 base_url=_MOCK_MS2_BASE_URL,
                 timeout_seconds=2.0,
             ),
+            circuit_breaker=CircuitBreaker(),
             processor=observe_processing,
             max_concurrency=1,
             poll_initial_seconds=0.01,
@@ -1038,6 +1046,8 @@ async def test_automatic_retry_preserves_cycle_and_worker_processes_other_job(
                 base_url=_MOCK_MS2_BASE_URL,
                 timeout_seconds=2.0,
             ),
+            circuit_breaker=circuit_breaker,
+            circuit_breaker_busy_retry_seconds=0.01,
         )
         assert second_result is ProcessingResult.COMPLETED
         assert len(requests) == 3
@@ -1090,6 +1100,7 @@ async def test_transient_retries_exhaust_five_attempts_without_sixth_call(
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(transport_handler)
     )
+    circuit_breaker = CircuitBreaker()
     cycle_id = None
     cycle_started_at = None
     previous_fencing_token = None
@@ -1124,6 +1135,8 @@ async def test_transient_retries_exhaust_five_attempts_without_sixth_call(
                     base_url=_MOCK_MS2_BASE_URL,
                     timeout_seconds=2.0,
                 ),
+                circuit_breaker=circuit_breaker,
+                circuit_breaker_busy_retry_seconds=0.01,
             )
             persisted = await context.collection.find_one(
                 {"_id": fixture["document_id"]}
@@ -1180,6 +1193,7 @@ async def test_retry_at_cycle_deadline_is_claimed_then_exhausted_without_http(
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(transport_handler)
     )
+    circuit_breaker = CircuitBreaker()
     try:
         first_claim = await repository.claim_pending("worker-u86-window-first")
         assert first_claim is not None
@@ -1196,6 +1210,8 @@ async def test_retry_at_cycle_deadline_is_claimed_then_exhausted_without_http(
                 base_url=_MOCK_MS2_BASE_URL,
                 timeout_seconds=2.0,
             ),
+            circuit_breaker=circuit_breaker,
+            circuit_breaker_busy_retry_seconds=0.01,
         )
         assert result is ProcessingResult.RETRY_SCHEDULED
         assert len(requests) == 1
@@ -1226,6 +1242,8 @@ async def test_retry_at_cycle_deadline_is_claimed_then_exhausted_without_http(
                 base_url=_MOCK_MS2_BASE_URL,
                 timeout_seconds=2.0,
             ),
+            circuit_breaker=circuit_breaker,
+            circuit_breaker_busy_retry_seconds=0.01,
         )
         assert exhausted is ProcessingResult.FAILED_EXHAUSTED
         assert len(requests) == 1
@@ -1282,6 +1300,8 @@ async def test_technical_ms2_failure_is_persisted_and_alerted_safely(
                     base_url=_MOCK_MS2_BASE_URL,
                     timeout_seconds=2.0,
                 ),
+                circuit_breaker=CircuitBreaker(),
+                circuit_breaker_busy_retry_seconds=0.01,
             )
 
         assert result is ProcessingResult.FAILED_TECHNICAL
@@ -1379,6 +1399,7 @@ async def test_expired_owner_result_is_rejected_after_real_recovery(
         transport=httpx.MockTransport(transport_handler)
     )
     controlled_repository = _HeartbeatGateRepository(repository)
+    circuit_breaker = CircuitBreaker()
     processing_task = asyncio.create_task(
         process_claimed_document(
             old_claim,
@@ -1389,6 +1410,8 @@ async def test_expired_owner_result_is_rejected_after_real_recovery(
                 base_url=_MOCK_MS2_BASE_URL,
                 timeout_seconds=2.0,
             ),
+            circuit_breaker=circuit_breaker,
+            circuit_breaker_busy_retry_seconds=0.01,
         )
     )
 
