@@ -2225,6 +2225,77 @@ async def test_retry_operations_reject_invalid_retry_instants_before_mongodb(
 
 
 @pytest.mark.parametrize(
+    "operation",
+    ["schedule_transient_retry", "release_for_circuit_open"],
+)
+@pytest.mark.parametrize(
+    "next_retry_at",
+    [
+        NOW,
+        NOW - timedelta(milliseconds=1),
+        NOW + timedelta(microseconds=999),
+    ],
+    ids=["equal-now", "past", "rounds-down-to-now"],
+)
+@pytest.mark.asyncio
+async def test_retry_operations_raise_specific_error_for_expired_valid_timestamp(
+    repo_with_mocks, fixed_clock, operation, next_retry_at
+):
+    repo = repo_with_mocks
+    arguments = list(
+        _retry_arguments()
+        if operation == "schedule_transient_retry"
+        else _open_retry_arguments()
+    )
+    arguments[-1] = next_retry_at
+
+    with pytest.raises(ValueError) as raised:
+        await getattr(repo, operation)(*arguments)
+
+    expired_error = getattr(
+        processing_repository, "RetryTimestampExpiredError", None
+    )
+    assert expired_error is not None
+    assert issubclass(expired_error, ValueError)
+    assert isinstance(raised.value, expired_error)
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("operation", "next_retry_at"),
+    [
+        ("schedule_transient_retry", "not-a-datetime"),
+        ("schedule_transient_retry", NOW.replace(tzinfo=None)),
+        ("schedule_transient_retry", NOW.replace(tzinfo=_NoEffectiveOffset())),
+        ("release_for_circuit_open", "not-a-datetime"),
+        ("release_for_circuit_open", NOW.replace(tzinfo=None)),
+        ("release_for_circuit_open", NOW.replace(tzinfo=_NoEffectiveOffset())),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_retry_timestamp_is_not_expiry_specific_error(
+    repo_with_mocks, fixed_clock, operation, next_retry_at
+):
+    repo = repo_with_mocks
+    arguments = list(
+        _retry_arguments()
+        if operation == "schedule_transient_retry"
+        else _open_retry_arguments()
+    )
+    arguments[-1] = next_retry_at
+
+    with pytest.raises(ValueError) as raised:
+        await getattr(repo, operation)(*arguments)
+
+    expired_error = getattr(
+        processing_repository, "RetryTimestampExpiredError", None
+    )
+    if expired_error is not None:
+        assert not isinstance(raised.value, expired_error)
+    repo.collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
     ("operation", "argument_index", "invalid_value"),
     [
         (operation, argument_index, invalid_value)

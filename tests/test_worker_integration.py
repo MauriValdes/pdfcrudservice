@@ -673,6 +673,7 @@ async def test_two_real_workers_observe_per_worker_capacity_and_unique_claims(
 async def test_processor_persists_only_authorized_failure_outcomes(
     worker_integration_context,
     outcome,
+    monkeypatch,
 ):
     context = worker_integration_context
     fields = None
@@ -728,12 +729,28 @@ async def test_processor_persists_only_authorized_failure_outcomes(
         )
 
         if outcome == "transient":
-            with pytest.raises(MS2HTTPError) as raised:
-                await asyncio.wait_for(
-                    processor, timeout=_FIXTURE_TIMEOUT_SECONDS
-                )
-            assert raised.value.status_code == 503
-            assert raised.value.classification == "transient"
+            from src.worker import document_processor as processor_module
+
+            planned_at = datetime.now(timezone.utc)
+            real_plan_retry = processor_module.plan_retry
+
+            def deterministic_plan_retry(*args, **kwargs):
+                kwargs.setdefault("uniform", lambda lower, _upper: lower)
+                return real_plan_retry(*args, **kwargs)
+
+            monkeypatch.setattr(
+                processor_module,
+                "_utc_now",
+                lambda: planned_at,
+            )
+            monkeypatch.setattr(
+                processor_module,
+                "plan_retry",
+                deterministic_plan_retry,
+            )
+            result = await asyncio.wait_for(
+                processor, timeout=_FIXTURE_TIMEOUT_SECONDS
+            )
         else:
             result = await asyncio.wait_for(
                 processor, timeout=_FIXTURE_TIMEOUT_SECONDS
@@ -768,20 +785,39 @@ async def test_processor_persists_only_authorized_failure_outcomes(
             assert "content" not in persisted
             assert "page_count" not in persisted
         else:
+            assert result is ProcessingResult.RETRY_SCHEDULED
             assert len(requests) == 1
-            assert persisted["status"] == "processing"
+            assert persisted["status"] == "pending"
             assert persisted["attempt_count"] == 1
-            assert persisted["worker_id"] == claimed.worker_id
-            assert persisted["fencing_token"] == claimed.fencing_token
+            assert persisted["last_error"] == "ms2_http_503"
+            next_retry_at = persisted["next_retry_at"]
+            if next_retry_at.tzinfo is None:
+                next_retry_at = next_retry_at.replace(tzinfo=timezone.utc)
+            assert next_retry_at > planned_at
+            cycle_started_at = claimed.processing_cycle_started_at
+            if cycle_started_at.tzinfo is None:
+                cycle_started_at = cycle_started_at.replace(tzinfo=timezone.utc)
+            assert next_retry_at <= cycle_started_at + timedelta(minutes=10)
             assert persisted["processing_cycle_id"] == claimed.processing_cycle_id
+            assert (
+                persisted["processing_cycle_started_at"]
+                == claimed.processing_cycle_started_at
+            )
+            for field in (
+                "worker_id",
+                "fencing_token",
+                "lease_until",
+                "heartbeat_at",
+            ):
+                assert persisted.get(field) is None
+            assert persisted["file_id"] == fixture["file_id"]
+            assert await context.gridfs.read(fixture["file_id"]) == fixture["pdf_bytes"]
             for field in (
                 "content",
                 "page_count",
                 "completed_at",
                 "failed_at",
                 "error_message",
-                "last_error",
-                "next_retry_at",
             ):
                 assert persisted.get(field) is None
     finally:

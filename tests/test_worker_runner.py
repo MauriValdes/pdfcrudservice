@@ -481,25 +481,53 @@ async def test_all_processing_outcomes_are_logged_without_extra_writes(caplog):
     caplog.set_level(logging.INFO, logger=module.logger.name)
     processor_module = importlib.import_module("src.worker.document_processor")
     outcomes = list(processor_module.ProcessingResult)
-    repository = _Repository(recovered=[_document(str(i)) for i in range(5)])
+    documents = [_document(str(i)) for i in range(len(outcomes))]
+    repository = _Repository(recovered=documents)
     completed = asyncio.Event()
     returned = []
 
     async def processor(document, **_dependencies):
         returned.append(document.id)
-        if len(returned) == 5:
+        if len(returned) == len(outcomes):
             completed.set()
         return outcomes[int(document.id)]
 
-    worker = _make_worker(module, repository, processor, max_concurrency=5)
+    worker = _make_worker(
+        module,
+        repository,
+        processor,
+        max_concurrency=len(outcomes),
+    )
     run_task = asyncio.create_task(worker.run())
     try:
         await _wait(completed)
         worker.request_stop()
         await asyncio.wait_for(run_task, timeout=1)
-        assert len(returned) == 5
+        assert len(returned) == len(outcomes)
+        assert set(returned) == {str(i) for i in range(len(outcomes))}
         assert all(kind in {"recover", "claim"} for kind, _ in repository.calls)
         assert all(outcome.value in caplog.text for outcome in outcomes)
+        outcome_records = [
+            record
+            for record in caplog.records
+            if record.getMessage().startswith("Processing outcome for document ")
+        ]
+        assert len(outcome_records) == len(outcomes)
+        for outcome in outcomes:
+            matching_records = [
+                record
+                for record in outcome_records
+                if record.getMessage().endswith(f": {outcome.value}")
+            ]
+            assert len(matching_records) == 1
+            expected_level = (
+                logging.INFO
+                if outcome is processor_module.ProcessingResult.COMPLETED
+                else logging.WARNING
+            )
+            assert matching_records[0].levelno == expected_level
+        assert "private upstream detail" not in caplog.text
+        assert "secret" not in caplog.text
     finally:
         worker.request_stop()
         if not run_task.done():

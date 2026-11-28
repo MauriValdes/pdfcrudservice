@@ -26,6 +26,10 @@ _UNAVAILABLE_ERRORS = (
 _DATETIME_TYPE = datetime
 
 
+class RetryTimestampExpiredError(ValueError):
+    """A valid retry instant is no longer future at BSON precision."""
+
+
 class CleanupConfirmation(Enum):
     CONFIRMED = "confirmed"
     ALREADY_CONFIRMED = "already_confirmed"
@@ -216,7 +220,9 @@ def _validated_retry_arguments(
         microsecond=(captured_now.microsecond // 1000) * 1000
     )
     if normalized_retry_at <= now:
-        raise ValueError("La fecha del próximo intento debe ser futura")
+        raise RetryTimestampExpiredError(
+            "La fecha del próximo intento debe ser futura"
+        )
 
     return ObjectId(document_id), now, normalized_retry_at
 

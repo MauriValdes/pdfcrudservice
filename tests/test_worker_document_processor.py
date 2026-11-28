@@ -1,7 +1,8 @@
 """RED tests for basic processing of one already-claimed document."""
 
 import asyncio
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -17,6 +18,7 @@ from src.worker.ms2_client import (
     MS2HTTPError,
     MS2InvalidResponseError,
     MS2TransportError,
+    TransportKind,
 )
 
 
@@ -83,6 +85,28 @@ def _run_inline(monkeypatch, processor_module):
         processor_module,
         "read_claimed_pdf",
         AsyncMock(return_value=b"%PDF-test"),
+    )
+
+
+def _freeze_retry_clock(monkeypatch, processor_module, now):
+    from src.worker.retry_policy import plan_retry as real_plan_retry
+
+    monkeypatch.setattr(
+        processor_module,
+        "_utc_now",
+        lambda: now,
+        raising=False,
+    )
+
+    def deterministic_plan_retry(*args, **kwargs):
+        kwargs.setdefault("uniform", lambda lower, _upper: lower)
+        return real_plan_retry(*args, **kwargs)
+
+    monkeypatch.setattr(
+        processor_module,
+        "plan_retry",
+        deterministic_plan_retry,
+        raising=False,
     )
 
 
@@ -469,22 +493,13 @@ async def test_snapshot_attempt_count_never_replaces_atomic_authorization(
     assert repository.complete_processing.await_args.args[4] == 2
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        MS2TransportError("timeout"),
-        MS2InvalidResponseError("invalid response"),
-    ],
-    ids=["transport-error", "invalid-success-response"],
-)
 @pytest.mark.asyncio
-async def test_transport_and_invalid_response_errors_propagate_without_terminal_persistence(
-    monkeypatch, error
-):
+async def test_unclassified_ms2_error_propagates_unchanged(monkeypatch):
     processor = _load_processor()
     _run_inline(monkeypatch, processor)
     document = _document()
     repository, gridfs, ms2 = _dependencies()
+    error = MS2TransportError("transport kind is unavailable")
     ms2.extract.side_effect = error
 
     with pytest.raises(type(error)) as raised:
@@ -501,6 +516,347 @@ async def test_transport_and_invalid_response_errors_propagate_without_terminal_
     repository.complete_processing.assert_not_awaited()
     repository.fail_processing.assert_not_awaited()
     repository.schedule_transient_retry.assert_not_awaited()
+    repository.fail_exhausted_processing.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("error", "failure_code", "retry_after_seconds"),
+    [
+        (
+            MS2HTTPError(503, "transient", "10"),
+            "ms2_http_503",
+            10,
+        ),
+        (
+            MS2InvalidResponseError("private invalid response"),
+            "ms2_invalid_response",
+            0,
+        ),
+        (
+            MS2TransportError(
+                "private transport detail",
+                transport_kind=TransportKind.TIMEOUT,
+            ),
+            "ms2_timeout",
+            0,
+        ),
+    ],
+    ids=["retry-after", "invalid-response", "typed-timeout"],
+)
+@pytest.mark.asyncio
+async def test_classified_transient_errors_schedule_once_with_authorized_attempt(
+    monkeypatch,
+    caplog,
+    error,
+    failure_code,
+    retry_after_seconds,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        attempt_count=1,
+        processing_cycle_started_at=now - timedelta(minutes=1),
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 4
+    repository.schedule_transient_retry.return_value = True
+    ms2.extract.side_effect = error
+
+    with caplog.at_level(logging.ERROR, logger=processor.__name__):
+        outcome = await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert outcome is processor.ProcessingResult.RETRY_SCHEDULED
+    assert ms2.extract.await_count == 1
+    repository.schedule_transient_retry.assert_awaited_once()
+    args = repository.schedule_transient_retry.await_args.args
+    assert args[:5] == (
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+        4,
+    )
+    assert args[5] == failure_code
+    assert args[6] == now + timedelta(seconds=max(8, retry_after_seconds))
+    repository.fail_exhausted_processing.assert_not_awaited()
+    repository.fail_processing.assert_not_awaited()
+    repository.complete_processing.assert_not_awaited()
+    assert "event_id=worker.ms2.technical_failure" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("exhaustion_confirmed", "expected"),
+    [
+        (True, "FAILED_EXHAUSTED"),
+        (False, "RESULT_NOT_CONFIRMED"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rejected_retry_confirms_exhaustion_once(
+    monkeypatch, exhaustion_confirmed, expected
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        processing_cycle_started_at=now - timedelta(minutes=1)
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 3
+    repository.schedule_transient_retry.return_value = False
+    repository.fail_exhausted_processing.return_value = exhaustion_confirmed
+    ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+
+    outcome = await processor.process_claimed_document(
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+    )
+
+    assert outcome is getattr(processor.ProcessingResult, expected)
+    assert ms2.extract.await_count == 1
+    repository.schedule_transient_retry.assert_awaited_once()
+    assert repository.schedule_transient_retry.await_args.args[6] > now
+    repository.fail_exhausted_processing.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+    )
+    repository.fail_processing.assert_not_awaited()
+    repository.complete_processing.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("exhaustion_confirmed", "expected"),
+    [
+        (True, "FAILED_EXHAUSTED"),
+        (False, "RESULT_NOT_CONFIRMED"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_expired_retry_timestamp_confirms_exhaustion_once(
+    monkeypatch, exhaustion_confirmed, expected
+):
+    from src.repository.processing_repository import RetryTimestampExpiredError
+
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        processing_cycle_started_at=now - timedelta(minutes=1)
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 2
+    repository.schedule_transient_retry.side_effect = (
+        RetryTimestampExpiredError("test-only stale schedule")
+    )
+    repository.fail_exhausted_processing.return_value = exhaustion_confirmed
+    ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+
+    outcome = await processor.process_claimed_document(
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+    )
+
+    assert outcome is getattr(processor.ProcessingResult, expected)
+    assert ms2.extract.await_count == 1
+    repository.schedule_transient_retry.assert_awaited_once()
+    assert repository.schedule_transient_retry.await_args.args[6] > now
+    repository.fail_exhausted_processing.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+    )
+    repository.complete_processing.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("attempt_number", "cycle_age", "exhaustion_confirmed", "expected"),
+    [
+        (5, timedelta(minutes=1), True, "FAILED_EXHAUSTED"),
+        (5, timedelta(minutes=1), False, "RESULT_NOT_CONFIRMED"),
+        (3, timedelta(minutes=11), True, "FAILED_EXHAUSTED"),
+        (3, timedelta(minutes=11), False, "RESULT_NOT_CONFIRMED"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_retry_policy_exhaustion_requires_confirmed_terminal_write(
+    monkeypatch, attempt_number, cycle_age, exhaustion_confirmed, expected
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        attempt_count=attempt_number - 1,
+        processing_cycle_started_at=now - cycle_age,
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = attempt_number
+    repository.fail_exhausted_processing.return_value = exhaustion_confirmed
+    ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+
+    outcome = await processor.process_claimed_document(
+        document,
+        processing_repository=repository,
+        gridfs_repository=gridfs,
+        ms2_client=ms2,
+    )
+
+    assert outcome is getattr(processor.ProcessingResult, expected)
+    assert ms2.extract.await_count == 1
+    repository.fail_exhausted_processing.assert_awaited_once_with(
+        document.id,
+        document.worker_id,
+        document.fencing_token,
+        document.processing_cycle_id,
+    )
+    repository.schedule_transient_retry.assert_not_awaited()
+    repository.fail_processing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_confirmation_exception_propagates_without_retry(
+    monkeypatch,
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        processing_cycle_started_at=now - timedelta(minutes=1)
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 2
+    repository.schedule_transient_retry.return_value = False
+    error = DatabaseUnavailableError("exhaustion result is ambiguous")
+    repository.fail_exhausted_processing.side_effect = error
+    ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+
+    with pytest.raises(DatabaseUnavailableError) as raised:
+        await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert raised.value is error
+    ms2.extract.assert_awaited_once()
+    repository.schedule_transient_retry.assert_awaited_once()
+    repository.fail_exhausted_processing.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("programming error, not timestamp expiry"),
+        DatabaseUnavailableError("write acknowledgement is ambiguous"),
+    ],
+    ids=["ordinary-value-error", "ambiguous-persistence-error"],
+)
+@pytest.mark.asyncio
+async def test_retry_write_error_propagates_without_exhaustion_or_repetition(
+    monkeypatch, error
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        processing_cycle_started_at=now - timedelta(minutes=1)
+    )
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 2
+    repository.schedule_transient_retry.side_effect = error
+    ms2.extract.side_effect = MS2HTTPError(503, "transient", None)
+
+    with pytest.raises(type(error)) as raised:
+        await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert raised.value is error
+    assert ms2.extract.await_count == 1
+    repository.schedule_transient_retry.assert_awaited_once()
+    repository.fail_exhausted_processing.assert_not_awaited()
+    repository.fail_processing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_ms2_exception_propagates_without_policy_writes(monkeypatch):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document()
+    repository, gridfs, ms2 = _dependencies()
+    error = RuntimeError("unknown extraction failure")
+    ms2.extract.side_effect = error
+
+    with pytest.raises(RuntimeError) as raised:
+        await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert raised.value is error
+    ms2.extract.assert_awaited_once()
+    repository.fail_processing.assert_not_awaited()
+    repository.schedule_transient_retry.assert_not_awaited()
+    repository.fail_exhausted_processing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_technical_alert_is_emitted_even_when_failure_write_is_rejected(
+    monkeypatch, caplog
+):
+    processor = _load_processor()
+    _run_inline(monkeypatch, processor)
+    document = _document(filename="secret-document-name.pdf")
+    repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 3
+    repository.fail_processing.return_value = False
+    ms2.extract.side_effect = MS2HTTPError(
+        401,
+        "unclassified",
+        None,
+    )
+
+    with caplog.at_level(logging.ERROR, logger=processor.__name__):
+        outcome = await processor.process_claimed_document(
+            document,
+            processing_repository=repository,
+            gridfs_repository=gridfs,
+            ms2_client=ms2,
+        )
+
+    assert outcome is processor.ProcessingResult.RESULT_NOT_CONFIRMED
+    assert "event_id=worker.ms2.technical_failure" in caplog.text
+    assert f"document_id={document.id}" in caplog.text
+    assert "error_code=ms2_http_401" in caplog.text
+    assert "http_status=401" in caplog.text
+    assert "secret-document-name.pdf" not in caplog.text
+    assert "MS2 returned HTTP" not in caplog.text
+    repository.fail_processing.assert_awaited_once()
+    repository.fail_exhausted_processing.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -657,44 +1013,121 @@ async def test_exhaustion_write_exception_propagates_without_http(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "error",
+    ("error", "action", "failure_code", "alert_status"),
     [
-        MS2HTTPError(503, "transient", "3"),
-        MS2HTTPError(404, "unclassified", None),
-        MS2HTTPError(400, "unclassified", None),
-        MS2HTTPError(404, "permanent_input", None),
+        (MS2HTTPError(503, "transient", "3"), "RETRY", "ms2_http_503", None),
+        (
+            MS2HTTPError(404, "unclassified", "private body"),
+            "FAIL_TECHNICAL",
+            "ms2_http_404",
+            404,
+        ),
+        (
+            MS2HTTPError(401, "unclassified", None),
+            "FAIL_TECHNICAL",
+            "ms2_http_401",
+            401,
+        ),
+        (
+            MS2HTTPError(403, "unclassified", None),
+            "FAIL_TECHNICAL",
+            "ms2_http_403",
+            403,
+        ),
+        (
+            MS2HTTPError(418, "unclassified", None),
+            "FAIL_TECHNICAL",
+            "ms2_http_unclassified",
+            418,
+        ),
+        (
+            MS2HTTPError(400, "unclassified", None),
+            "FAIL_INPUT",
+            "ms2_invalid_input",
+            None,
+        ),
+        (
+            MS2HTTPError(404, "permanent_input", None),
+            "FAIL_TECHNICAL",
+            "ms2_http_404",
+            404,
+        ),
     ],
     ids=[
-        "transient-http",
-        "unclassified-http",
-        "known-status-wrong-classification",
-        "permanent-classification-unmapped-status",
+        "retryable-http",
+        "technical-http",
+        "technical-401",
+        "technical-403",
+        "technical-unclassified",
+        "input-status-wrong-classification",
+        "technical-status-wrong-classification",
     ],
 )
 @pytest.mark.asyncio
-async def test_nonpermanent_or_mismatched_http_errors_propagate_unchanged(
-    monkeypatch, error
+async def test_http_errors_follow_real_classifier_action(
+    monkeypatch, caplog, error, action, failure_code, alert_status
 ):
     processor = _load_processor()
     _run_inline(monkeypatch, processor)
-    document = _document()
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    _freeze_retry_clock(monkeypatch, processor, now)
+    document = _document(
+        filename="private-filename.pdf",
+        attempt_count=1,
+        processing_cycle_started_at=now - timedelta(minutes=1),
+    )
     repository, gridfs, ms2 = _dependencies()
+    repository.record_ms2_attempt.return_value = 3
+    repository.fail_processing.return_value = True
+    repository.schedule_transient_retry.return_value = True
     ms2.extract.side_effect = error
 
-    with pytest.raises(MS2HTTPError) as raised:
-        await processor.process_claimed_document(
+    with caplog.at_level(logging.ERROR, logger=processor.__name__):
+        outcome = await processor.process_claimed_document(
             document,
             processing_repository=repository,
             gridfs_repository=gridfs,
             ms2_client=ms2,
         )
 
-    assert raised.value is error
+    expected_result = {
+        "RETRY": processor.ProcessingResult.RETRY_SCHEDULED,
+        "FAIL_INPUT": processor.ProcessingResult.FAILED_PERMANENT,
+        "FAIL_TECHNICAL": processor.ProcessingResult.FAILED_TECHNICAL,
+    }[action]
+    assert outcome is expected_result
     ms2.extract.assert_awaited_once()
-    repository.fail_processing.assert_not_awaited()
-    repository.fail_exhausted_processing.assert_not_awaited()
+    if action == "RETRY":
+        repository.schedule_transient_retry.assert_awaited_once()
+        assert repository.schedule_transient_retry.await_args.args[4:6] == (
+            3,
+            failure_code,
+        )
+        repository.fail_processing.assert_not_awaited()
+        repository.fail_exhausted_processing.assert_not_awaited()
+    else:
+        repository.fail_processing.assert_awaited_once()
+        assert repository.fail_processing.await_args.args[4:] == (
+            3,
+            failure_code,
+        )
+        repository.schedule_transient_retry.assert_not_awaited()
+        repository.fail_exhausted_processing.assert_not_awaited()
+
+    event = "event_id=worker.ms2.technical_failure"
+    if action == "FAIL_TECHNICAL":
+        assert event in caplog.text
+        assert f"document_id={document.id}" in caplog.text
+        assert f"error_code={failure_code}" in caplog.text
+        assert f"http_status={alert_status}" in caplog.text
+        assert error.__class__.__name__ not in caplog.text
+        assert "private body" not in caplog.text
+        assert "private-filename.pdf" not in caplog.text
+    else:
+        assert event not in caplog.text
+
     repository.complete_processing.assert_not_awaited()
-    repository.schedule_transient_retry.assert_not_awaited()
+    assert ms2.extract.await_count == 1
 
 
 @pytest.mark.asyncio

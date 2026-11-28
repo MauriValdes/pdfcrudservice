@@ -1,22 +1,36 @@
 """Basic orchestration for processing one already-claimed document."""
 
+import logging
+from datetime import datetime, timezone
 from enum import Enum
 
 from bson import ObjectId
 
 from src.models.document import DocumentModel
 from src.repository.gridfs_repository import GridFSRepository
-from src.repository.processing_repository import ProcessingRepository
+from src.repository.processing_repository import (
+    ProcessingRepository,
+    RetryTimestampExpiredError,
+)
+from src.worker.error_classifier import DocumentAction, classify_ms2_error
 from src.worker.heartbeat import run_with_heartbeat
-from src.worker.ms2_client import MS2Client, MS2HTTPError
+from src.worker.ms2_client import (
+    MS2Client,
+    MS2HTTPError,
+    MS2InvalidResponseError,
+    MS2TransportError,
+)
 from src.worker.pdf_reader import read_claimed_pdf
+from src.worker.retry_policy import RetryExhausted, RetryScheduled, plan_retry
 
 
-_PERMANENT_FAILURE_CODES = {
-    400: "ms2_invalid_input",
-    413: "pdf_too_large",
-    422: "pdf_unprocessable",
-}
+_logger = logging.getLogger(__name__)
+_MS2_ERRORS = (MS2HTTPError, MS2TransportError, MS2InvalidResponseError)
+
+
+def _utc_now() -> datetime:
+    """Return the current timezone-aware UTC instant."""
+    return datetime.now(timezone.utc)
 
 
 class ProcessingResult(Enum):
@@ -27,6 +41,8 @@ class ProcessingResult(Enum):
     RESULT_NOT_CONFIRMED = "result_not_confirmed"
     FAILED_PERMANENT = "failed_permanent"
     FAILED_EXHAUSTED = "failed_exhausted"
+    RETRY_SCHEDULED = "retry_scheduled"
+    FAILED_TECHNICAL = "failed_technical"
 
 
 async def process_claimed_document(
@@ -106,28 +122,97 @@ async def process_claimed_document(
                 pdf_bytes,
                 filename,
             )
-        except MS2HTTPError as error:
-            failure_code = _PERMANENT_FAILURE_CODES.get(error.status_code)
-
-            if (
-                error.classification != "permanent_input"
-                or failure_code is None
-            ):
+        except _MS2_ERRORS as error:
+            category = classify_ms2_error(error)
+            if category is None:
                 raise
 
-            confirmed = await processing_repository.fail_processing(
-                document_id,
-                worker_id,
-                fencing_token,
-                processing_cycle_id,
-                attempt_number,
-                failure_code,
-            )
+            if category.alert_required:
+                fields = (
+                    f"event_id=worker.ms2.technical_failure "
+                    f"document_id={document_id} error_code={category.code}"
+                )
+                if category.http_status is not None:
+                    fields += f" http_status={category.http_status}"
+                _logger.error(fields)
 
-            if confirmed:
-                return ProcessingResult.FAILED_PERMANENT
+            if category.document_action in (
+                DocumentAction.FAIL_INPUT,
+                DocumentAction.FAIL_TECHNICAL,
+            ):
+                confirmed = await processing_repository.fail_processing(
+                    document_id,
+                    worker_id,
+                    fencing_token,
+                    processing_cycle_id,
+                    attempt_number,
+                    category.code,
+                )
+                if not confirmed:
+                    return ProcessingResult.RESULT_NOT_CONFIRMED
+                if category.document_action is DocumentAction.FAIL_INPUT:
+                    return ProcessingResult.FAILED_PERMANENT
+                return ProcessingResult.FAILED_TECHNICAL
 
-            return ProcessingResult.RESULT_NOT_CONFIRMED
+            if category.document_action is DocumentAction.RETRY:
+                now = _utc_now()
+                retry_plan = plan_retry(
+                    attempt_count=attempt_number,
+                    cycle_started_at=snapshot.processing_cycle_started_at,
+                    now=now,
+                    retry_after=(
+                        error.retry_after
+                        if isinstance(error, MS2HTTPError)
+                        else None
+                    ),
+                )
+                if isinstance(retry_plan, RetryExhausted):
+                    confirmed = await processing_repository.fail_exhausted_processing(
+                        document_id,
+                        worker_id,
+                        fencing_token,
+                        processing_cycle_id,
+                    )
+                    return (
+                        ProcessingResult.FAILED_EXHAUSTED
+                        if confirmed
+                        else ProcessingResult.RESULT_NOT_CONFIRMED
+                    )
+
+                if isinstance(retry_plan, RetryScheduled):
+                    try:
+                        scheduled = (
+                            await processing_repository.schedule_transient_retry(
+                                document_id,
+                                worker_id,
+                                fencing_token,
+                                processing_cycle_id,
+                                attempt_number,
+                                category.code,
+                                retry_plan.next_retry_at,
+                            )
+                        )
+                    except RetryTimestampExpiredError:
+                        scheduled = False
+
+                    if scheduled:
+                        return ProcessingResult.RETRY_SCHEDULED
+
+                    confirmed = await processing_repository.fail_exhausted_processing(
+                        document_id,
+                        worker_id,
+                        fencing_token,
+                        processing_cycle_id,
+                    )
+                    return (
+                        ProcessingResult.FAILED_EXHAUSTED
+                        if confirmed
+                        else ProcessingResult.RESULT_NOT_CONFIRMED
+                    )
+
+                raise TypeError("plan_retry returned an unsupported result")
+
+            raise TypeError("MS2 classifier returned an unsupported action")
 
         confirmed = await processing_repository.complete_processing(
             document_id,
