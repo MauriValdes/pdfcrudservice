@@ -1,17 +1,28 @@
 import logging
-from datetime import datetime
 from typing import List
 
-import httpx
 from bson import ObjectId
-from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
-from src.schemas.document import DocumentCreate, DocumentUpdate, DocumentResponse
-from src.models.document import DocumentStatus
-from src.config.config import settings
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+
+from src.api.pdf_validation import PdfValidationExecutor, validate_pdf_upload
+from src.schemas.document import DocumentReceipt, DocumentUpdate, DocumentResponse
 from src.core.exceptions import AppError, DatabaseUnavailableError
 from src.database.mongodb import db_connection
 from src.repository.document_repository import DocumentRepository, InvalidObjectIdError
-from src.services.document_service import DocumentService
+from src.services.document_service import (
+    DocumentService,
+    UploadFinalizationRejectedError,
+    UploadLeaseLostError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,119 +45,126 @@ def get_document_service() -> DocumentService:
     )
 
 
-# 1. CREATE: Subir y registrar el procesamiento de un PDF
+# 1. CREATE: Recibir y almacenar un PDF para procesamiento asíncrono
 @router.post(
     "/",
-    status_code=status.HTTP_201_CREATED,
-    response_model=DocumentResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=DocumentReceipt,
+    responses={
+        status.HTTP_200_OK: {
+            "model": DocumentReceipt,
+            "description": "Checksum duplicado; se devuelve el documento existente.",
+            "headers": {
+                "Location": {
+                    "description": "URL relativa del estado del documento.",
+                    "schema": {"type": "string"},
+                }
+            },
+        },
+        status.HTTP_202_ACCEPTED: {
+            "description": "PDF persistido y carga finalizada de forma durable.",
+            "headers": {
+                "Location": {
+                    "description": "URL relativa del estado del documento.",
+                    "schema": {"type": "string"},
+                }
+            },
+        },
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "MIME inválido o archivo vacío.",
+        },
+        status.HTTP_413_CONTENT_TOO_LARGE: {
+            "description": "El archivo supera el tamaño máximo permitido.",
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "description": "El contenido no es un PDF válido.",
+        },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "Error inesperado durante la recepción.",
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "description": "No se pudo confirmar la recepción durable.",
+        },
+    },
 )
 async def upload_pdf(
+    request: Request,
+    response: Response,
     file: UploadFile = File(...),
     service: DocumentService = Depends(get_document_service),
-):
-    """Registra un PDF nuevo y procesa su extracción de texto de forma síncrona.
-
-    Flujo completo:
-    1. Validación del archivo.
-    2. Registro en MongoDB con estado PENDING.
-    3. Comunicación HTTP con MS2 para extraer texto y página count.
-    4. Actualización del documento a COMPLETED o FAILED.
-    5. Devolución al cliente del documento con estado final.
-
-    El cliente recibe siempre el resultado final (COMPLETED o FAILED),
-    nunca PENDING.
-    """
-    if file.content_type != "application/pdf":
+) -> DocumentReceipt:
+    """Valida y almacena el PDF; la extracción se procesa posteriormente."""
+    executor = getattr(request.app.state, "pdf_validation_executor", None)
+    if not isinstance(executor, PdfValidationExecutor) or executor.closed:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El archivo debe ser un PDF"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Servicio temporalmente no disponible",
         )
-
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El archivo está vacío"
-        )
-
-    # Rechazamos temprano archivos que superen el límite permitido
-    max_bytes = settings.max_file_size_mb * 1024 * 1024
-    if len(file_bytes) > max_bytes:
-        raise HTTPException(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail=f"El archivo supera el tamaño máximo de {settings.max_file_size_mb} MB"
-        )
-
-    # Identificador del documento registrado; None si el registro falla
-    # (por ejemplo, cuando submit_pdf detecta un documento duplicado).
-    document_id: str | None = None
 
     try:
-        # Paso 1: Guardar metadatos del PDF en la base de datos (estado PENDING)
-        task = await service.submit_pdf(file_bytes=file_bytes, filename=file.filename)
-        document_id = task.id
-
-        # Paso 2: Orquestar extracción con MS2 (síncrono)
-        await service.process_pdf_extraction(
-            document_id=task.id,
-            pdf_bytes=file_bytes,
-            filename=file.filename,
-        )
-
-        # Paso 3: Recuperar el documento actualizado desde MongoDB
-        # (submit_pdf retorna PENDING, process_pdf_extraction actualiza a COMPLETED/FAILED)
-        updated_doc = await service.get_document_by_id(task.id)
-
-        if not updated_doc:
-            # Esto debería suceder solo en condiciones extremas (competencia de carrera en BD)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="No se pudo recuperar el documento después del procesamiento"
-            )
-
-        return updated_doc
-
+        file_bytes = await validate_pdf_upload(file, executor=executor)
     except HTTPException:
         raise
     except AppError:
-        # Indisponibilidad de MongoDB y demás errores de dominio:
-        # el manejador central preserva el código HTTP (ej. 503).
         raise
-    except ValueError as e:
-        # Errores de negocio o de validación de respuesta MS2.
-        # Incluye el documento duplicado: el servicio convierte
-        # DuplicateKeyError en ValueError("El documento ya existe").
-        # Si ya se actualizó a FAILED en process_pdf_extraction, retornamos ese estado
-        try:
-            failed_doc = await service.get_document_by_id(document_id) if document_id else None
-            if failed_doc and failed_doc.status == "failed":
-                return failed_doc
-        except AppError:
-            # MongoDB no disponible durante la recuperación del estado: 503
-            raise
-        except Exception:
-            pass
-        # Si no hay documento FAILED, lanzamos el error HTTP
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    except Exception as e:
-        logger.error(f"Error inesperado durante el procesamiento síncrono: {e}", exc_info=True)
-        # Si falla la persistencia final, intentamos retornar el estado actual del documento
-        try:
-            failed_doc = await service.get_document_by_id(document_id) if document_id else None
-            if failed_doc and failed_doc.status == "failed":
-                return failed_doc
-        except AppError:
-            # MongoDB no disponible durante la recuperación del estado: 503
-            raise
-        except Exception:
-            pass
+    except RuntimeError as e:
+        if (
+            executor.closed
+            and str(e) == "PDF validation executor is shutting down"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Servicio temporalmente no disponible",
+            ) from None
+        logger.exception("Error inesperado al validar el PDF")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Ocurrió un error inesperado durante el procesamiento"
+            detail="Ocurrió un error inesperado durante la recepción del documento",
+        ) from None
+    except Exception:
+        logger.exception("Error inesperado al validar el PDF")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Ocurrió un error inesperado durante la recepción del documento",
+        ) from None
+
+    try:
+        document, classification = await service.receive_pdf(
+            file_bytes=file_bytes,
+            filename=file.filename,
         )
+        if classification not in ("accepted", "existing"):
+            raise ValueError("Clasificación de recepción desconocida.")
+
+        status_url = f"/documents/{document.id}"
+        receipt = DocumentReceipt(
+            document_id=document.id,
+            status=document.status,
+            created_at=document.created_at,
+            status_url=status_url,
+        )
+        response.headers["Location"] = status_url
+        response.status_code = (
+            status.HTTP_202_ACCEPTED
+            if classification == "accepted"
+            else status.HTTP_200_OK
+        )
+        return receipt
+    except HTTPException:
+        raise
+    except AppError:
+        raise
+    except (UploadLeaseLostError, UploadFinalizationRejectedError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Servicio temporalmente no disponible",
+        ) from None
+    except Exception:
+        logger.exception("Error inesperado durante la recepción asíncrona")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Ocurrió un error inesperado durante la recepción del documento",
+        ) from None
 
 
 # 2. READ: Obtener todos los documentos

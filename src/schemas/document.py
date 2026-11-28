@@ -1,7 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from src.models.document import DocumentStatus
 
 
 class DocumentCreate(BaseModel):
@@ -45,3 +47,24 @@ class DocumentResponse(BaseModel):
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+
+class DocumentReceipt(BaseModel):
+    """Ticket público devuelto al recibir un PDF."""
+
+    model_config = {"extra": "forbid"}
+
+    document_id: str
+    status: DocumentStatus
+    created_at: datetime
+    status_url: str
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def normalize_created_at_to_utc(cls, value):
+        """Las fechas BSON naive se interpretan como UTC."""
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+        return value

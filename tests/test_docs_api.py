@@ -1,19 +1,41 @@
 import pytest
 import datetime
 import asyncio
-import httpx
 import hashlib
 from unittest.mock import AsyncMock, MagicMock, patch
 from bson import ObjectId
 from fastapi.testclient import TestClient
-from pymongo.errors import AutoReconnect, DuplicateKeyError, ServerSelectionTimeoutError
+from pymongo.errors import AutoReconnect, ServerSelectionTimeoutError
+import pymupdf
 
 from src.main import app
 from src.api.docs_api import get_document_service
+from src.api.pdf_validation import PdfValidationExecutor
 from src.schemas.document import DocumentResponse
 from src.database.mongodb import db_connection
 from src.config.config import settings
 from src.repository.document_repository import DocumentRepository, InvalidObjectIdError
+
+
+def make_valid_pdf() -> bytes:
+    document = pymupdf.open()
+    document.new_page().insert_text((72, 72), "PDF CRUD API test")
+    pdf_bytes = document.tobytes()
+    document.close()
+    return pdf_bytes
+
+
+PDF_BYTES = make_valid_pdf()
+
+
+@pytest.fixture(autouse=True)
+def pdf_validation_executor():
+    """Provide the managed executor without starting the MongoDB lifespan."""
+    executor = PdfValidationExecutor()
+    app.state.pdf_validation_executor = executor
+    yield executor
+    executor.shutdown(wait=True, cancel_futures=True)
+    app.state.pdf_validation_executor = None
 
 
 @pytest.fixture
@@ -31,394 +53,75 @@ def client():
     return TestClient(app)
 
 
-def test_upload_pdf_returns_201_and_document_response(client, mock_service):
-    """Test el flujo síncrono completo: submit_pdf + process_pdf_extraction + get_document_by_id."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
+def test_upload_pdf_returns_202_receipt_without_sync_extraction(client, mock_service):
+    """La API devuelve el ticket de recepcion, no el resultado de MS2."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    mock_service.receive_pdf.return_value = (
+        DocumentResponse(
+            id="test-id", filename="test.pdf", checksum="internal-checksum",
+            size_bytes=len(PDF_BYTES), status="pending", content="private",
+            page_count=5, error_message=None, created_at=now, updated_at=now,
+        ),
+        "accepted",
     )
-    # 2. process_pdf_extraction - éxito (no lanzar excepción)
-    mock_service.process_pdf_extraction = AsyncMock()
-    # 3. get_document_by_id - retorna documento COMPLETED con content y page_count
-    # IMPORTANTE: return_value debe ser una instancia REAL de DocumentResponse, no un AsyncMock
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="completed",
-        content="Texto extraído del PDF",
-        page_count=5,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
+    response = client.post(
+        "/documents/", files={"file": ("test.pdf", PDF_BYTES, "application/pdf")}
     )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "completed", f"Expected completed, got {body['status']}"
-    assert "Texto extraído del PDF" in body["content"], f"Content mismatch: {body['content']}"
-    assert body["page_count"] == 5, f"page_count mismatch: {body['page_count']}"
-    assert body["error_message"] is None, f"Expected None error_message, got {body['error_message']}"
-
-
-def test_upload_pdf_returns_201_and_document_response_on_failure(client, mock_service):
-    """Test extracción fallida: documento queda en FAILED."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
+    assert response.status_code == 202
+    assert response.json() == {
+        "document_id": "test-id", "status": "pending",
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "status_url": "/documents/test-id",
+    }
+    assert response.headers["location"] == response.json()["status_url"]
+    assert set(response.json()) == {"document_id", "status", "created_at", "status_url"}
+    mock_service.receive_pdf.assert_awaited_once_with(
+        file_bytes=PDF_BYTES, filename="test.pdf"
     )
-    # 2. process_pdf_extraction - falla (simula error de extracción)
-    mock_service.process_pdf_extraction = AsyncMock(side_effect=Exception("Error de extracción en MS2"))
-    # 3. get_document_by_id - retorna documento FAILED
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="failed",
-        content=None,
-        page_count=0,
-        error_message="Error de extracción en MS2",
-        created_at=now,
-        updated_at=now,
+    mock_service.submit_pdf.assert_not_awaited()
+    mock_service.process_pdf_extraction.assert_not_awaited()
+    mock_service.call_extraction_service.assert_not_awaited()
+    mock_service.get_document_by_id.assert_not_awaited()
+
+
+def test_upload_pdf_existing_document_returns_200_original_ticket(client, mock_service):
+    """Los duplicados conservan identidad y fecha original, sin re-procesar."""
+    created_at = datetime.datetime(2021, 4, 5, 6, 7, 8, tzinfo=datetime.timezone.utc)
+    mock_service.receive_pdf.return_value = (
+        DocumentResponse(
+            id="existing-id", filename="original-name.pdf",
+            checksum="internal-checksum", size_bytes=len(PDF_BYTES),
+            status="completed", content="private", page_count=3,
+            error_message=None, created_at=created_at, updated_at=created_at,
+        ),
+        "existing",
     )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "failed", f"Expected failed, got {body['status']}"
-    assert body["error_message"] == "Error de extracción en MS2", f"Expected error message, got {body['error_message']}"
-    assert body["content"] is None, f"Expected None content, got {body['content']}"
-
-
-def test_upload_pdf_duplicate_document(client, mock_service):
-    """Test documento duplicado: submit_pdf falla y no se invoca process_pdf_extraction."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf lanza ValueError por checksum duplicado (comportamiento real)
-    mock_service.submit_pdf.side_effect = ValueError("El documento ya existe")
-    # 2. process_pdf_extraction no debe invocarse para duplicados
-    mock_service.process_pdf_extraction = AsyncMock()
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-
-    assert response.status_code == 400, f"Expected 400 Bad Request, got {response.status_code}"
-    assert response.json()["detail"] == "El documento ya existe"
-    # La extracción NUNCA debe invocarse cuando el documento es duplicado
+    response = client.post(
+        "/documents/", files={"file": ("new-name.pdf", PDF_BYTES, "application/pdf")}
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "document_id": "existing-id", "status": "completed",
+        "created_at": created_at.isoformat().replace("+00:00", "Z"),
+        "status_url": "/documents/existing-id",
+    }
+    assert response.headers["location"] == "/documents/existing-id"
+    mock_service.receive_pdf.assert_awaited_once()
+    mock_service.submit_pdf.assert_not_awaited()
     mock_service.process_pdf_extraction.assert_not_awaited()
 
 
-def test_upload_pdf_error_persistence(client, mock_service):
-    """Test error de persistencia: la excepción no se oculta ni se reporta como éxito."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
+def test_unexpected_reception_error_is_generic_500_and_logged(client, mock_service, caplog):
+    mock_service.receive_pdf.side_effect = RuntimeError("private storage detail")
+    response = client.post(
+        "/documents/", files={"file": ("test.pdf", PDF_BYTES, "application/pdf")}
     )
-    # 2. process_pdf_extraction falla al persistir en MongoDB: la excepción
-    # de persistencia se propaga hacia el endpoint (comportamiento real).
-    mock_service.process_pdf_extraction = AsyncMock(
-        side_effect=Exception("Error de persistencia en MongoDB")
+    assert response.status_code == 500
+    assert response.json()["detail"] == (
+        "Ocurri\u00f3 un error inesperado durante la recepci\u00f3n del documento"
     )
-    # 3. get_document_by_id - recupera un documento sin estado FAILED:
-    # el endpoint NO debe devolver una respuesta exitosa en este caso.
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="completed",
-        content="Texto extraído del PDF",
-        page_count=5,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-
-    # El endpoint debe propagar el fallo como 500, nunca como respuesta exitosa
-    assert response.status_code == 500, (
-        f"Expected 500 Internal Server Error, got {response.status_code}"
-    )
-    body = response.json()
-    # Nunca se afirma que el documento quedó COMPLETED si no se pudo guardar
-    assert "completed" not in body.get("detail", "").lower() or True
-    # El detalle interno de la excepción NO se expone al cliente (seguridad)
-    assert "Error de persistencia en MongoDB" not in body["detail"]
-    assert body["detail"] == "Ocurrió un error inesperado durante el procesamiento"
-
-
-def test_upload_pdf_extraction_with_empty_content(client, mock_service):
-    """Test extracción con content vacío: COMPLETED y content=''."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    # 2. process_pdf_extraction - éxito
-    mock_service.process_pdf_extraction = AsyncMock()
-    # 3. get_document_by_id - retorna documento COMPLETED con content vacío
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="completed",
-        content="",
-        page_count=0,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "completed", f"Expected completed, got {body['status']}"
-    assert body["content"] == "", f"Expected empty content, got {body['content']}"
-    assert body["page_count"] == 0, f"Expected page_count=0, got {body['page_count']}"
-
-
-def test_upload_pdf_page_count_boolean_rejected(client, mock_service):
-    """Test page_count booleano: debe ser rechazado (no es entero válido)."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    # 2. process_pdf_extraction - éxito
-    mock_service.process_pdf_extraction = AsyncMock()
-    # 3. get_document_by_id - intenta con page_count=True (booleano)
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="completed",
-        content="Texto",
-        page_count=True,  # Booleano - debe ser rechazado
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    # Debe manejar el page_count inválido - esperar 422 o validar el error
-    assert response.status_code in (201, 422), f"Expected 201 or 422, got {response.status_code}"
-
-
-def test_upload_pdf_page_count_negative_rejected(client, mock_service):
-    """Test page_count negativo: debe ser rechazado (int < 0)."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    # 2. process_pdf_extraction - éxito
-    mock_service.process_pdf_extraction = AsyncMock()
-    # 3. get_document_by_id - intenta con page_count=-1 (negativo)
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="completed",
-        content="Texto",
-        page_count=-1,  # Negativo - debe ser rechazado
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    # Debe manejar el page_count inválido - esperar 422 o validar el error
-    assert response.status_code in (201, 422), f"Expected 201 or 422, got {response.status_code}"
-
-
-def test_upload_pdf_timeout_error(client, mock_service):
-    """Test error de timeout: MS2 no responde a tiempo."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    # 2. process_pdf_extraction - timeout
-    mock_service.process_pdf_extraction = AsyncMock(side_effect=TimeoutError("Timeout contacting extract service"))
-    # 3. get_document_by_id - retorna documento FAILED por timeout
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="failed",
-        content=None,
-        page_count=0,
-        error_message="Timeout contacting extract service",
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "failed", f"Expected failed, got {body['status']}"
-    assert body["error_message"] == "Timeout contacting extract service", f"Expected timeout error, got {body['error_message']}"
-
-
-def test_upload_pdf_connection_error(client, mock_service):
-    """Test error de conexión: MS2 inalcanzable."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    # 2. process_pdf_extraction - ConnectError
-    mock_service.process_pdf_extraction = AsyncMock(side_effect=Exception("Connection error to extract service"))
-    # 3. get_document_by_id - retorna documento FAILED por error de conexión
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="failed",
-        content=None,
-        page_count=0,
-        error_message="Connection error to extract service",
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "failed", f"Expected failed, got {body['status']}"
-    assert body["error_message"] == "Connection error to extract service", f"Expected connection error, got {body['error_message']}"
-
-
-def test_upload_pdf_invalid_response(client, mock_service):
-    """Test respuesta inválida de MS2: JSON vacío o campos ausentes."""
-    now = datetime.datetime.now()
-    # 1. submit_pdf retorna documento PENDING
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    # 2. process_pdf_extraction - respuesta inválida de MS2 (JSON vacío)
-    mock_service.process_pdf_extraction = AsyncMock(return_value=None)
-    # 3. get_document_by_id - retorna documento FAILED por respuesta inválida
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="failed",
-        content=None,
-        page_count=0,
-        error_message="Invalid response from extract service",
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "failed", f"Expected failed, got {body['status']}"
-    assert body["error_message"] == "Invalid response from extract service", f"Expected invalid response error, got {body['error_message']}"
+    assert "private storage detail" not in response.text
+    assert "private storage detail" in caplog.text
 
 
 def test_get_all_documents_returns_list(client, mock_service):
@@ -616,215 +319,6 @@ def test_unexpected_errors_log_technical_detail(client, mock_service, caplog):
     assert "Detalle técnico interno para logging" in caplog.text
 
 
-def test_upload_pdf_duplicate_handled_gracefully(client, mock_service):
-    """Test que el documento duplicado se traduce a error 400 con mensaje 'El documento ya existe'.
-
-    El servicio convierte DuplicateKeyError en ValueError("El documento ya existe"),
-    por lo que el mock reproduce el comportamiento real del servicio.
-    """
-    now = datetime.datetime.now()
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    # Simular que submit_pdf lanza ValueError por documento duplicado (comportamiento real)
-    mock_service.submit_pdf = AsyncMock(side_effect=ValueError("El documento ya existe"))
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "El documento ya existe"
-
-
-async def test_upload_pdf_concurrent_duplicate(mock_service):
-    """Test que dos solicitudes concurrentes con el mismo PDF no generen dos documentos."""
-    import asyncio
-
-    now = datetime.datetime.now()
-    call_count = 0
-
-    async def mock_submit_pdf(file_bytes, filename):
-        nonlocal call_count
-        call_count += 1
-        # Simular que la primera llamada tiene éxito y la segunda falla con
-        # ValueError por documento duplicado (comportamiento real del servicio)
-        if call_count == 1:
-            return DocumentResponse(
-                id="test-id",
-                filename=filename,
-                checksum="checksum123",
-                size_bytes=1024,
-                status="pending",
-                content=None,
-                page_count=None,
-                error_message=None,
-                created_at=now,
-                updated_at=now,
-            )
-        else:
-            raise ValueError("El documento ya existe")
-
-    mock_service.submit_pdf = mock_submit_pdf
-
-    # Configurar get_document_by_id para retornar un DocumentResponse real
-    mock_service.get_document_by_id.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
-    ) as client:
-        results = await asyncio.gather(
-            client.post("/documents/", files={"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}),
-            client.post("/documents/", files={"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}),
-        )
-
-    # Una debe tener éxito (201) y la otra debe fallar (400)
-    status_codes = sorted([r.status_code for r in results])
-    assert status_codes == [201, 400]
-
-
-def test_upload_pdf_unexpected_error_returns_500_generic_message(client, mock_service):
-    """Excepción inesperada durante el procesamiento devuelve 500 con mensaje genérico."""
-    now = datetime.datetime.now()
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    # Excepción inesperada (no ValueError) durante la extracción
-    mock_service.process_pdf_extraction = AsyncMock(
-        side_effect=RuntimeError("Error interno inesperado de bajo nivel")
-    )
-    # get_document_by_id no retorna documento FAILED (simula que no se pudo persistir)
-    mock_service.get_document_by_id.return_value = None
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-
-    assert response.status_code == 500, f"Expected 500, got {response.status_code}"
-    body = response.json()
-    assert body["detail"] == "Ocurrió un error inesperado durante el procesamiento", (
-        f"Expected generic message, got: {body['detail']}"
-    )
-    # El detalle interno no debe aparecer en la respuesta
-    assert "Error interno inesperado de bajo nivel" not in body["detail"]
-    assert "RuntimeError" not in body["detail"]
-
-
-def test_upload_pdf_unexpected_error_logs_technical_detail(client, mock_service, caplog):
-    """El detalle técnico de la excepción inesperada se registra en los logs internos."""
-    now = datetime.datetime.now()
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.process_pdf_extraction = AsyncMock(
-        side_effect=RuntimeError("Detalle técnico interno para logging")
-    )
-    mock_service.get_document_by_id.return_value = None
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-
-    assert response.status_code == 500
-
-    # Verificar que el logger registró el error con exc_info=True
-    assert "Error inesperado durante el procesamiento síncrono" in caplog.text
-    assert "Detalle técnico interno para logging" in caplog.text
-
-
-def test_upload_pdf_unexpected_error_failed_doc_returned(client, mock_service):
-    """Si el documento ya quedó FAILED, se devuelve ese documento incluso ante excepción inesperada."""
-    now = datetime.datetime.now()
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.process_pdf_extraction = AsyncMock(
-        side_effect=RuntimeError("Error inesperado")
-    )
-    # get_document_by_id retorna documento ya marcado como FAILED
-    retrieved_doc = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="failed",
-        content=None,
-        page_count=0,
-        error_message="Error previo de extracción",
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.get_document_by_id.return_value = retrieved_doc
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "failed"
-    assert body["error_message"] == "Error previo de extracción"
-
-
-def test_upload_pdf_validation_errors_still_return_400(client, mock_service):
-    """Los errores de validación (duplicado) continúan devolviendo 400 con su mensaje."""
-    now = datetime.datetime.now()
-    mock_service.submit_pdf.side_effect = ValueError("El documento ya existe")
-    mock_service.process_pdf_extraction = AsyncMock()
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "El documento ya existe"
-    mock_service.process_pdf_extraction.assert_not_awaited()
-
-
-# =============================================================================
-# Pruebas de inicialización automática del índice único
 # =============================================================================
 
 async def test_index_unique_is_created_automatically(monkeypatch):
@@ -945,7 +439,7 @@ def test_endpoints_return_503_when_db_is_none(client, monkeypatch):
     endpoints CRUD responden 503 y no 500 con TypeError."""
     _patch_db_connection(monkeypatch, None, connected=False)
     valid_id = str(ObjectId())
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
+    files = {"file": ("test.pdf", PDF_BYTES, "application/pdf")}
 
     response = client.post("/documents/", files=files)
     assert response.status_code == 503
@@ -1003,7 +497,7 @@ def test_upload_pdf_returns_503_when_mongodb_fails_mid_flow(client, monkeypatch)
     )
     _patch_db_connection(monkeypatch, _mock_db_with_collection(mock_collection), connected=True)
 
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
+    files = {"file": ("test.pdf", PDF_BYTES, "application/pdf")}
     response = client.post("/documents/", files=files)
     assert response.status_code == 503
     assert "El documento ya existe" not in response.json()["detail"]
@@ -1053,124 +547,29 @@ def test_fast_fail_skips_db_operations_when_not_connected(client, monkeypatch):
     mock_collection.find.assert_not_called()
 
 
-def test_duplicate_document_still_returns_400_with_real_repository(
-    client, monkeypatch
-):
-    """DuplicateKeyError NO se traduce a 503: el servicio lo convierte y la
-    API conserva el 400 'El documento ya existe'."""
-    mock_collection = MagicMock()
-    mock_collection.find_one = AsyncMock(return_value=None)  # no existe aún
-    mock_collection.insert_one = AsyncMock(
-        side_effect=DuplicateKeyError("E11000 duplicate key", 11000)
-    )
-    _patch_db_connection(monkeypatch, _mock_db_with_collection(mock_collection), connected=True)
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    assert response.status_code == 400
-    assert response.json()["detail"] == "El documento ya existe"
-
-
-def test_ms2_failure_with_mongodb_down_returns_503(client, monkeypatch):
-    """Si MS2 falla y además MongoDB está caído, prevalece el 503 (no 400/500):
-    no se puede ni persistir el estado FAILED ni recuperar el documento."""
-    mock_collection = MagicMock()
-    mock_collection.find_one = AsyncMock(return_value=None)  # no duplicado
-    mock_collection.insert_one = AsyncMock(
-        return_value=MagicMock(inserted_id=ObjectId())
-    )
-    mock_collection.update_one = AsyncMock(
-        side_effect=ServerSelectionTimeoutError("simulado")
-    )
-    _patch_db_connection(monkeypatch, _mock_db_with_collection(mock_collection), connected=True)
-
-    # MS2 inalcanzable (mock de red, sin dependencia de servicios reales)
-    with patch("src.services.document_service.httpx.AsyncClient") as mock_client_cls:
-        mock_client = MagicMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("MS2 caído"))
-        mock_client_cls.return_value = mock_client
-
-        files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-        response = client.post("/documents/", files=files)
-
-    assert response.status_code == 503
-    assert "base de datos" in response.json()["detail"]
-
-
 def test_upload_pdf_too_large_still_returns_413(client, mock_service):
-    """Regresión de validación: archivo demasiado grande mantiene 413
-    (con la BD operativa, vía servicio inyectado)."""
-    oversized = b"%PDF-1.4 " + b"x" * (settings.max_file_size_mb * 1024 * 1024 + 1)
+    """El tamano excedido mantiene 413 antes de invocar receive_pdf()."""
+    oversized = b"%PDF-1.4 " + b"x" * (
+        settings.max_file_size_mb * 1024 * 1024 + 1
+    )
     response = client.post(
         "/documents/", files={"file": ("big.pdf", oversized, "application/pdf")}
     )
     assert response.status_code == 413
-
-
-@pytest.mark.parametrize(
-    ("error_type", "message"),
-    [
-        (httpx.ConnectError, "Connection error to extract service"),
-        (httpx.ReadError, "Read error from extract service"),
-        (httpx.WriteError, "Write error to extract service"),
-        (httpx.RemoteProtocolError, "Protocol error from extract service"),
-    ],
-)
-def test_ms2_transport_errors_are_not_confused_with_mongodb_unavailability(
-    client, mock_service, error_type, message
-):
-    """Los errores de transporte conservan la respuesta 201 + documento FAILED."""
-    now = datetime.datetime.now()
-    mock_service.submit_pdf.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="pending",
-        content=None,
-        page_count=None,
-        error_message=None,
-        created_at=now,
-        updated_at=now,
-    )
-    mock_service.process_pdf_extraction = AsyncMock(
-        side_effect=error_type(message)
-    )
-    mock_service.get_document_by_id.return_value = DocumentResponse(
-        id="test-id",
-        filename="test.pdf",
-        checksum="checksum123",
-        size_bytes=1024,
-        status="failed",
-        content=None,
-        page_count=0,
-        error_message=message,
-        created_at=now,
-        updated_at=now,
-    )
-
-    files = {"file": ("test.pdf", b"%PDF-1.4 test content", "application/pdf")}
-    response = client.post("/documents/", files=files)
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "failed"
-    assert body["error_message"] == message
+    mock_service.receive_pdf.assert_not_awaited()
 
 
 # =============================================================================
-# Pruebas de integración real contra MongoDB
-# ============================================================================
+# Pruebas de integracion real contra MongoDB
+# =============================================================================
 
 @pytest.mark.integration
 async def test_concurrent_upload_same_pdf_real_mongodb():
     """Prueba de concurrencia real contra MongoDB.
 
     Dos solicitudes HTTP simultáneas con el mismo PDF compiten por insertar
-    el mismo checksum. Una debe insertarse (HTTP 201) y la otra rechazarse
-    como duplicada (HTTP 400). Se simula únicamente MS2 (servicio de
-    extracción); la persistencia en MongoDB es real.
+    el mismo checksum. Una debe devolver 202 y la otra 200 para el mismo
+    documento. La persistencia del PDF en GridFS es real y no se ejecuta MS2.
 
     Los errores de conexión, configuración, autenticación o permisos hacen
     fallar explícitamente la prueba.
@@ -1178,15 +577,13 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
     import hashlib
     import uuid
 
-    import fitz
     from httpx import ASGITransport, AsyncClient
     from unittest.mock import AsyncMock, patch
 
-    from src.main import app
-    from src.api.docs_api import get_document_service
     from src.database.mongodb import MongoDB
     from src.services.document_service import DocumentService
     from src.config.config import settings
+    from src.repository.gridfs_repository import GridFSRepository
 
     # for_testing valida MONGO_TEST_URL explícitamente; cualquier error de
     # conexión, autenticación o inicialización se propaga como fallo.
@@ -1208,7 +605,7 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
         override_installed = True
 
         # Generar un PDF válido distinto por ejecución sin alterar su estructura.
-        pdf = fitz.open()
+        pdf = pymupdf.open()
         page = pdf.new_page()
         page.insert_text((72, 72), f"Concurrency test {uuid.uuid4()}")
         pdf_bytes = pdf.tobytes()
@@ -1216,12 +613,13 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
         filename = "test_concurrent_real.pdf"
         checksum = hashlib.sha256(pdf_bytes).hexdigest()
 
-        extraction_result = {"content": "texto extraído de prueba", "page_count": 3}
-
+        extraction_mock = AsyncMock(
+            side_effect=AssertionError("MS2 must not be called")
+        )
         with patch.object(
             DocumentService,
             "call_extraction_service",
-            AsyncMock(return_value=extraction_result),
+            extraction_mock,
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://testserver"
@@ -1241,9 +639,28 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
                     ),
                 )
 
-        status_codes = sorted([r.status_code for r in results])
-        assert 201 in status_codes, f"Esperaba una respuesta 201, obtuvo {status_codes}"
-        assert 400 in status_codes, f"Esperaba una respuesta 400, obtuvo {status_codes}"
+        responses_by_status = {result.status_code: result for result in results}
+        assert set(responses_by_status) == {200, 202}, (
+            f"Esperaba respuestas 200 y 202, obtuvo "
+            f"{sorted(responses_by_status)}"
+        )
+        accepted_response = responses_by_status[202]
+        duplicate_response = responses_by_status[200]
+        accepted_ticket = accepted_response.json()
+        duplicate_ticket = duplicate_response.json()
+
+        assert accepted_ticket["status"] == "pending"
+        assert duplicate_ticket["status"] in {"uploading", "pending"}
+        assert accepted_ticket["document_id"] == duplicate_ticket["document_id"]
+        assert accepted_ticket["created_at"] == duplicate_ticket["created_at"]
+        assert all(
+            result.headers["location"] == result.json()["status_url"]
+            for result in results
+        )
+        assert all(
+            set(ticket) == {"document_id", "status", "created_at", "status_url"}
+            for ticket in (accepted_ticket, duplicate_ticket)
+        )
 
         existing_docs = await repository.collection.find(
             {"checksum": checksum}
@@ -1251,6 +668,16 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
         assert len(existing_docs) == 1, (
             f"Se esperaba exactamente 1 documento, se encontró {len(existing_docs)}"
         )
+        stored_document = existing_docs[0]
+        assert stored_document["status"] == "pending"
+        assert str(stored_document["_id"]) == accepted_ticket["document_id"]
+        assert str(stored_document["_id"]) == duplicate_ticket["document_id"]
+        assert stored_document["file_id"] is not None
+        stored_pdf = await GridFSRepository(testing_db.db).read(
+            stored_document["file_id"]
+        )
+        assert stored_pdf == pdf_bytes
+        extraction_mock.assert_not_awaited()
 
         indexes = await testing_db.db[settings.mongo_collection].list_indexes().to_list(
             length=None
@@ -1275,6 +702,13 @@ async def test_concurrent_upload_same_pdf_real_mongodb():
 
         try:
             if repository is not None and checksum is not None:
+                created_document = await repository.collection.find_one(
+                    {"checksum": checksum}
+                )
+                if created_document and created_document.get("file_id") is not None:
+                    await repository._gridfs_repository().delete(
+                        created_document["file_id"]
+                    )
                 await repository.delete_by_checksum(checksum)
         except Exception as exc:
             cleanup_error = exc
