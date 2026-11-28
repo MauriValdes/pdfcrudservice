@@ -1,6 +1,7 @@
 """Integración del flujo conjunto de persistencia de una carga PDF."""
 
 import hashlib
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -15,7 +16,7 @@ from src.models.document import DocumentStatus
 from src.repository.document_repository import DocumentRepository
 from src.repository.gridfs_repository import GridFSRepository
 from src.schemas.document import DocumentCreate
-from src.services.document_service import DocumentService
+from src.services.document_service import DocumentService, UploadLeaseLostError
 
 
 @pytest_asyncio.fixture
@@ -79,6 +80,280 @@ def _normalize_mongo_datetime(value: datetime) -> datetime:
     else:
         value = value.astimezone(timezone.utc)
     return value.replace(microsecond=(value.microsecond // 1000) * 1000)
+
+
+async def _prepare_coordinated_upload(testing_db, token):
+    collection = testing_db.db[settings.mongo_collection]
+    repository = DocumentRepository(testing_db.db)
+    service = DocumentService(repository=repository)
+    gridfs_repository = GridFSRepository(testing_db.db)
+    pdf_bytes = _build_minimal_pdf(f"coordinated-upload-{token}")
+    checksum = hashlib.sha256(pdf_bytes).hexdigest()
+    filename = f"coordinated-upload-{token}.pdf"
+    document, created = await repository.reserve_document(
+        DocumentCreate(
+            filename=filename,
+            checksum=checksum,
+            size_bytes=len(pdf_bytes),
+        )
+    )
+    assert created is True
+    owned, acquired = await service.acquire_upload_ownership(
+        document, settings.upload_lease_seconds
+    )
+    assert acquired is True
+    assert owned is not None
+    # _gridfs_repository() crea una instancia nueva en cada invocación.
+    # El servicio debe usar la misma instancia que la prueba instrumenta.
+    repository._gridfs_repository = lambda: gridfs_repository
+    return (
+        collection, repository, service, gridfs_repository, owned,
+        pdf_bytes, checksum, filename,
+    )
+
+
+def _hold_after_real_gridfs_write(gridfs):
+    """Retiene el stream tras write() real y antes de close()."""
+    stream_opened = asyncio.Event()
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    close_started = asyncio.Event()
+    original_bucket = gridfs._bucket
+
+    class HeldUploadStream:
+        def __init__(self, stream):
+            self._stream = stream
+            self.chunk_size = stream.chunk_size
+
+        async def write(self, block):
+            result = await self._stream.write(block)
+            # Motor/PyMongo ejecutó write(), aunque sus bytes/chunks sigan
+            # en buffers internos hasta alcanzar el batch o llamar close().
+            write_started.set()
+            await release_write.wait()
+            return result
+
+        async def close(self):
+            close_started.set()
+            return await self._stream.close()
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    class HeldBucket:
+        def __init__(self, bucket):
+            self._bucket = bucket
+
+        def open_upload_stream_with_id(self, *args, **kwargs):
+            stream = self._bucket.open_upload_stream_with_id(*args, **kwargs)
+            stream_opened.set()
+            return HeldUploadStream(stream)
+
+        def __getattr__(self, name):
+            return getattr(self._bucket, name)
+
+    gridfs._bucket = lambda: HeldBucket(original_bucket())
+    return stream_opened, write_started, release_write, close_started
+
+
+async def _wait_for_writer_or_failure(writer_started, operation):
+    """Espera la escritura o propaga inmediatamente la terminación del servicio."""
+    writer_waiter = asyncio.create_task(writer_started.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {writer_waiter, operation},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if writer_waiter not in done and operation in done:
+            # Recupera la excepción original (o evidencia un retorno prematuro)
+            # en vez de ocultarla detrás de un timeout del evento.
+            result = operation.result()
+            raise AssertionError(
+                f"El coordinador terminó antes de iniciar GridFS: {result!r}"
+            )
+        await writer_waiter
+    finally:
+        if not writer_waiter.done():
+            writer_waiter.cancel()
+            await asyncio.gather(writer_waiter, return_exceptions=True)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_coordinator_renews_during_active_gridfs_write(
+    _isolated_testing_db, monkeypatch
+):
+    """El coordinador renueva en Mongo mientras la escritura está retenida."""
+    testing_db = _isolated_testing_db
+    monkeypatch.setattr(settings, "upload_lease_seconds", 2)
+    monkeypatch.setattr(settings, "upload_lease_renew_interval_seconds", 0.05)
+    token = str(uuid.uuid4())
+    (
+        collection, repository, service, gridfs, document, pdf, checksum, filename,
+    ) = await _prepare_coordinated_upload(testing_db, token)
+    file_id = ObjectId()
+    stream_opened, writer_entered, release_writer, close_started = (
+        _hold_after_real_gridfs_write(gridfs)
+    )
+    renewal_completed = asyncio.Event()
+    original_renew = repository.renew_upload_lease
+    renewals = []
+
+    async def real_renewal(*args):
+        result = await original_renew(*args)
+        if result:
+            renewals.append(args[-1])
+            renewal_completed.set()
+        return result
+
+    repository.renew_upload_lease = real_renewal
+    tasks_before = asyncio.all_tasks()
+    try:
+        operation = asyncio.create_task(
+            service.save_original_pdf_with_lease(
+                document, file_id, filename, pdf,
+                {"checksum": checksum}, ownership_acquired=True,
+            )
+        )
+        await _wait_for_writer_or_failure(writer_entered, operation)
+        assert stream_opened.is_set()
+        assert not close_started.is_set()
+        assert await testing_db.db["fs.files"].count_documents(
+            {"_id": file_id}
+        ) == 0
+        await asyncio.wait_for(renewal_completed.wait(), timeout=5)
+        persisted = await collection.find_one({"_id": ObjectId(document.id)})
+        persisted_expiry = _normalize_mongo_datetime(
+            persisted["upload_lease_until"]
+        )
+        assert persisted_expiry == max(
+            _normalize_mongo_datetime(value) for value in renewals
+        )
+        assert persisted_expiry > _normalize_mongo_datetime(
+            document.upload_lease_until
+        )
+        assert persisted["status"] == DocumentStatus.UPLOADING.value
+        assert persisted["file_id"] is None
+        release_writer.set()
+        assert await asyncio.wait_for(operation, timeout=5) == file_id
+        assert close_started.is_set()
+
+        info = await gridfs.stat(file_id)
+        recovered = await gridfs.read(file_id)
+        assert info is not None
+        assert info.length == len(pdf)
+        assert recovered == pdf
+        assert hashlib.sha256(recovered).hexdigest() == checksum
+        assert await testing_db.db["fs.files"].count_documents(
+            {"_id": file_id}
+        ) == 1
+        assert await testing_db.db["fs.chunks"].count_documents(
+            {"files_id": file_id}
+        ) > 0
+        final_document = await collection.find_one({"_id": ObjectId(document.id)})
+        assert final_document["status"] == DocumentStatus.UPLOADING.value
+        assert final_document["file_id"] is None
+        assert not [
+            task for task in asyncio.all_tasks() - tasks_before
+            if not task.done()
+        ]
+    finally:
+        release_writer.set()
+        if "operation" in locals():
+            if not operation.done():
+                await asyncio.wait_for(
+                    asyncio.gather(operation, return_exceptions=True), timeout=5
+                )
+            if operation.done():
+                await gridfs.delete(file_id)
+                await testing_db.db["fs.files"].delete_one({"_id": file_id})
+                await testing_db.db["fs.chunks"].delete_many(
+                    {"files_id": file_id}
+                )
+                await collection.delete_one({"_id": ObjectId(document.id)})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_coordinator_stops_writer_after_real_ownership_loss(
+    _isolated_testing_db, monkeypatch
+):
+    """El rechazo real de renovación detiene al escritor y no finaliza."""
+    testing_db = _isolated_testing_db
+    monkeypatch.setattr(settings, "upload_lease_seconds", 2)
+    monkeypatch.setattr(settings, "upload_lease_renew_interval_seconds", 0.05)
+    token = str(uuid.uuid4())
+    (
+        collection, repository, service, gridfs, document, pdf, checksum, filename,
+    ) = await _prepare_coordinated_upload(testing_db, token)
+    file_id = ObjectId()
+    stream_opened, writer_entered, release_writer, close_started = (
+        _hold_after_real_gridfs_write(gridfs)
+    )
+    renewal_rejected = asyncio.Event()
+    tasks_before = asyncio.all_tasks()
+    original_renew = repository.renew_upload_lease
+
+    async def real_renewal(*args):
+        result = await original_renew(*args)
+        if not result:
+            renewal_rejected.set()
+        return result
+
+    repository.renew_upload_lease = real_renewal
+    try:
+        operation = asyncio.create_task(
+            service.save_original_pdf_with_lease(
+                document, file_id, filename, pdf,
+                {"checksum": checksum}, ownership_acquired=True,
+            )
+        )
+        await _wait_for_writer_or_failure(writer_entered, operation)
+        assert stream_opened.is_set()
+        assert not close_started.is_set()
+        assert await testing_db.db["fs.files"].count_documents(
+            {"_id": file_id}
+        ) == 0
+        # Transferir realmente la propiedad en MongoDB antes de la renovación.
+        await collection.update_one(
+            {"_id": ObjectId(document.id)},
+            {"$set": {
+                "upload_owner_id": str(uuid.uuid4()),
+                "upload_fencing_token": str(uuid.uuid4()),
+            }},
+        )
+        await asyncio.wait_for(renewal_rejected.wait(), timeout=5)
+        release_writer.set()
+        with pytest.raises(UploadLeaseLostError, match="renovación|lease"):
+            await asyncio.wait_for(operation, timeout=5)
+        persisted = await collection.find_one({"_id": ObjectId(document.id)})
+        assert persisted["status"] == DocumentStatus.UPLOADING.value
+        assert persisted["file_id"] is None
+        assert await testing_db.db["fs.files"].count_documents(
+            {"_id": file_id}
+        ) == 0
+        assert await gridfs.stat(file_id) is None
+        assert await testing_db.db["fs.chunks"].count_documents(
+            {"files_id": file_id}
+        ) == 0
+        assert not [
+            task for task in asyncio.all_tasks() - tasks_before
+            if not task.done()
+        ]
+    finally:
+        release_writer.set()
+        if "operation" in locals():
+            if not operation.done():
+                await asyncio.wait_for(
+                    asyncio.gather(operation, return_exceptions=True), timeout=5
+                )
+            if operation.done():
+                await gridfs.delete(file_id)
+                await testing_db.db["fs.files"].delete_one({"_id": file_id})
+                await testing_db.db["fs.chunks"].delete_many(
+                    {"files_id": file_id}
+                )
+                await collection.delete_one({"_id": ObjectId(document.id)})
 
 
 @pytest.mark.integration
