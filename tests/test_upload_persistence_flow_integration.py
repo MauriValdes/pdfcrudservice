@@ -11,6 +11,7 @@ import pytest_asyncio
 from bson import ObjectId
 
 from src.config.config import settings
+from src.core.exceptions import DatabaseUnavailableError
 from src.database.mongodb import MongoDB
 from src.models.document import DocumentStatus
 from src.repository.document_repository import DocumentRepository
@@ -584,3 +585,254 @@ async def test_service_stores_authorized_upload_durably_without_finalizing(
                     await collection.delete_one(
                         {"_id": ObjectId(document_id)}
                     )
+
+
+async def _prepare_service_finalization(testing_db, token):
+    """Prepara una reserva propia y su servicio con GridFS de testing real."""
+    collection = testing_db.db[settings.mongo_collection]
+    repository = DocumentRepository(testing_db.db)
+    service = DocumentService(repository=repository)
+    gridfs_repository = GridFSRepository(testing_db.db)
+    pdf_bytes = _build_minimal_pdf(f"service-finalization-{token}")
+    checksum = hashlib.sha256(pdf_bytes).hexdigest()
+    filename = f"service-finalization-{token}.pdf"
+
+    document, created = await repository.reserve_document(
+        DocumentCreate(
+            filename=filename,
+            checksum=checksum,
+            size_bytes=len(pdf_bytes),
+        )
+    )
+    assert created is True
+    owned_document, acquired = await service.acquire_upload_ownership(
+        document,
+        settings.upload_lease_seconds,
+    )
+    assert acquired is True
+    assert owned_document is not None
+
+    # El servicio crea un adaptador por llamada; fijarlo permite verificar
+    # GridFS real y limpiar únicamente el file_id de esta prueba.
+    repository._gridfs_repository = lambda: gridfs_repository
+    return (
+        collection,
+        repository,
+        service,
+        gridfs_repository,
+        owned_document,
+        acquired,
+        pdf_bytes,
+        checksum,
+        filename,
+    )
+
+
+def _assert_no_pending_coordinator_tasks(tasks_before):
+    assert not [
+        task
+        for task in asyncio.all_tasks() - tasks_before
+        if not task.done()
+    ]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_service_finalization_with_real_mongodb_and_gridfs(
+    _isolated_testing_db,
+):
+    """El servicio persiste GridFS y finaliza la reserva realmente."""
+    testing_db = _isolated_testing_db
+    (
+        collection,
+        repository,
+        service,
+        gridfs,
+        document,
+        acquired,
+        pdf_bytes,
+        checksum,
+        filename,
+    ) = await _prepare_service_finalization(testing_db, str(uuid.uuid4()))
+    file_id = ObjectId()
+    tasks_before = asyncio.all_tasks()
+
+    try:
+        finalized = await service.save_and_finalize_upload(
+            document,
+            file_id,
+            filename,
+            pdf_bytes,
+            {"checksum": checksum},
+            ownership_acquired=acquired,
+        )
+
+        assert finalized is True
+        persisted = await collection.find_one({"_id": ObjectId(document.id)})
+        assert persisted is not None
+        assert persisted["status"] == DocumentStatus.PENDING.value
+        assert persisted["file_id"] == file_id
+        assert persisted["upload_owner_id"] == document.upload_owner_id
+        assert (
+            persisted["upload_fencing_token"]
+            == document.upload_fencing_token
+        )
+
+        info = await gridfs.stat(file_id)
+        recovered_pdf = await gridfs.read(file_id)
+        assert info is not None
+        assert info.length == len(pdf_bytes)
+        assert recovered_pdf == pdf_bytes
+        assert hashlib.sha256(recovered_pdf).hexdigest() == checksum
+        _assert_no_pending_coordinator_tasks(tasks_before)
+    finally:
+        await gridfs.delete(file_id)
+        await collection.delete_one({"_id": ObjectId(document.id)})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_service_finalization_rejects_expired_lease_and_keeps_gridfs_file(
+    _isolated_testing_db,
+):
+    """Un lease vencido al finalizar rechaza la asociación sin borrar GridFS."""
+    testing_db = _isolated_testing_db
+    (
+        collection,
+        repository,
+        service,
+        gridfs,
+        document,
+        acquired,
+        pdf_bytes,
+        checksum,
+        filename,
+    ) = await _prepare_service_finalization(testing_db, str(uuid.uuid4()))
+    file_id = ObjectId()
+    original_finalize = repository.finalize_upload
+    finalize_calls = []
+    delete_calls = []
+    original_delete = gridfs.delete
+
+    async def finalize_after_expiring_lease(*args, **kwargs):
+        info = await gridfs.stat(file_id)
+        assert info is not None
+        assert info.length == len(pdf_bytes)
+        persisted = await gridfs.read(file_id)
+        assert hashlib.sha256(persisted).hexdigest() == checksum
+        expired_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        result = await collection.update_one(
+            {"_id": ObjectId(document.id)},
+            {"$set": {"upload_lease_until": expired_at}},
+        )
+        assert result.matched_count == 1
+        finalize_calls.append((args, kwargs))
+        return await original_finalize(*args, **kwargs)
+
+    async def track_delete(candidate_file_id):
+        delete_calls.append(candidate_file_id)
+        return await original_delete(candidate_file_id)
+
+    repository.finalize_upload = finalize_after_expiring_lease
+    gridfs.delete = track_delete
+    tasks_before = asyncio.all_tasks()
+
+    try:
+        finalized = await service.save_and_finalize_upload(
+            document,
+            file_id,
+            filename,
+            pdf_bytes,
+            {"checksum": checksum},
+            ownership_acquired=acquired,
+        )
+
+        assert finalized is False
+        assert len(finalize_calls) == 1
+        persisted_document = await collection.find_one(
+            {"_id": ObjectId(document.id)}
+        )
+        assert persisted_document is not None
+        assert persisted_document["status"] == DocumentStatus.UPLOADING.value
+        assert persisted_document["file_id"] is None
+        assert _normalize_mongo_datetime(
+            persisted_document["upload_lease_until"]
+        ) < _normalize_mongo_datetime(datetime.now(timezone.utc))
+        assert await gridfs.read(file_id) == pdf_bytes
+        assert delete_calls == []
+        _assert_no_pending_coordinator_tasks(tasks_before)
+    finally:
+        await original_delete(file_id)
+        await collection.delete_one({"_id": ObjectId(document.id)})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_service_propagates_uncertain_confirmation_after_real_finalization(
+    _isolated_testing_db,
+):
+    """Simula pérdida de confirmación en el límite del repositorio.
+
+    No simula una caída real de MongoDB ni un fallo de red del driver: el
+    wrapper observa el éxito real y luego lanza DatabaseUnavailableError.
+    """
+    testing_db = _isolated_testing_db
+    (
+        collection,
+        repository,
+        service,
+        gridfs,
+        document,
+        acquired,
+        pdf_bytes,
+        checksum,
+        filename,
+    ) = await _prepare_service_finalization(testing_db, str(uuid.uuid4()))
+    file_id = ObjectId()
+    original_finalize = repository.finalize_upload
+    original_delete = gridfs.delete
+    confirmation_error = DatabaseUnavailableError()
+    finalize_calls = []
+    delete_calls = []
+
+    async def apply_then_lose_confirmation(*args, **kwargs):
+        finalize_calls.append((args, kwargs))
+        applied = await original_finalize(*args, **kwargs)
+        assert applied is True
+        raise confirmation_error
+
+    async def track_delete(candidate_file_id):
+        delete_calls.append(candidate_file_id)
+        return await original_delete(candidate_file_id)
+
+    repository.finalize_upload = apply_then_lose_confirmation
+    gridfs.delete = track_delete
+    tasks_before = asyncio.all_tasks()
+
+    try:
+        with pytest.raises(DatabaseUnavailableError) as raised:
+            await service.save_and_finalize_upload(
+                document,
+                file_id,
+                filename,
+                pdf_bytes,
+                {"checksum": checksum},
+                ownership_acquired=acquired,
+            )
+
+        assert raised.value is confirmation_error
+        assert len(finalize_calls) == 1
+        persisted_document = await collection.find_one(
+            {"_id": ObjectId(document.id)}
+        )
+        assert persisted_document is not None
+        assert persisted_document["status"] == DocumentStatus.PENDING.value
+        assert persisted_document["file_id"] == file_id
+        assert await gridfs.read(file_id) == pdf_bytes
+        assert hashlib.sha256(await gridfs.read(file_id)).hexdigest() == checksum
+        assert delete_calls == []
+        assert len(finalize_calls) == 1
+        _assert_no_pending_coordinator_tasks(tasks_before)
+    finally:
+        await original_delete(file_id)
+        await collection.delete_one({"_id": ObjectId(document.id)})
