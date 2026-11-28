@@ -70,6 +70,10 @@ class UploadLeaseLostError(Exception):
     """La carga dejó de tener autorización para continuar."""
 
 
+class UploadFinalizationRejectedError(Exception):
+    """La carga GridFS terminó, pero MongoDB rechazó su finalización."""
+
+
 class DocumentService:
     def __init__(self, repository: DocumentRepository):
         self.repository = repository
@@ -89,6 +93,79 @@ class DocumentService:
         if document.status == DocumentStatus.UPLOADING:
             return document, "existing_uploading"
         return document, "existing"
+
+    async def receive_pdf(
+        self,
+        *,
+        file_bytes: bytes,
+        filename: str,
+    ) -> tuple[DocumentModel, Literal["accepted", "existing"]]:
+        """Orquesta la recepción durable sin iniciar la extracción."""
+        checksum = hashlib.sha256(file_bytes).hexdigest()
+        document_data = DocumentCreate(
+            filename=filename,
+            checksum=checksum,
+            size_bytes=len(file_bytes),
+        )
+        document, classification = await self.reserve_or_classify(document_data)
+
+        if classification == "existing":
+            return document, "existing"
+        if classification not in ("created", "existing_uploading"):
+            raise ValueError("Clasificación de reserva desconocida.")
+
+        acquired_document, ownership_acquired = (
+            await self.acquire_upload_ownership(
+                document,
+                settings.upload_lease_seconds,
+            )
+        )
+        if not ownership_acquired:
+            if acquired_document is None:
+                raise UploadLeaseLostError(
+                    "No se pudo recuperar el documento de la reserva."
+                )
+            return acquired_document, "existing"
+
+        if (
+            not isinstance(acquired_document, DocumentModel)
+            or acquired_document.status != DocumentStatus.UPLOADING
+            or acquired_document.file_id is not None
+            or not acquired_document.id
+            or not acquired_document.upload_owner_id
+            or not acquired_document.upload_fencing_token
+        ):
+            raise UploadLeaseLostError(
+                "La adquisición no devolvió una reserva uploading válida."
+            )
+
+        file_id = ObjectId()
+        metadata = {
+            "document_id": acquired_document.id,
+            "checksum": acquired_document.checksum,
+            "upload_owner_id": acquired_document.upload_owner_id,
+            "upload_fencing_token": acquired_document.upload_fencing_token,
+        }
+        finalized = await self.save_and_finalize_upload(
+            acquired_document,
+            file_id,
+            filename,
+            file_bytes,
+            metadata,
+            ownership_acquired=ownership_acquired,
+        )
+        if not finalized:
+            raise UploadFinalizationRejectedError(
+                "MongoDB rechazó la finalización de la carga."
+            )
+
+        accepted_document = acquired_document.model_copy(
+            update={
+                "status": DocumentStatus.PENDING,
+                "file_id": file_id,
+            }
+        )
+        return accepted_document, "accepted"
 
     async def acquire_upload_ownership(
         self,
