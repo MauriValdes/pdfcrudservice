@@ -580,7 +580,7 @@ class DocumentService:
             created_at = doc.created_at
             updated_at = doc.updated_at
 
-        return DocumentResponse(
+        return DocumentResponse.for_public_read(
             id=id_str,
             filename=filename,
             checksum=checksum,

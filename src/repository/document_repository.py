@@ -355,7 +355,7 @@ class DocumentRepository:
         for doc in documents:
             # Convertir _id a string para el DTO
             doc_id = str(doc.get("_id", "")) if doc.get("_id") else ""
-            response = DocumentResponse(
+            response = DocumentResponse.for_public_read(
                 id=doc_id,
                 filename=doc.get("filename", ""),
                 checksum=doc.get("checksum", ""),
